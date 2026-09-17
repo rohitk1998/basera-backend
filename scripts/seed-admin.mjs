@@ -21,8 +21,8 @@ if (!email || !password) {
   console.error('Usage: node scripts/seed-admin.mjs <email> <password>');
   process.exit(1);
 }
-if (password.length < 12) {
-  console.error('Password must be at least 12 characters.');
+if (password.length < 8) {
+  console.error('Password must be at least 8 characters.');
   process.exit(1);
 }
 
@@ -39,18 +39,18 @@ await client.connect();
 
 const passwordHash = await bcrypt.hash(password, 12);
 
-const { rows: existing } = await client.query('select id from profiles where email = $1', [email]);
+const { rows: existing } = await client.query('select id from users where email = $1', [email]);
 
 if (existing.length > 0) {
   await client.query(
-    `update profiles set role = 'admin', password_hash = $2 where id = $1`,
+    `update users set role = 'admin', password_hash = $2 where id = $1`,
     [existing[0].id, passwordHash],
   );
   console.log(`Updated existing profile ${existing[0].id} — role set to admin, password reset.`);
 } else {
   const id = randomUUID();
   await client.query(
-    `insert into profiles (id, email, role, password_hash, "isHost")
+    `insert into users (id, email, role, password_hash, "isHost")
      values ($1, $2, 'admin', $3, false)`,
     [id, email, passwordHash],
   );

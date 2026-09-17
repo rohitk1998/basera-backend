@@ -2,19 +2,42 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ListingEntity, ProfileEntity } from '../entities';
+import { createReadStream } from 'fs';
+import { unlink } from 'fs/promises';
+import { randomUUID } from 'crypto';
+import { ListingEntity, UserEntity } from '../entities';
 import { assertVerified } from '../user/verification-gate.util';
+import { SupabaseProvider } from '../auth/supabase.provider';
 import {
   bankingSchema,
   fullOnboardingSchema,
   listingSchema,
+  mediaSchema,
   planSchema,
   telemetrySchema,
+  ROOM_IDS,
 } from './listing-schema';
+
+type UploadedMulterFile = { buffer?: Buffer; path?: string; mimetype: string; size: number };
+
+const PHOTO_ALLOWED_TYPES: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+const PHOTO_MAX_BYTES = 8 * 1024 * 1024;
+
+const VIDEO_ALLOWED_TYPES: Record<string, string> = {
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+};
+const VIDEO_MAX_BYTES = 150 * 1024 * 1024;
 
 /** Statuses a host may resubmit from. `live`/`paused` are edited through a
  *  separate flow (not yet built) since they are already public; `in_review`
@@ -29,12 +52,12 @@ export type HostListingSummary = {
   title: string;
   town: string;
   fullAddress: string;
-  price: number | null;
+  dailyBaseRate: number | null;
   beds: string;
   bedrooms: number | null;
   bathrooms: number | null;
   maxGuests: number | null;
-  minMonths: number | null;
+  minDays: number | null;
   propertyType: string;
   photoCount: number;
   plan: string | null;
@@ -51,8 +74,9 @@ export class HostListingsService {
   constructor(
     @InjectRepository(ListingEntity)
     private readonly listings: Repository<ListingEntity>,
-    @InjectRepository(ProfileEntity)
-    private readonly profiles: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profiles: Repository<UserEntity>,
+    private readonly supabase: SupabaseProvider,
   ) {}
 
   /** The caller's own listings, scoped by the session's user id — a host can
@@ -85,12 +109,12 @@ export class HostListingsService {
         title: prop.title ?? '',
         town: prop.town ?? '',
         fullAddress: prop.fullAddress ?? '',
-        price: typeof prop.price === 'number' ? prop.price : null,
+        dailyBaseRate: typeof prop.dailyBaseRate === 'number' ? prop.dailyBaseRate : null,
         beds: prop.beds ?? '',
         bedrooms: prop.bedrooms ?? null,
         bathrooms: prop.bathrooms ?? null,
         maxGuests: prop.maxGuests ?? null,
-        minMonths: prop.minMonths ?? null,
+        minDays: prop.minDays ?? null,
         propertyType: prop.propertyType ?? '',
         photoCount: prop.photoCount ?? 0,
         plan: draft.plan?.plan ?? null,
@@ -100,6 +124,95 @@ export class HostListingsService {
         reviewReasonCategory: row.review_reason_category ?? null,
       };
     });
+  }
+
+  /**
+   * Keyed off the host only, not a listing — the wizard is a one-page form
+   * with no listing row until final submit (see submitFull), so photos
+   * upload to the host's own storage folder first and the returned URLs
+   * ride along in the submit-full/resubmit body afterward, same shape as
+   * every other wizard field. Room tags come from the host, paired
+   * atomically with each URL rather than a parallel array, so there is no
+   * index-drift risk between a photo and its tag.
+   */
+  async uploadPhotos(userId: string, files: UploadedMulterFile[], rooms: string[]) {
+    if (files.length !== rooms.length) {
+      throw new BadRequestException('Each file must have exactly one room tag.');
+    }
+    for (const room of rooms) {
+      if (!(ROOM_IDS as readonly string[]).includes(room)) {
+        throw new BadRequestException(`Invalid room tag: ${room}`);
+      }
+    }
+
+    const photos: { url: string; room: string }[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const ext = PHOTO_ALLOWED_TYPES[file.mimetype];
+      if (!ext) {
+        throw new BadRequestException('Unsupported file type. Use JPEG, PNG or WebP.');
+      }
+      if (file.size > PHOTO_MAX_BYTES) {
+        throw new BadRequestException({ error: 'File too large. Maximum size is 8 MB.', statusCode: 413 });
+      }
+      if (!file.buffer) {
+        throw new InternalServerErrorException('Photo upload expected an in-memory file.');
+      }
+
+      const storagePath = `${userId}/photos/${randomUUID()}.${ext}`;
+      const { error: uploadError } = await this.supabase.client.storage
+        .from('listing-media')
+        .upload(storagePath, file.buffer, { contentType: file.mimetype });
+      if (uploadError) {
+        throw new InternalServerErrorException('Upload failed. Please try again.');
+      }
+
+      const {
+        data: { publicUrl },
+      } = this.supabase.client.storage.from('listing-media').getPublicUrl(storagePath);
+      photos.push({ url: publicUrl, room: rooms[i] });
+    }
+
+    return photos;
+  }
+
+  /**
+   * A short property video, no transcoding — stored and served as-is.
+   * Uses Multer's disk storage (see host-listings.controller.ts's
+   * FileInterceptor options) rather than the in-memory buffering every
+   * other upload in this codebase uses: a 150MB cap held fully in RAM per
+   * concurrent request is a real resource risk at this size, unlike the
+   * ~5-30MB avatar/dispute-evidence uploads. The temp file is always
+   * removed, success or failure.
+   */
+  async uploadVideo(userId: string, file: UploadedMulterFile) {
+    const ext = VIDEO_ALLOWED_TYPES[file.mimetype];
+    if (!ext) {
+      throw new BadRequestException('Unsupported file type. Use MP4, WebM or MOV.');
+    }
+    if (file.size > VIDEO_MAX_BYTES) {
+      throw new BadRequestException({ error: 'File too large. Maximum size is 150 MB.', statusCode: 413 });
+    }
+    if (!file.path) {
+      throw new InternalServerErrorException('Video upload expected a temp file on disk.');
+    }
+
+    try {
+      const storagePath = `${userId}/video/${randomUUID()}.${ext}`;
+      const { error: uploadError } = await this.supabase.client.storage
+        .from('listing-media')
+        .upload(storagePath, createReadStream(file.path), { contentType: file.mimetype, duplex: 'half' });
+      if (uploadError) {
+        throw new InternalServerErrorException('Upload failed. Please try again.');
+      }
+
+      const {
+        data: { publicUrl },
+      } = this.supabase.client.storage.from('listing-media').getPublicUrl(storagePath);
+      return publicUrl;
+    } finally {
+      await unlink(file.path).catch(() => {});
+    }
   }
 
   /** A single listing the caller owns, flattened the same way findMine is,
@@ -122,6 +235,7 @@ export class HostListingsService {
         ...(draft.telemetry ?? {}),
         ...(draft.banking ?? {}),
         ...(draft.plan ?? {}),
+        ...(draft.media ?? {}),
       },
     };
   }
@@ -163,6 +277,7 @@ export class HostListingsService {
       telemetry: telemetrySchema.parse(d),
       banking: bankingSchema.parse(d),
       plan: planSchema.parse(d),
+      media: mediaSchema.parse(d),
     };
 
     existing.draft_data = draft_data;
@@ -214,6 +329,7 @@ export class HostListingsService {
       telemetry: telemetrySchema.parse(d),
       banking: bankingSchema.parse(d),
       plan: planSchema.parse(d),
+      media: mediaSchema.parse(d),
     };
 
     const created = this.listings.create({

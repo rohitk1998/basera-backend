@@ -57,6 +57,40 @@ export class PaymentsService {
     await this.paymentsRepo.update({ id: payment.id }, { status: 'refunded', updated_at: new Date() });
   }
 
+  /**
+   * The one payout path for a dispute settling on some split between guest
+   * and host — an accepted negotiation, an admin decision, or an appeal
+   * decision. `amountToGuest` of 0 or the full amount reproduces `release`/
+   * `refund` exactly, but is still recorded as `split` rather than reusing
+   * those two statuses, so a resolved dispute is always distinguishable
+   * from the plain auto-release/binary-resolve paths in the payments log.
+   *
+   * Re-callable on an already-`split`/`released_to_host`/`refunded` payment
+   * — an appeal needs to adjust an amount that already "moved". Since every
+   * payout here is simulated (no real gateway call), that's just an
+   * overwrite, not a reversal-then-reissue. A real gateway integration
+   * cannot re-split a payout already sent and would need an actual
+   * reversal-then-reissue flow at that point — noted here, not built now.
+   */
+  async splitRelease(bookingId: string, amountToGuest: number): Promise<void> {
+    const payment = await this.getForBooking(bookingId);
+    if (!payment) {
+      throw new InternalServerErrorException(`No payment found for booking ${bookingId}`);
+    }
+    if (amountToGuest < 0 || amountToGuest > payment.amount) {
+      throw new InternalServerErrorException('amountToGuest must be between 0 and the held amount');
+    }
+    await this.paymentsRepo.update(
+      { id: payment.id },
+      {
+        status: 'split',
+        split_amount_to_guest: amountToGuest,
+        cashfree_payout_id: `SIMULATED-${randomUUID()}`,
+        updated_at: new Date(),
+      },
+    );
+  }
+
   async listTransactions(userId: string, role?: 'guest' | 'host') {
     const qb = this.dataSource
       .createQueryBuilder(PaymentEntity, 'payment')

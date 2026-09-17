@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   InternalServerErrorException,
@@ -7,12 +8,9 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ProfileEntity } from '../entities';
+import { UserEntity } from '../entities';
 import { SupabaseProvider } from '../auth/supabase.provider';
 import { ProfilePayloadDto } from './dto/profile-payload.dto';
-import { HostKycDto } from './dto/host-kyc.dto';
-import { SelfieVerificationDto } from './dto/selfie-verification.dto';
-import { BankingVerificationDto } from './dto/banking-verification.dto';
 
 /** A freshly-created profile can't be edited for this many days — the fraud
  *  case is someone who just verified a phone number immediately rewriting
@@ -44,8 +42,8 @@ export interface ProfileEditLockedError {
 @Injectable()
 export class UserService {
   constructor(
-    @InjectRepository(ProfileEntity)
-    private readonly profiles: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profiles: Repository<UserEntity>,
     private readonly supabase: SupabaseProvider,
   ) {}
 
@@ -139,6 +137,15 @@ export class UserService {
           `Database schema is out of date (${err.message}). Apply the latest migration.`,
         );
       }
+      // email is unique-constrained — an existing user editing their email
+      // to one that already belongs to a different account is a real,
+      // foreseeable conflict (typo, shared family email), not a server
+      // failure. Same 23505 the completeSignup() phone-signup branch
+      // already guards against; this is the other place that insert can
+      // collide.
+      if (err?.code === '23505') {
+        throw new ConflictException('An account with this email already exists.');
+      }
       throw new InternalServerErrorException('Failed to update profile');
     }
 
@@ -154,51 +161,6 @@ export class UserService {
   async setIsHost(userId: string, isHost: boolean) {
     await this.profiles.update({ id: userId }, { isHost });
     return { success: true, isHost };
-  }
-
-  async saveHostKyc(userId: string, dto: HostKycDto) {
-    await this.profiles.update(
-      { id: userId },
-      {
-        host_kind: dto.host_kind,
-        pan: dto.pan,
-        gst: dto.gst || null,
-        registration_number: dto.registrationNumber,
-        kyc_completed_at: new Date(),
-      },
-    );
-    return { success: true };
-  }
-
-  /**
-   * Account-level verification, open to guests and hosts alike (unlike
-   * saveHostKyc above). No liveness/face-match — records that an upload
-   * happened, same mocked-trust posture as the rest of this product's
-   * verification stack. selfiePath is a Supabase Storage path in the
-   * 'selfies' bucket, written by the client via the existing
-   * POST /api/storage/upload-url flow before this call.
-   */
-  async saveSelfie(userId: string, dto: SelfieVerificationDto) {
-    await this.profiles.update(
-      { id: userId },
-      { selfie_url: dto.selfiePath, selfie_uploaded_at: new Date() },
-    );
-    return { success: true };
-  }
-
-  /**
-   * Account-level identity-banking proof — distinct from a listing's
-   * payout account (draft_data.banking on `listings`). The pass/mismatch
-   * penny-drop check itself runs client-side (same heuristic as
-   * HostOnboardingForm's BankingSection); this just persists the result
-   * once the client reports success.
-   */
-  async saveBanking(userId: string, dto: BankingVerificationDto) {
-    await this.profiles.update(
-      { id: userId },
-      { bank_upi: dto.upi, bank_account_name: dto.name, bank_verified_at: new Date() },
-    );
-    return { success: true };
   }
 
   async uploadAvatar(userId: string, file: { buffer: Buffer; mimetype: string; size: number }) {
@@ -221,7 +183,7 @@ export class UserService {
       throw new BadRequestException('Unsupported file type. Use JPEG, PNG, WebP or GIF.');
     }
     if (file.size < MIN_BYTES) {
-      throw new BadRequestException('File too small. Minimum size is 1 KB.');
+      throw new BadRequestException('File too small. Minimum size is 1 MB.');
     }
     if (file.size > MAX_BYTES) {
       throw new BadRequestException({ error: 'File too large. Maximum size is 5 MB.', statusCode: 413 });

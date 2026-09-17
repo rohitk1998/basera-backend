@@ -18,9 +18,6 @@ import { isSupportedLocale } from '../common/supported-locales';
 import { UserService } from './user.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ProfilePayloadDto } from './dto/profile-payload.dto';
-import { HostKycDto } from './dto/host-kyc.dto';
-import { SelfieVerificationDto } from './dto/selfie-verification.dto';
-import { BankingVerificationDto } from './dto/banking-verification.dto';
 import { BecomeHostDto } from './dto/become-host.dto';
 import { PushTokenDto } from './dto/push-token.dto';
 import { SetLocaleDto } from './dto/set-locale.dto';
@@ -77,23 +74,6 @@ export class UserController {
     return this.userService.setIsHost(user.userId, dto.isHost);
   }
 
-  @Post('kyc')
-  saveKyc(@CurrentUser() user: AuthUser, @Body() dto: HostKycDto) {
-    return this.userService.saveHostKyc(user.userId, dto);
-  }
-
-  // Account-level verification steps — open to guests and hosts alike,
-  // unlike POST kyc above (host-only). See verification-gate.util.ts for
-  // where these are enforced.
-  @Post('verification/selfie')
-  saveSelfie(@CurrentUser() user: AuthUser, @Body() dto: SelfieVerificationDto) {
-    return this.userService.saveSelfie(user.userId, dto);
-  }
-
-  @Post('verification/banking')
-  saveBanking(@CurrentUser() user: AuthUser, @Body() dto: BankingVerificationDto) {
-    return this.userService.saveBanking(user.userId, dto);
-  }
 
   @Post('avatar')
   @UseInterceptors(FileInterceptor('avatar'))

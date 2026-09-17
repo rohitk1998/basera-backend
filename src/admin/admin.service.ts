@@ -1,18 +1,22 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { z } from 'zod';
 import {
   ListingEntity,
-  ProfileEntity,
+  UserEntity,
   BookingEntity,
   NotificationLogEntity,
   PaymentEntity,
   HostSubscriptionEntity,
+  DisputeCaseEntity,
+  VerificationRequestEntity,
+  VerificationAuditLogEntity,
 } from '../entities';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ListingTranslationService } from '../listings/listing-translation.service';
 import { BookingsService } from '../bookings/bookings.service';
+import { StorageService } from '../storage/storage.service';
 
 type AuditEvent = {
   id: string;
@@ -61,6 +65,29 @@ const reviewSchema = z
 
 export type ReviewDecisionInput = z.infer<typeof reviewSchema>;
 
+const VERIFICATION_TYPES = ['identity', 'pan', 'bank', 'legal', 'selfie'] as const;
+
+/** Same reason-required-on-reject shape as reviewSchema above, for the
+ *  verification_requests review decision. */
+const verificationReviewSchema = z
+  .object({
+    decision: z.enum(['approve', 'reject']),
+    rejectionReason: z.string().trim().max(2000).optional(),
+  })
+  .refine((body) => body.decision !== 'reject' || !!body.rejectionReason?.trim(), {
+    message: 'A rejection reason is required to reject a verification request.',
+  });
+
+export type VerificationReviewInput = z.infer<typeof verificationReviewSchema>;
+
+const VERIFICATION_LAYER_NAME: Record<string, string> = {
+  identity: 'identity',
+  pan: 'PAN',
+  bank: 'bank',
+  legal: 'HP Tourism registration',
+  selfie: 'selfie',
+};
+
 function resolveIsHost(p: { isHost?: unknown; role?: unknown }): boolean {
   if (typeof p.isHost === 'boolean') return p.isHost;
   return p.role === 'host';
@@ -74,14 +101,18 @@ function resolveIsAdmin(p: { role?: unknown }): boolean {
 export class AdminService {
   constructor(
     @InjectRepository(ListingEntity) private readonly listings: Repository<ListingEntity>,
-    @InjectRepository(ProfileEntity) private readonly profiles: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity) private readonly profiles: Repository<UserEntity>,
     @InjectRepository(BookingEntity) private readonly bookings: Repository<BookingEntity>,
     @InjectRepository(NotificationLogEntity) private readonly notificationLog: Repository<NotificationLogEntity>,
     @InjectRepository(PaymentEntity) private readonly payments: Repository<PaymentEntity>,
     @InjectRepository(HostSubscriptionEntity) private readonly subscriptions: Repository<HostSubscriptionEntity>,
+    @InjectRepository(DisputeCaseEntity) private readonly disputeCases: Repository<DisputeCaseEntity>,
+    @InjectRepository(VerificationRequestEntity) private readonly verificationRequests: Repository<VerificationRequestEntity>,
+    @InjectRepository(VerificationAuditLogEntity) private readonly verificationAuditLog: Repository<VerificationAuditLogEntity>,
     private readonly notifications: NotificationsService,
     private readonly listingTranslations: ListingTranslationService,
     private readonly bookingsService: BookingsService,
+    private readonly storage: StorageService,
   ) {}
 
   // --- audits -------------------------------------------------------------
@@ -224,8 +255,9 @@ export class AdminService {
       const legalStep = draft.legal || {};
       const telemetryStep = draft.telemetry || {};
       const bankingStep = draft.banking || {};
+      const mediaStep = draft.media || {};
 
-      const profile = profileMap.get(row.host_id) || ({} as Partial<ProfileEntity>);
+      const profile = profileMap.get(row.host_id) || ({} as Partial<UserEntity>);
 
       const title =
         propStep.title ||
@@ -239,9 +271,12 @@ export class AdminService {
       const beds = propStep.beds || (propStep.bedrooms ? `${propStep.bedrooms} BHK` : '1 room · private bath');
       const term = propStep.minMonths ? `${propStep.minMonths}–12 mo` : '1–6 mo';
 
+      // Photos live at draft.property_details.photos (photoSchema entries,
+      // { url, room }), not a top-level draft.photos — see listing-mapper.ts
+      // rowToListing() for the same convention on the public listing side.
       const photos: string[] =
-        draft.photos && draft.photos.length > 0
-          ? draft.photos
+        propStep.photos && propStep.photos.length > 0
+          ? propStep.photos.map((p: { url: string } | string) => (typeof p === 'string' ? p : p.url))
           : [
               `https://picsum.photos/seed/${row.id}-1/900/600`,
               `https://picsum.photos/seed/${row.id}-2/900/600`,
@@ -274,8 +309,13 @@ export class AdminService {
           },
           telemetry: {
             status: telemetryStep.status || 'not_started',
-            videoUrl: telemetryStep.videoUrl,
-            gpsMatched: telemetryStep.gpsMatched ?? false,
+            // The walkthrough video is the same upload as the public
+            // listing's property video — mediaSchema.videoUrl, not a
+            // separate telemetry-only field (telemetrySchema only ever
+            // carries walkthroughPassed).
+            videoUrl: mediaStep.videoUrl,
+            tourUrl: mediaStep.tourUrl,
+            gpsMatched: telemetryStep.walkthroughPassed ?? telemetryStep.gpsMatched ?? false,
             coordinates: telemetryStep.coordinates,
             wifiSpeedMbps: telemetryStep.wifiSpeedMbps,
           },
@@ -560,7 +600,10 @@ export class AdminService {
     return { payments, total: payments.length };
   }
 
-  /** Open disputes queue — the only way a `disputed` booking gets resolved. */
+  /** Every disputed booking's case — `open`/`negotiating` show read-only
+   *  (still between guest and host, admin can peek but shouldn't be
+   *  tempted to short-circuit negotiation), `escalated` is the actionable
+   *  queue, `appealed` needs a final look. */
   async getDisputes() {
     const rows = await this.bookings.find({ where: { status: 'disputed' }, order: { updated_at: 'DESC' } });
     if (rows.length === 0) {
@@ -570,10 +613,11 @@ export class AdminService {
     const listingIds = Array.from(new Set(rows.map((r) => r.listing_id)));
     const partyIds = Array.from(new Set(rows.flatMap((r) => [r.guest_id, r.host_id])));
 
-    const [listingRows, profileRows, paymentRows] = await Promise.all([
+    const [listingRows, profileRows, paymentRows, caseRows] = await Promise.all([
       this.listings.find({ where: listingIds.map((id) => ({ id })), select: { id: true, draft_data: true } }),
       this.profiles.find({ where: partyIds.map((id) => ({ id })), select: { id: true, full_name: true } }),
       this.payments.find({ where: rows.map((r) => ({ booking_id: r.id })) }),
+      this.disputeCases.find({ where: rows.map((r) => ({ booking_id: r.id })) }),
     ]);
 
     const titleById = new Map(
@@ -581,28 +625,58 @@ export class AdminService {
     );
     const nameById = new Map(profileRows.map((p) => [p.id, p.full_name ?? 'Basera user']));
     const paymentByBookingId = new Map(paymentRows.map((p) => [p.booking_id, p]));
+    const caseByBookingId = new Map(caseRows.map((c) => [c.booking_id, c]));
 
-    const disputes = rows.map((row) => ({
-      bookingId: row.id,
-      listingId: row.listing_id,
-      listingTitle: titleById.get(row.listing_id) ?? 'Listing',
-      guestName: nameById.get(row.guest_id) ?? 'Basera user',
-      hostName: nameById.get(row.host_id) ?? 'Basera user',
-      reason: row.rejection_reason,
-      amount: paymentByBookingId.get(row.id)?.amount ?? row.due_at_move_in,
-      checkinTime: row.checkin_time,
-      updatedAt: row.updated_at,
-    }));
+    const disputes = rows.map((row) => {
+      const disputeCase = caseByBookingId.get(row.id);
+      return {
+        bookingId: row.id,
+        listingId: row.listing_id,
+        listingTitle: titleById.get(row.listing_id) ?? 'Listing',
+        guestName: nameById.get(row.guest_id) ?? 'Basera user',
+        hostName: nameById.get(row.host_id) ?? 'Basera user',
+        category: disputeCase?.category ?? null,
+        reason: disputeCase?.description ?? row.rejection_reason,
+        requestedAmount: disputeCase?.requested_amount ?? null,
+        evidenceUrls: disputeCase?.evidence_urls ?? [],
+        caseStatus: disputeCase?.case_status ?? null,
+        amount: paymentByBookingId.get(row.id)?.amount ?? row.due_at_move_in,
+        checkinTime: row.checkin_time,
+        updatedAt: row.updated_at,
+      };
+    });
 
     return { disputes, total: disputes.length };
   }
 
-  /** Resolves a disputed booking: `refund` sides with the guest, `release` sides with the host. */
-  async resolveDispute(bookingId: string, adminUserId: string, resolution: unknown) {
-    if (resolution !== 'refund' && resolution !== 'release') {
-      throw new BadRequestException('resolution must be "refund" or "release"');
+  /** Full case detail for the admin's case-review view — claim, evidence,
+   *  and the whole negotiation/decision timeline, not just the isolated
+   *  claim text `getDisputes` summarizes for the list. */
+  async getDisputeCase(bookingId: string, adminUserId: string) {
+    return this.bookingsService.getDisputeCase(adminUserId, bookingId);
+  }
+
+  /** Admin resolution of an escalated case, for any amount to the guest —
+   *  0 or the full paid amount reproduces the old binary refund/release. */
+  async resolveDispute(bookingId: string, adminUserId: string, amountToGuest: unknown, message: unknown) {
+    if (typeof amountToGuest !== 'number' || !Number.isInteger(amountToGuest) || amountToGuest < 0) {
+      throw new BadRequestException('amountToGuest must be a non-negative integer');
     }
-    return this.bookingsService.resolveDispute(adminUserId, bookingId, resolution);
+    if (message !== undefined && typeof message !== 'string') {
+      throw new BadRequestException('message must be a string');
+    }
+    return this.bookingsService.resolveDispute(adminUserId, bookingId, amountToGuest, message);
+  }
+
+  /** Final say after one appeal — same validation shape as resolveDispute. */
+  async resolveAppeal(bookingId: string, adminUserId: string, amountToGuest: unknown, message: unknown) {
+    if (typeof amountToGuest !== 'number' || !Number.isInteger(amountToGuest) || amountToGuest < 0) {
+      throw new BadRequestException('amountToGuest must be a non-negative integer');
+    }
+    if (message !== undefined && typeof message !== 'string') {
+      throw new BadRequestException('message must be a string');
+    }
+    return this.bookingsService.resolveAppeal(adminUserId, bookingId, amountToGuest, message);
   }
 
   /** Ops visibility into who's on what plan/status. */
@@ -626,5 +700,323 @@ export class AdminService {
     }));
 
     return { subscriptions, total: subscriptions.length };
+  }
+
+  // --- verification requests ----------------------------------------------
+
+  /**
+   * Full detail for one verification request: everything in the list view
+   * plus the raw analysis_result, a short-lived signed document URL (via
+   * StorageService — omitted when there is no document, e.g. some bank
+   * submissions), the relevant profile fields for cross-check, the user's
+   * older attempts at the same verification_type (resubmission history,
+   * most recent first), and the full audit-log trail for this request.
+   */
+  async getVerificationRequestDetail(id: string) {
+    const row = await this.verificationRequests.findOne({ where: { id } });
+    if (!row) {
+      throw new NotFoundException('Verification request not found');
+    }
+
+    const previousRows = await this.verificationRequests.find({
+      where: { user_id: row.user_id, verification_type: row.verification_type },
+      order: { submitted_at: 'DESC' },
+    });
+    const previousAttempts = previousRows
+      .filter((r) => r.id !== row.id)
+      .map((r) => ({
+        id: r.id,
+        status: r.status,
+        rejectionReason: r.rejection_reason,
+        submittedAt: r.submitted_at,
+        reviewedAt: r.reviewed_at,
+      }));
+
+    const auditLogRows = await this.verificationAuditLog.find({
+      where: { verification_request_id: id },
+      order: { created_at: 'DESC' },
+    });
+
+    const reviewerIds = [row.reviewed_by, ...auditLogRows.map((a) => a.admin_id)].filter(
+      (v): v is string => !!v,
+    );
+    const profileIds = Array.from(new Set([row.user_id, ...reviewerIds]));
+    const profiles = await this.profiles.find({
+      where: profileIds.map((pid) => ({ id: pid })),
+      select: {
+        id: true,
+        full_name: true,
+        phone: true,
+        bank_upi: true,
+        bank_account_name: true,
+        registration_number: true,
+        pan: true,
+      },
+    });
+    const profileById = new Map(profiles.map((p) => [p.id, p]));
+    const submitterProfile = profileById.get(row.user_id);
+
+    let documentUrl: string | null = null;
+    if (row.document_path) {
+      documentUrl = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path, 300);
+    }
+
+    const auditLog = auditLogRows.map((a) => ({
+      id: a.id,
+      action: a.action,
+      previousStatus: a.previous_status,
+      newStatus: a.new_status,
+      rejectionReason: a.rejection_reason,
+      adminId: a.admin_id,
+      adminName: a.admin_id ? (profileById.get(a.admin_id)?.full_name ?? null) : null,
+      createdAt: a.created_at,
+    }));
+
+    return {
+      id: row.id,
+      userId: row.user_id,
+      userName: submitterProfile?.full_name ?? 'Basera user',
+      userPhone: submitterProfile?.phone ?? '',
+      verificationType: row.verification_type,
+      documentSubtype: row.document_subtype,
+      status: row.status,
+      submittedAt: row.submitted_at,
+      reviewedAt: row.reviewed_at,
+      reviewedBy: row.reviewed_by ? (profileById.get(row.reviewed_by)?.full_name ?? null) : null,
+      rejectionReason: row.rejection_reason,
+      analysisResult: row.analysis_result,
+      documentUrl,
+      bank:
+        row.verification_type === 'bank'
+          ? {
+              accountNumber: row.bank_account_number,
+              ifsc: row.bank_ifsc,
+              accountHolderName: row.bank_account_holder_name,
+              bankName: row.bank_name,
+              // Existing profile fields, for the admin to cross-check the
+              // new submission against what's already on file.
+              profileBankUpi: submitterProfile?.bank_upi ?? null,
+              profileBankAccountName: submitterProfile?.bank_account_name ?? null,
+            }
+          : undefined,
+      legal:
+        row.verification_type === 'legal'
+          ? {
+              registrationNumber: row.registration_number,
+              // Existing self-attested profile fields, for cross-check —
+              // same idea as bank's profileBankUpi/profileBankAccountName.
+              profileRegistrationNumber: submitterProfile?.registration_number ?? null,
+              profilePan: submitterProfile?.pan ?? null,
+            }
+          : undefined,
+      previousAttempts,
+      auditLog,
+    };
+  }
+
+  /**
+   * Admin approve/reject decision on a verification request. Server-side
+   * state machine: only a `pending` request can be reviewed here —
+   * verified/rejected are terminal from this endpoint, the only way back to
+   * pending is the user resubmitting (which creates a new row, never
+   * mutates this one). rejectionReason is required on reject.
+   *
+   * On approve of identity/pan: profiles has no dedicated "identity
+   * verified"/"pan verified" column, and none is invented here — the
+   * verification_requests row itself (status=verified) is the source of
+   * truth for that concept; assertVerified() does not gate on
+   * identity/pan today, so nothing else needs to change for those two
+   * types to reflect approval.
+   *
+   * On approve of bank: profiles.bank_verified_at is set to now() because
+   * assertVerified() gates on exactly that column — approving a bank
+   * request must actually flip the gate the user-facing app already
+   * checks. profiles.bank_account_name is overwritten with the submitted
+   * holder name (the same column the old client-only heuristic check
+   * wrote to), so the profile reflects the newly-verified identity.
+   * profiles.bank_upi is intentionally left untouched: the new bank
+   * verification flow collects accountNumber+IFSC, not a UPI id, so there
+   * is nothing here to write into bank_upi — it stays whatever the user
+   * separately set it to (or null), and is surfaced read-only in
+   * getVerificationRequestDetail for cross-check instead.
+   */
+  async reviewVerificationRequest(id: string, adminId: string, body: unknown) {
+    const parsed = verificationReviewSchema.safeParse(body ?? {});
+    if (!parsed.success) {
+      throw new BadRequestException(parsed.error.issues[0]?.message ?? 'Invalid review payload');
+    }
+    const { decision, rejectionReason } = parsed.data;
+
+    const row = await this.verificationRequests.findOne({ where: { id } });
+    if (!row) {
+      throw new NotFoundException('Verification request not found');
+    }
+    if (row.status !== 'pending') {
+      throw new ConflictException(
+        `This request has already been reviewed (status: ${row.status}). Only pending requests can be reviewed.`,
+      );
+    }
+
+    const newStatus = decision === 'approve' ? 'verified' : 'rejected';
+    const now = new Date();
+
+    await this.verificationRequests.update(
+      { id },
+      {
+        status: newStatus,
+        reviewed_by: adminId,
+        reviewed_at: now,
+        rejection_reason: decision === 'reject' ? rejectionReason! : null,
+        updated_at: now,
+      },
+    );
+
+    if (decision === 'approve' && row.verification_type === 'bank') {
+      await this.profiles.update(
+        { id: row.user_id },
+        {
+          bank_verified_at: now,
+          bank_account_name: row.bank_account_holder_name ?? undefined,
+        },
+      );
+    }
+
+    // On approve of legal: profiles.registration_number and
+    // kyc_completed_at are the columns assertVerified()'s requireHostKyc
+    // branch and host-listings' submit gate already read — approving this
+    // request must actually flip them, same reasoning as bank above. This
+    // is what moves the HP Tourism certificate off the old
+    // instant-self-attest POST /api/user/kyc path onto real admin review.
+    if (decision === 'approve' && row.verification_type === 'legal') {
+      await this.profiles.update(
+        { id: row.user_id },
+        {
+          registration_number: row.registration_number ?? undefined,
+          kyc_completed_at: now,
+        },
+      );
+    }
+
+    // On approve of selfie: profiles.selfie_uploaded_at is what
+    // assertVerified() actually gates on. The new flow uploads straight to
+    // verification_requests.document_path (not the old
+    // signed-URL-then-POST-/api/user/verification/selfie path), so nothing
+    // else sets this column for a submission reviewed through here —
+    // approval is what makes it real, same reasoning as bank/legal above.
+    // profiles.selfie_url is intentionally left as whatever the old flow
+    // set it to (or null): the reviewed photo lives in document_path /
+    // the private verification-documents bucket, not duplicated there.
+    if (decision === 'approve' && row.verification_type === 'selfie') {
+      await this.profiles.update({ id: row.user_id }, { selfie_uploaded_at: now });
+    }
+
+    await this.verificationAuditLog.save(
+      this.verificationAuditLog.create({
+        verification_request_id: id,
+        user_id: row.user_id,
+        admin_id: adminId,
+        action: decision === 'approve' ? 'approved' : 'rejected',
+        previous_status: 'pending',
+        new_status: newStatus,
+        rejection_reason: decision === 'reject' ? rejectionReason : null,
+      }),
+    );
+
+    const layerName = VERIFICATION_LAYER_NAME[row.verification_type] ?? row.verification_type;
+    if (decision === 'approve') {
+      this.notifications.notify('verification.layer_passed', row.user_id, {
+        layerName,
+        pushTitle: `${layerName} verification passed`,
+        pushBody: `Your ${layerName} verification was approved`,
+        link: '/account',
+      });
+    } else {
+      this.notifications.notify('verification.layer_failed', row.user_id, {
+        layerName,
+        failReason: rejectionReason,
+        pushTitle: `${layerName} verification needs another look`,
+        pushBody: rejectionReason,
+        link: '/account',
+      });
+    }
+
+    const updated = await this.verificationRequests.findOne({ where: { id } });
+    return { success: true, request: updated };
+  }
+
+  /**
+   * Admin document access — same signed-URL mechanism as the user-facing
+   * route but WITHOUT an ownership check, since AdminGuard already gates
+   * the whole controller and an admin is allowed to view any user's
+   * document. Still a short-lived signed URL, never getPublicUrl().
+   */
+  async getVerificationDocumentUrl(id: string) {
+    const row = await this.verificationRequests.findOne({ where: { id }, select: { id: true, document_path: true } });
+    if (!row) {
+      throw new NotFoundException('Verification request not found');
+    }
+    if (!row.document_path) {
+      throw new NotFoundException('This verification request has no document');
+    }
+
+    const url = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path, 300);
+    return { url };
+  }
+
+  /**
+   * All of one user's verification requests, grouped by type — the data
+   * behind UserDetailModal's "Verification" section. Replaces the old
+   * standalone cross-user "Verification" admin tab: reviewing verification
+   * is now something an admin does from a user's own profile, not from a
+   * separate global queue. For each of the 5 verification_type values,
+   * returns the most recent row (the "current" one — same convention as
+   * VerificationService.getMyStatus on the user side) plus any older rows
+   * as resubmission history, so nothing about a user's status/history is
+   * lost by dropping the flat table view.
+   */
+  async getUserVerificationSummary(userId: string) {
+    const rows = await this.verificationRequests.find({
+      where: { user_id: userId },
+      order: { submitted_at: 'DESC' },
+    });
+
+    const reviewerIds = Array.from(new Set(rows.map((r) => r.reviewed_by).filter((id): id is string => !!id)));
+    const reviewers = reviewerIds.length
+      ? await this.profiles.find({ where: reviewerIds.map((id) => ({ id })), select: { id: true, full_name: true } })
+      : [];
+    const reviewerNameById = new Map(reviewers.map((p) => [p.id, p.full_name ?? 'Admin']));
+
+    const toSummaryRow = (row: VerificationRequestEntity) => {
+      const analysis = row.analysis_result as { errors?: unknown[] } | null;
+      return {
+        id: row.id,
+        documentSubtype: row.document_subtype,
+        status: row.status,
+        submittedAt: row.submitted_at,
+        reviewedAt: row.reviewed_at,
+        reviewedBy: row.reviewed_by ? (reviewerNameById.get(row.reviewed_by) ?? 'Admin') : null,
+        rejectionReason: row.rejection_reason,
+        hasAnalysisErrors: Array.isArray(analysis?.errors) && analysis!.errors!.length > 0,
+      };
+    };
+
+    const byType = new Map<string, VerificationRequestEntity[]>();
+    for (const row of rows) {
+      const list = byType.get(row.verification_type) ?? [];
+      list.push(row);
+      byType.set(row.verification_type, list);
+    }
+
+    const types = VERIFICATION_TYPES.map((type) => {
+      const typeRows = byType.get(type) ?? [];
+      const [current, ...previous] = typeRows;
+      return {
+        type,
+        current: current ? toSummaryRow(current) : null,
+        previousAttempts: previous.map(toSummaryRow),
+      };
+    });
+
+    return { userId, types };
   }
 }

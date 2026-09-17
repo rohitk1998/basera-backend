@@ -48,7 +48,14 @@ export class AuthGuard implements CanActivate {
       if (!decoded.sub) throw new Error('No user ID in token');
 
       return { userId: decoded.sub, phone: decoded.phone_number as string | undefined };
-    } catch {
+    } catch (err) {
+      // Distinguish "expired" (code: 'session_expired') from anything else
+      // so the frontend's fetch wrapper knows an /api/auth/refresh retry is
+      // worth attempting rather than sending the user straight to login —
+      // see web/lib/auth-fetch.ts.
+      if (err instanceof jwt.TokenExpiredError) {
+        throw new UnauthorizedException({ code: 'session_expired', message: 'Session expired' });
+      }
       throw new UnauthorizedException('Invalid or expired session');
     }
   }

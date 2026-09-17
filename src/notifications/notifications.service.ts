@@ -3,7 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { ConfigService } from '@nestjs/config';
 import { IsNull, Repository } from 'typeorm';
 import * as jwt from 'jsonwebtoken';
-import { NotificationLogEntity, ProfileEntity } from '../entities';
+import * as nodemailer from 'nodemailer';
+import { NotificationLogEntity, UserEntity } from '../entities';
 import { EMAIL_TEMPLATES } from './email-templates';
 import { notificationCopy } from './notification-copy';
 import { NotificationData, NotificationEvent } from './notifications.types';
@@ -47,8 +48,8 @@ export class NotificationsService {
   private fcmTokenExpiry = 0;
 
   constructor(
-    @InjectRepository(ProfileEntity)
-    private readonly profiles: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profiles: Repository<UserEntity>,
     @InjectRepository(NotificationLogEntity)
     private readonly notificationLog: Repository<NotificationLogEntity>,
     private readonly config: ConfigService,
@@ -221,6 +222,81 @@ export class NotificationsService {
         row.payload = data as Record<string, unknown>;
       });
       await this.notificationLog.save(rows);
+    }
+  }
+
+  /**
+   * Awaited email send for the one caller that must see a failure rather
+   * than have it swallowed: AuthController.sendEmailOtp. Every other email
+   * in this app goes through notify()'s fire-and-forget dispatch(), where a
+   * failed send is merely logged — fine for a "welcome" or "dispute
+   * escalated" email, not fine for the OTP itself, since the user has no
+   * other way to know the code never arrived. Reuses the same EMAIL_TEMPLATES
+   * lookup and sendEmail() plumbing as every other template; just doesn't
+   * swallow the result.
+   */
+  async sendEmailNow(to: string, event: string, data: Record<string, unknown>): Promise<void> {
+    const result = await this.sendEmail(to, event, data);
+    if (result.status === 'failed') {
+      throw new Error(result.error ?? `Failed to send email for event=${event}`);
+    }
+    if (result.status === 'skipped') {
+      throw new Error(`Email skipped for event=${event} — missing template or RESEND_API_KEY`);
+    }
+  }
+
+  /**
+   * OTP-only delivery path, via Gmail SMTP instead of Resend. Resend's
+   * shared onboarding@resend.dev sender only delivers to a handful of
+   * Resend-owned test addresses until a real domain is verified on the
+   * account — fine for the "welcome"/dispute emails during development
+   * (those go to whoever's testing), but useless for an OTP code that has
+   * to reach an arbitrary real inbox right now. Kept entirely separate from
+   * sendEmailNow/sendEmail above: same EMAIL_TEMPLATES['auth.otp_code']
+   * template, different transport, and this is the only thing SMTP_* is
+   * used for — every other email in this app still goes through Resend.
+   */
+  private smtpTransporter: nodemailer.Transporter | null = null;
+
+  private getSmtpTransporter(): nodemailer.Transporter {
+    if (this.smtpTransporter) return this.smtpTransporter;
+
+    const host = this.config.get<string>('SMTP_HOST');
+    const port = this.config.get<string>('SMTP_PORT');
+    const user = this.config.get<string>('SMTP_USER');
+    const pass = this.config.get<string>('SMTP_PASS');
+
+    if (!host || !port || !user || !pass) {
+      throw new Error('SMTP is not configured — set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS.');
+    }
+
+    this.smtpTransporter = nodemailer.createTransport({
+      host,
+      port: Number(port),
+      // 587 is STARTTLS (secure: false, upgraded after connect), not the
+      // implicit-TLS 465 that Gmail also serves — the two are not
+      // interchangeable with the same `secure` flag.
+      secure: Number(port) === 465,
+      auth: { user, pass },
+    });
+    return this.smtpTransporter;
+  }
+
+  async sendEmailOtpViaSmtp(to: string, data: Record<string, unknown>): Promise<void> {
+    const template = EMAIL_TEMPLATES['auth.otp_code'];
+    const { subject, html } = template(data, {
+      absoluteLink: (link) => this.absoluteLink(link),
+      appUrl: this.appUrl,
+      logoIconUrl: this.logoIconUrl,
+    });
+
+    const transporter = this.getSmtpTransporter();
+    const from = this.config.get<string>('SMTP_USER')!;
+
+    try {
+      await transporter.sendMail({ from: `Basera <${from}>`, to, subject, html });
+    } catch (e: any) {
+      throw new Error(e?.message ?? 'Failed to send OTP email via SMTP');
     }
   }
 

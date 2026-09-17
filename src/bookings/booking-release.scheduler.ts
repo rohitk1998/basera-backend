@@ -23,5 +23,13 @@ export class BookingReleaseScheduler {
     } catch (err) {
       this.logger.error('[handleExpiredHolds] failed', err as Error);
     }
+    // Piggybacks on this same tick rather than a second @Cron for one
+    // query — a negotiating dispute with no reply in NEGOTIATION_STALE_HOURS
+    // gets forced to admin review.
+    try {
+      await this.bookingsService.escalateStaleNegotiations();
+    } catch (err) {
+      this.logger.error('[escalateStaleNegotiations] failed', err as Error);
+    }
   }
 }

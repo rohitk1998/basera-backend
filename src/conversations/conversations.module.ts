@@ -6,7 +6,7 @@ import {
   ConversationPresenceEntity,
   ListingEntity,
   MessageEntity,
-  ProfileEntity,
+  UserEntity,
 } from '../entities';
 import { AuthModule } from '../auth/auth.module';
 import { NotificationsModule } from '../notifications/notifications.module';
@@ -20,7 +20,7 @@ import { ConversationsService } from './conversations.service';
       MessageEntity,
       CallEntity,
       ListingEntity,
-      ProfileEntity,
+      UserEntity,
       ConversationPresenceEntity,
     ]),
     AuthModule,

@@ -108,6 +108,16 @@ export function emailShell(opts: EmailShellOpts): string {
 // an email is called with exactly this key from an app route — see
 // grep -rn "notify(" app/api — so a key here with no caller, or a caller
 // with no key here, is a real gap, not a naming choice.
+//
+// Deliberately narrow: email fires only for account registration and the
+// dispute sub-flow. Everything else in the booking lifecycle (confirmed,
+// declined, cancelled, completed, listing status, verification, messages,
+// calls) reaches the user through push + in-app only — see notify() in
+// notifications.service.ts, which skips email whenever EMAIL_TEMPLATES has
+// no entry for the event. Disputes get email because they're money-on-the-
+// line and time-boxed (a missed push shouldn't cost someone their response
+// window); registration gets it because it's the one message guaranteed to
+// land before push permission has even been granted.
 export type Template = (
   data: Record<string, unknown>,
   ctx: { absoluteLink: (link: unknown) => string; appUrl: string; logoIconUrl: string },
@@ -133,155 +143,79 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       logoIconUrl,
     }),
   }),
-  'booking.requested': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `${d.guestName ?? 'A guest'} wants to stay at ${d.listingTitle}`,
+  'booking.disputed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `A dispute was raised for ${d.listingTitle}`,
     html: emailShell({
-      preheader: `New booking request for ${d.listingTitle}`,
+      preheader: `Basera is reviewing a dispute for ${d.listingTitle}`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;"><strong>${d.guestName ?? 'A guest'}</strong> would like to stay at
-        <strong>${d.listingTitle}</strong>, moving in ${d.moveIn}.</p>
-        <p style="margin: 0;">Reply within 24 hours — guests can see how quickly hosts usually respond.</p>
+        <p style="margin: 0 0 12px;"><strong>${d.guestName ?? 'Your guest'}</strong> raised a dispute for
+        <strong>${d.listingTitle}</strong>. The held payment stays with Basera until this is resolved.</p>
+        <p style="margin: 0;">Review the details and respond — this affects when the payment is released.</p>
       `,
-      ctaLabel: 'Review the request',
+      ctaLabel: 'Review the dispute',
       ctaLink: absoluteLink(d.link),
       appUrl,
       logoIconUrl,
     }),
   }),
-  'booking.confirmed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `${d.hostName ?? 'Your host'} confirmed your stay at ${d.listingTitle}`,
+  'dispute.offer_received': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `New offer on the dispute for ${d.listingTitle}`,
     html: emailShell({
-      preheader: `Your booking at ${d.listingTitle} is confirmed`,
+      preheader: `A settlement offer is waiting for your response`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">Good news — <strong>${d.hostName ?? 'your host'}</strong> confirmed your stay at
-        <strong>${d.listingTitle}</strong>${d.moveIn ? `, from ${d.moveIn}` : ''}.</p>
-        <p style="margin: 0;">Pay directly by UPI or cash when you arrive. Basera never holds or moves this money on your behalf.</p>
+        <p style="margin: 0 0 12px;">The other party made an offer to settle the dispute for
+        <strong>${d.listingTitle}</strong>.</p>
+        <p style="margin: 0;">Accept, counter, or escalate to Basera — the held payment isn't released until this is settled.</p>
       `,
-      ctaLabel: 'Message your host',
+      ctaLabel: 'Respond to the offer',
       ctaLink: absoluteLink(d.link),
       appUrl,
       logoIconUrl,
     }),
   }),
-  'booking.declined': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `Your request for ${d.listingTitle} wasn't accepted`,
+  'dispute.escalated': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `Dispute for ${d.listingTitle} escalated to Basera`,
     html: emailShell({
-      preheader: `Your booking request was declined`,
+      preheader: `Basera will now review this dispute directly`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">The host wasn't able to accept your request for <strong>${d.listingTitle}</strong> this time.</p>
-        <p style="margin: 0;">This happens for all sorts of reasons that have nothing to do with you — there are plenty of other verified stays nearby.</p>
+        <p style="margin: 0 0 12px;">The dispute for <strong>${d.listingTitle}</strong> couldn't be settled directly and has been escalated to Basera for review.</p>
+        <p style="margin: 0;">You'll hear back once a decision is made — no action is needed from you right now.</p>
       `,
-      ctaLabel: 'Browse other stays',
-      ctaLink: absoluteLink('/stays'),
-      appUrl,
-      logoIconUrl,
-    }),
-  }),
-  'booking.cancelled': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `Booking cancelled — ${d.listingTitle}`,
-    html: emailShell({
-      preheader: `The booking for ${d.listingTitle} was cancelled`,
-      bodyHtml: `
-        <p style="margin: 0;">The booking for <strong>${d.listingTitle}</strong> has been cancelled. Nothing further is owed on either side.</p>
-      `,
-      ctaLabel: 'View details',
+      ctaLabel: 'View the case',
       ctaLink: absoluteLink(d.link),
       appUrl,
       logoIconUrl,
     }),
   }),
-  'booking.completed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `How was your stay at ${d.listingTitle}?`,
+  // Transactional — sent by the dedicated awaited send path in
+  // AuthController.sendEmailOtp, not via notify()/dispatch() like every
+  // other row here (a failed OTP email must surface to the caller as an
+  // error, not be swallowed the way notify() swallows failures). Kept in
+  // this same lookup table anyway so every "what emails does this app
+  // send" grep still finds it in one place.
+  'auth.otp_code': (d, { appUrl, logoIconUrl }) => ({
+    subject: `${d.code} is your Basera code`,
     html: emailShell({
-      preheader: `Leave a review for ${d.listingTitle}`,
+      preheader: `Your Basera sign-in code is ${d.code}`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">Hope the stay at <strong>${d.listingTitle}</strong> went well.</p>
-        <p style="margin: 0;">A quick review helps other guests trust what they're booking, and helps good hosts get found.</p>
+        <p style="margin: 0 0 16px;">Use this code to sign in to Basera. It expires in ${d.expiresInMinutes} minutes.</p>
+        <p style="margin: 0; font-size: 32px; font-weight: 700; letter-spacing: 0.3em; color: #1f2937;">${d.code}</p>
+        <p style="margin: 16px 0 0; color: #6b7280;">If you didn't request this, you can ignore this email.</p>
       `,
-      ctaLabel: 'Write a review',
-      ctaLink: absoluteLink(d.link),
       appUrl,
       logoIconUrl,
     }),
   }),
-  'listing.live': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `${d.listingTitle} is live on Basera`,
+  'dispute.appeal_raised': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `An appeal was raised on ${d.listingTitle}`,
     html: emailShell({
-      preheader: `Your listing passed every check and is now live`,
+      preheader: `The other party appealed Basera's decision`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;"><strong>${d.listingTitle}</strong> has successfully passed all three verification checks — legal, walkthrough, and banking — and is now live for guests to discover and request.</p>
-        <p style="margin: 0;">Basera operates on a host-only subscription model, with zero booking fees for guests.</p>
+        <p style="margin: 0 0 12px;">The other party appealed Basera's decision on the dispute for
+        <strong>${d.listingTitle}</strong>. This is the one appeal either side gets on this case.</p>
+        <p style="margin: 0;">Basera will take a final look and let you know the outcome.</p>
       `,
-      ctaLabel: 'View your listing',
-      ctaLink: absoluteLink(d.link),
-      appUrl,
-      logoIconUrl,
-    }),
-  }),
-  'listing.changes_needed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `One thing to fix on ${d.listingTitle}`,
-    html: emailShell({
-      preheader: `Your listing needs a small correction before it can go live`,
-      bodyHtml: `
-        <p style="margin: 0 0 12px;">Your listing <strong>${d.listingTitle}</strong> is close, but needs one correction before it can go live:</p>
-        <p style="margin: 0 0 12px; padding: 12px 14px; background: ${SURFACE_2}; border-radius: 10px; color: ${INK};">${d.failReason ?? 'See your dashboard for details.'}</p>
-        <p style="margin: 0;">Fix it and resubmit — most listings clear review the second time within a day.</p>
-      `,
-      ctaLabel: 'Review and resubmit',
-      ctaLink: absoluteLink(d.link),
-      appUrl,
-      logoIconUrl,
-    }),
-  }),
-  'verification.layer_passed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `${d.layerName} verification passed`,
-    html: emailShell({
-      preheader: `One more check cleared`,
-      bodyHtml: `
-        <p style="margin: 0;">Your <strong>${d.layerName}</strong> verification passed. Once all three checks clear, your listing goes live automatically.</p>
-      `,
-      ctaLabel: 'View your progress',
-      ctaLink: absoluteLink(d.link),
-      appUrl,
-      logoIconUrl,
-    }),
-  }),
-  'verification.layer_failed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `Your ${d.layerName} verification needs another look`,
-    html: emailShell({
-      preheader: `Action needed on your ${d.layerName} verification`,
-      bodyHtml: `
-        <p style="margin: 0 0 12px;">We couldn't verify your <strong>${d.layerName}</strong> yet:</p>
-        <p style="margin: 0 0 12px; padding: 12px 14px; background: ${SURFACE_2}; border-radius: 10px; color: ${INK};">${d.failReason ?? 'See your dashboard for details.'}</p>
-        <p style="margin: 0;">This is exactly the kind of mismatch the check exists to catch — resubmit once it's fixed.</p>
-      `,
-      ctaLabel: 'Resubmit',
-      ctaLink: absoluteLink(d.link),
-      appUrl,
-      logoIconUrl,
-    }),
-  }),
-  'message.received': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `${d.senderName ?? 'Someone'} sent you a message`,
-    html: emailShell({
-      preheader: `New message on Basera`,
-      bodyHtml: `
-        <p style="margin: 0;">You have a new message from <strong>${d.senderName ?? 'someone'}</strong> on Basera.</p>
-      `,
-      ctaLabel: 'Read and reply',
-      ctaLink: absoluteLink(d.link),
-      appUrl,
-      logoIconUrl,
-    }),
-  }),
-  'call.incoming': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `${d.senderName ?? 'Someone'} called you on Basera`,
-    html: emailShell({
-      preheader: `Missed call on Basera`,
-      bodyHtml: `
-        <p style="margin: 0;"><strong>${d.senderName ?? 'Someone'}</strong> tried to reach you on Basera. Open the conversation to call back.</p>
-      `,
-      ctaLabel: 'Open conversation',
+      ctaLabel: 'View the case',
       ctaLink: absoluteLink(d.link),
       appUrl,
       logoIconUrl,

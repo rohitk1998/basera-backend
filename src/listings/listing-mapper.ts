@@ -1,7 +1,28 @@
 import { ListingEntity } from '../entities';
-import { Amenity, CategoryId, Listing, Photo, RoomId } from './listing.types';
+import { Amenity, AmenityGroup, CategoryId, Listing, Photo, RoomId } from './listing.types';
 
 const ROOMS: readonly RoomId[] = ['exterior', 'living', 'bedroom', 'kitchen', 'view'];
+
+// Mirrors web/lib/listings.ts COMMON_AMENITIES — same labels, same groups,
+// so a host-picked amenity renders under the right heading on the detail page.
+const AMENITY_GROUPS: Record<string, AmenityGroup> = {
+  Wifi: 'work',
+  Workspace: 'work',
+  'Power backup': 'work',
+  Kitchen: 'kitchen',
+  'Dining table': 'kitchen',
+  'Hot water': 'bathroom',
+  'Room heater': 'bathroom',
+  'Attached bathroom': 'bathroom',
+  'Washing machine': 'bedroom',
+  'Extra bedding': 'bedroom',
+  'Mountain views': 'scenic',
+  Balcony: 'scenic',
+  Parking: 'outside',
+  Garden: 'outside',
+  'Smoke alarm': 'safety',
+  'First aid kit': 'safety',
+};
 
 /**
  * Ported from web/lib/listing-mapper.ts rowToListing — the single row →
@@ -31,26 +52,26 @@ export function rowToListing(row: ListingEntity): Listing {
     propStep.title || addressStep.fullAddress || addressStep.line1 || `Mountain Stay (#${row.id.slice(0, 6)})`;
   const town = propStep.town || addressStep.town || addressStep.city || 'Dharamshala';
 
-  const photoUrls: string[] =
-    draft.photos && draft.photos.length > 0
-      ? draft.photos
-      : Array.from(
-          { length: 5 },
-          (_, i) => `https://picsum.photos/seed/stay-${row.id}-${i + 1}/900/700`,
-        );
-
-  const photos: Photo[] = photoUrls.map((url, i) => ({
-    url,
-    room: ROOMS[i % ROOMS.length],
-    caption: `${title} - Room view`,
-  }));
+  // propStep.photos entries are { url, room } (photoSchema) — not bare URLs.
+  const photos: Photo[] =
+    propStep.photos && propStep.photos.length > 0
+      ? propStep.photos.map((p: { url: string; room?: RoomId }, i: number) => ({
+          url: p.url,
+          room: p.room || ROOMS[i % ROOMS.length],
+          caption: `${title} - Room view`,
+        }))
+      : Array.from({ length: 5 }, (_, i) => ({
+          url: `https://picsum.photos/seed/stay-${row.id}-${i + 1}/900/700`,
+          room: ROOMS[i % ROOMS.length],
+          caption: `${title} - Room view`,
+        }));
 
   const amenities: Amenity[] = (
     propStep.amenities || ['Wifi', 'Workspace', 'Kitchen', 'Hot water', 'Room heater']
   ).map((label: string, i: number) => ({
     id: `am-${i}`,
     label,
-    group: i === 0 || i === 1 ? 'work' : i === 2 ? 'kitchen' : 'bathroom',
+    group: AMENITY_GROUPS[label] || 'safety',
   }));
 
   const categories: CategoryId[] =
@@ -87,6 +108,9 @@ export function rowToListing(row: ListingEntity): Listing {
     bathrooms: propStep.bathrooms || 1,
     maxGuests: propStep.maxGuests || 2,
     availableFrom: propStep.availableFrom || new Date().toISOString().slice(0, 10),
+    billsIncluded: propStep.billsIncluded || 'all',
+    videoUrl: draft.media?.videoUrl || undefined,
+    tourUrl: draft.media?.tourUrl || undefined,
     houseRules: {
       checkIn: propStep.checkIn || '12:00 pm – 9:00 pm',
       checkOut: propStep.checkOut || 'Before 11:00 am',

@@ -47,16 +47,25 @@ export const descriptionSchema = z.object({
   guestAccess: z.string().trim().max(1000).optional().or(z.literal('')),
 });
 
+export const ROOM_IDS = ['exterior', 'living', 'bedroom', 'kitchen', 'bath', 'view'] as const;
+
+export const photoSchema = z.object({
+  url: z.string().url(),
+  room: z.enum(ROOM_IDS),
+});
+
 export const photosSchema = z.object({
-  photoCount: z.number().int().min(1, 'Add a photograph of the property.'),
+  photos: z.array(photoSchema).min(5, 'Add at least 5 photographs of the property.'),
 });
 
 export const pricingSchema = z.object({
-  price: z.preprocess(
+  dailyBaseRate: z.preprocess(
     parseRupees,
-    z.number().int().min(1000, 'Monthly rent must be at least ₹1,000.').max(500000),
+    z.number().int().min(500, 'Daily rate must be at least ₹500.').max(100000)
   ),
-  minMonths: z.coerce.number().int().min(1).max(24),
+  weeklyDiscountPct: z.coerce.number().int().min(0).max(99),
+  monthlyDiscountPct: z.coerce.number().int().min(0).max(99),
+  minDays: z.coerce.number().int().min(1).max(365),
   availableFrom: z.string().min(10, 'Pick the first date the home is free.'),
   billsIncluded: z.enum(['all', 'electricity_extra', 'none']),
 });
@@ -69,10 +78,6 @@ export const rulesSchema = z.object({
   cancellation: z.enum(['flexible', 'moderate', 'firm']),
 });
 
-/* Photographs and amenities are gathered on their own steps, so gating them
-   here rejected a draft the host had filled in correctly — `photoCount: 0`
-   is a real value, so an action's `?? 5` fallback never fired and the
-   schema failed on 0 < 5. Kept exactly as-is. */
 export const listingSchema = basicsSchema
   .merge(locationSchema)
   .merge(descriptionSchema)
@@ -83,11 +88,8 @@ export const listingSchema = basicsSchema
     categories: z
       .array(z.string())
       .min(1, 'Pick at least one — this decides where guests find you.'),
+    amenities: z.array(z.string()).min(3, 'Pick at least three amenities.'),
   });
-
-export const publishSchema = listingSchema.extend({
-  amenities: z.array(z.string()).min(3, 'List at least three amenities.'),
-});
 
 export type ListingDraft = z.infer<typeof listingSchema>;
 
@@ -133,6 +135,11 @@ export const planSchema = z.object({
   plan: z.enum(['listed', 'featured', 'pro']),
 });
 
+export const mediaSchema = z.object({
+  videoUrl: z.string().url().optional().or(z.literal('')),
+  tourUrl: z.string().url().optional().or(z.literal('')),
+});
+
 export const hostKycSchema = kindSchema.merge(identitySchema).merge(legalSchema);
 
 export type HostKycPayload = z.infer<typeof hostKycSchema>;
@@ -142,6 +149,7 @@ export type HostKycPayload = z.infer<typeof hostKycSchema>;
 export const fullOnboardingSchema = listingSchema
   .merge(telemetrySchema)
   .merge(bankingSchema)
-  .merge(planSchema);
+  .merge(planSchema)
+  .merge(mediaSchema);
 
 export type FullOnboardingDraft = z.infer<typeof fullOnboardingSchema>;

@@ -1,4 +1,4 @@
-export * from './profile.entity';
+export * from './user.entity';
 export * from './listing.entity';
 export * from './listing-translation.entity';
 export * from './booking.entity';
@@ -11,3 +11,8 @@ export * from './message.entity';
 export * from './call.entity';
 export * from './conversation-presence.entity';
 export * from './review.entity';
+export * from './dispute-case.entity';
+export * from './dispute-event.entity';
+export * from './verification-request.entity';
+export * from './verification-audit-log.entity';
+export * from './email-otp.entity';

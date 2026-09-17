@@ -2,16 +2,20 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import {
   ListingEntity,
-  ProfileEntity,
+  UserEntity,
   BookingEntity,
   NotificationLogEntity,
   PaymentEntity,
   HostSubscriptionEntity,
+  DisputeCaseEntity,
+  VerificationRequestEntity,
+  VerificationAuditLogEntity,
 } from '../entities';
 import { AuthModule } from '../auth/auth.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { ListingsModule } from '../listings/listings.module';
 import { BookingsModule } from '../bookings/bookings.module';
+import { StorageModule } from '../storage/storage.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 
@@ -19,16 +23,20 @@ import { AdminService } from './admin.service';
   imports: [
     TypeOrmModule.forFeature([
       ListingEntity,
-      ProfileEntity,
+      UserEntity,
       BookingEntity,
       NotificationLogEntity,
       PaymentEntity,
       HostSubscriptionEntity,
+      DisputeCaseEntity,
+      VerificationRequestEntity,
+      VerificationAuditLogEntity,
     ]),
     AuthModule,
     NotificationsModule,
     ListingsModule,
     BookingsModule,
+    StorageModule,
   ],
   controllers: [AdminController],
   providers: [AdminService],

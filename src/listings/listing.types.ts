@@ -56,6 +56,11 @@ export type Listing = {
   maxGuests: number;
   /** ISO date — the floor for the availability calendar. */
   availableFrom: string;
+  billsIncluded: 'all' | 'electricity_extra' | 'none';
+  /** Optional walkthrough video / 3D tour, shown on the listing page when a
+   *  host has provided one — see MediaExtras. */
+  videoUrl?: string;
+  tourUrl?: string;
   houseRules: HouseRules;
   cancellation: 'flexible' | 'moderate' | 'firm';
   /** HP Tourism Home Stay registration — Layer 1, shown publicly. null when
@@ -73,5 +78,9 @@ export type Town = {
   name: string;
   /** Cheapest monthly rent currently listed in this town. */
   from: number;
+  /** Total live listings in this town — use this for any "N homes" count,
+   *  NOT listings.length: `listings` below is a bounded preview (see
+   *  ListingsService.getTownSummaries), not every listing in the town. */
+  total: number;
   listings: Listing[];
 };

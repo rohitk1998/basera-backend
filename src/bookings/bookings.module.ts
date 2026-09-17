@@ -1,6 +1,14 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { BookingEntity, BookingEventEntity, ListingEntity, ProfileEntity, ReviewEntity } from '../entities';
+import {
+  BookingEntity,
+  BookingEventEntity,
+  ListingEntity,
+  UserEntity,
+  ReviewEntity,
+  DisputeCaseEntity,
+  DisputeEventEntity,
+} from '../entities';
 import { AuthModule } from '../auth/auth.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { PaymentsModule } from '../payments/payments.module';
@@ -10,7 +18,15 @@ import { BookingReleaseScheduler } from './booking-release.scheduler';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([BookingEntity, BookingEventEntity, ListingEntity, ProfileEntity, ReviewEntity]),
+    TypeOrmModule.forFeature([
+      BookingEntity,
+      BookingEventEntity,
+      ListingEntity,
+      UserEntity,
+      ReviewEntity,
+      DisputeCaseEntity,
+      DisputeEventEntity,
+    ]),
     AuthModule,
     NotificationsModule,
     PaymentsModule,

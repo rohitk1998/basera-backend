@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ListingEntity, ListingTranslationEntity, ProfileEntity } from '../entities';
+import { ListingEntity, ListingTranslationEntity, UserEntity } from '../entities';
 import { AuthModule } from '../auth/auth.module';
 import { RedisModule } from '../redis/redis.module';
 import { ListingsController } from './listings.controller';
@@ -13,7 +13,7 @@ import { TRANSLATE_PROVIDER } from './providers/translate-provider.token';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([ListingEntity, ListingTranslationEntity, ProfileEntity]),
+    TypeOrmModule.forFeature([ListingEntity, ListingTranslationEntity, UserEntity]),
     AuthModule,
     RedisModule,
   ],

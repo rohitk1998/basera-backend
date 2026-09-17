@@ -1,4 +1,16 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+  UploadedFiles,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import { AuthGuard } from '../auth/auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/types';
@@ -7,7 +19,17 @@ import { CreateBookingDto } from './dto/create-booking.dto';
 import { ListBookingsQueryDto } from './dto/list-bookings-query.dto';
 import { CheckinBookingDto } from './dto/checkin-booking.dto';
 import { DisputeBookingDto } from './dto/dispute-booking.dto';
+import { DisputeOfferDto } from './dto/dispute-offer.dto';
+import { DisputeRespondDto } from './dto/dispute-respond.dto';
+import { DisputeAppealDto } from './dto/dispute-appeal.dto';
 import { DeclineBookingDto } from './dto/decline-booking.dto';
+
+interface UploadedMulterFile {
+  buffer: Buffer;
+  mimetype: string;
+  size: number;
+  originalname: string;
+}
 
 @Controller('api/bookings')
 @UseGuards(AuthGuard)
@@ -57,7 +79,40 @@ export class BookingsController {
 
   @Post(':id/dispute')
   dispute(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DisputeBookingDto) {
-    return this.bookingsService.dispute(user.userId, id, dto.reason);
+    return this.bookingsService.dispute(user.userId, id, dto);
+  }
+
+  @Get(':id/dispute')
+  getDispute(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.bookingsService.getDisputeCase(user.userId, id);
+  }
+
+  @Post(':id/dispute/evidence')
+  @UseInterceptors(FilesInterceptor('files', 6))
+  addDisputeEvidence(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @UploadedFiles() files?: UploadedMulterFile[],
+  ) {
+    if (!files || files.length === 0) {
+      throw new BadRequestException('No files provided');
+    }
+    return this.bookingsService.addDisputeEvidence(user.userId, id, files);
+  }
+
+  @Post(':id/dispute/offer')
+  makeDisputeOffer(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DisputeOfferDto) {
+    return this.bookingsService.makeDisputeOffer(user.userId, id, dto.amountToGuest, dto.message);
+  }
+
+  @Post(':id/dispute/respond')
+  respondToDisputeOffer(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DisputeRespondDto) {
+    return this.bookingsService.respondToDisputeOffer(user.userId, id, dto.action);
+  }
+
+  @Post(':id/dispute/appeal')
+  appealDispute(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: DisputeAppealDto) {
+    return this.bookingsService.appealDispute(user.userId, id, dto.message);
   }
 
   @Post(':id/checkout')

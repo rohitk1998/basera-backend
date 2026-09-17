@@ -1,7 +1,7 @@
 import { Column, Entity, PrimaryColumn } from 'typeorm';
 
-@Entity('profiles')
-export class ProfileEntity {
+@Entity('users')
+export class UserEntity {
   @PrimaryColumn('uuid')
   id: string;
 
@@ -99,4 +99,13 @@ export class ProfileEntity {
   // cookie does on the frontend.
   @Column({ type: 'text', nullable: true })
   preferred_locale: string | null;
+
+  // Opaque refresh token for silently renewing an expired access token — see
+  // AuthController.issueSession/refresh. Only the hash is ever persisted;
+  // the raw token lives solely in the httpOnly refresh_token cookie.
+  @Column({ type: 'text', nullable: true })
+  refresh_token_hash: string | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  refresh_token_expires_at: Date | null;
 }

@@ -19,6 +19,16 @@ export class MessageEntity {
   @Column('text')
   body: string;
 
+  @Column({ default: 'text' })
+  type: string; // text | call
+
+  /** Set only on a `type: 'call'` row — the call this message is the
+   *  history entry for. One call produces at most one message (unique
+   *  index on this column), written by ConversationsService.updateCall
+   *  the moment the call reaches a terminal status. */
+  @Column('uuid', { nullable: true })
+  call_id: string | null;
+
   @Column({ type: 'timestamptz', default: () => 'now()' })
   created_at: Date;
 }

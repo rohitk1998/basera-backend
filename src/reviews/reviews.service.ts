@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ReviewEntity, BookingEntity, ProfileEntity } from '../entities';
+import { ReviewEntity, BookingEntity, UserEntity } from '../entities';
 import { CreateReviewDto } from './dto/create-review.dto';
 
 @Injectable()
@@ -11,8 +11,8 @@ export class ReviewsService {
     private readonly reviewsRepo: Repository<ReviewEntity>,
     @InjectRepository(BookingEntity)
     private readonly bookingsRepo: Repository<BookingEntity>,
-    @InjectRepository(ProfileEntity)
-    private readonly profilesRepo: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profilesRepo: Repository<UserEntity>,
   ) {}
 
   async createReview(userId: string, bookingId: string, dto: CreateReviewDto) {
@@ -44,15 +44,27 @@ export class ReviewsService {
       throw new ConflictException('You have already reviewed this stay');
     }
 
-    await this.reviewsRepo.insert({
-      booking_id: bookingId,
-      author_id: userId,
-      target_user_id: targetUserId,
-      listing_id: isGuest ? booking.listing_id : null,
-      role,
-      rating: dto.rating,
-      content: dto.content,
-    });
+    try {
+      await this.reviewsRepo.insert({
+        booking_id: bookingId,
+        author_id: userId,
+        target_user_id: targetUserId,
+        listing_id: isGuest ? booking.listing_id : null,
+        role,
+        rating: dto.rating,
+        content: dto.content,
+      });
+    } catch (err: any) {
+      // Race: a double-submit (slow network, impatient double-tap) or a
+      // retried request lands here between the findOne check above and
+      // this insert. The DB unique constraint on (booking_id, author_id)
+      // is the real guard; the findOne above is just the friendly-error
+      // fast path for the common case.
+      if (err?.code === '23505') {
+        throw new ConflictException('You have already reviewed this stay');
+      }
+      throw err;
+    }
 
     return { success: true };
   }

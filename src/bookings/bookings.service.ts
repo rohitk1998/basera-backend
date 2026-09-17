@@ -9,19 +9,44 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { LessThanOrEqual, Repository } from 'typeorm';
-import { randomInt } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
 import {
   BookingEntity,
   BookingEventEntity,
   ListingEntity,
-  ProfileEntity,
+  UserEntity,
 } from '../entities';
 import { agreeTerms } from '../common/domain';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PaymentsService } from '../payments/payments.service';
+import { SupabaseProvider } from '../auth/supabase.provider';
 import { assertVerified } from '../user/verification-gate.util';
 import { CreateBookingDto } from './dto/create-booking.dto';
-import { ReviewEntity } from '../entities';
+import { DisputeBookingDto } from './dto/dispute-booking.dto';
+import { ReviewEntity, DisputeCaseEntity, DisputeEventEntity } from '../entities';
+
+type UploadedMulterFile = { buffer: Buffer; mimetype: string; size: number };
+
+const EVIDENCE_ALLOWED_TYPES: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+const EVIDENCE_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Rounds cap for guest<->host negotiation before it's forced to admin —
+ *  a hard, small cap rather than an open-ended round count, so no separate
+ *  timer/scheduler is needed just to bound how long negotiation can run. */
+const NEGOTIATION_ROUNDS_CAP = 3;
+/** A negotiating case with no reply in this long auto-escalates to admin —
+ *  piggybacks on the existing release-scheduler's cron tick rather than
+ *  standing up a second scheduler for one query. */
+const NEGOTIATION_STALE_HOURS = 48;
+/** No human actor for an auto-escalated dispute_events row — actor_id has
+ *  no FK (unlike booking_events.actor, which does, to profiles), but a
+ *  real-looking-but-fake uuid would be misleading in the data; the
+ *  all-zeros nil UUID reads unambiguously as "not a real user" instead. */
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 
 const ESCROW_HOLD_HOURS = 5 / 60; // 5 minutes for testing
 
@@ -48,12 +73,17 @@ export class BookingsService {
     private readonly bookingEventsRepo: Repository<BookingEventEntity>,
     @InjectRepository(ListingEntity)
     private readonly listingsRepo: Repository<ListingEntity>,
-    @InjectRepository(ProfileEntity)
-    private readonly profilesRepo: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profilesRepo: Repository<UserEntity>,
     @InjectRepository(ReviewEntity)
     private readonly reviewsRepo: Repository<ReviewEntity>,
+    @InjectRepository(DisputeCaseEntity)
+    private readonly disputeCasesRepo: Repository<DisputeCaseEntity>,
+    @InjectRepository(DisputeEventEntity)
+    private readonly disputeEventsRepo: Repository<DisputeEventEntity>,
     private readonly notifications: NotificationsService,
     private readonly payments: PaymentsService,
+    private readonly supabase: SupabaseProvider,
   ) { }
 
   private async recordEvent(
@@ -155,17 +185,23 @@ export class BookingsService {
     const weeklyDiscountPct = propertyDetails.weeklyDiscountPct || 15;
     const monthlyDiscountPct = propertyDetails.monthlyDiscountPct || 40;
 
-    let inserted;
-    let terms;
-    try {
-      terms = agreeTerms(
-        dailyBaseRate,
-        weeklyDiscountPct,
-        monthlyDiscountPct,
-        dto.days,
-        dto.paymentMethod
-      );
+    // agreeTerms is pure arithmetic (see common/domain.ts) — it never
+    // throws, so nothing before the insert below can produce a client-
+    // shaped error. Only the insert itself can genuinely fail, and that
+    // failure is a server-side problem (a bad connection, a constraint
+    // violation, the DB being unreachable), not something the caller did
+    // wrong — the old catch-all here mislabelled any such failure as a 400
+    // and leaked the raw driver message straight to the client.
+    const terms = agreeTerms(
+      dailyBaseRate,
+      weeklyDiscountPct,
+      monthlyDiscountPct,
+      dto.days,
+      dto.paymentMethod
+    );
 
+    let inserted;
+    try {
       inserted = await this.bookingsRepo.insert({
         listing_id: dto.listingId,
         guest_id: userId,
@@ -180,7 +216,8 @@ export class BookingsService {
         due_at_move_in: terms.dueAtMoveIn,
       });
     } catch (e: any) {
-      throw new BadRequestException('Database error: ' + e.message);
+      this.logger.error('[create] booking insert failed', e);
+      throw new InternalServerErrorException('Could not create the booking. Please try again.');
     }
     
     const bookingId = inserted.identifiers[0]?.id as string;
@@ -228,7 +265,7 @@ export class BookingsService {
         : Promise.resolve([] as ListingEntity[]),
       counterpartIds.length
         ? this.profilesRepo.find({ where: counterpartIds.map((id) => ({ id })), select: { id: true, full_name: true } })
-        : Promise.resolve([] as ProfileEntity[]),
+        : Promise.resolve([] as UserEntity[]),
       Promise.all(rows.map((row) => this.payments.getForBooking(row.id))),
       this.reviewsRepo.find({ where: { author_id: userId }, select: { booking_id: true } }),
     ]);
@@ -237,11 +274,9 @@ export class BookingsService {
       listingRows.map((l) => [l.id, (l.draft_data as any)?.property_details?.title ?? 'Listing']),
     );
     const nameById = new Map(profileRows.map((p) => [p.id, p.full_name ?? 'Basera user']));
-    console.log('DEBUG paymentResults:', paymentResults);
     const paidByBookingId = new Set(
       paymentResults.filter((p) => p && p.status !== 'refunded').map((p) => p!.booking_id)
     );
-    console.log('DEBUG paidByBookingId:', paidByBookingId);
 
     const bookings = rows.map((row) => ({
       id: row.id,
@@ -568,7 +603,7 @@ export class BookingsService {
    * Reuses the existing `rejection_reason` column rather than adding a new
    * one for a single string.
    */
-  async dispute(userId: string, id: string, reason: string) {
+  async dispute(userId: string, id: string, dto: DisputeBookingDto) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
       select: { status: true, guest_id: true, host_id: true, listing_id: true, escrow_release_time: true },
@@ -586,14 +621,38 @@ export class BookingsService {
       throw new ConflictException('The dispute window for this booking has closed.');
     }
 
+    const payment = await this.payments.getForBooking(id);
+    if (payment && dto.requestedAmount > payment.amount) {
+      throw new BadRequestException('Requested amount cannot exceed the amount paid.');
+    }
+
     const updateRes = await this.bookingsRepo.update(
       { id, status: 'checked_in' },
-      { status: 'disputed', rejection_reason: reason, updated_at: new Date() },
+      { status: 'disputed', updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
     }
     await this.recordEvent(id, 'checked_in', 'disputed', userId);
+
+    const disputeCase = await this.disputeCasesRepo.save(
+      this.disputeCasesRepo.create({
+        booking_id: id,
+        category: dto.category,
+        description: dto.description,
+        requested_amount: dto.requestedAmount,
+        evidence_urls: [],
+        case_status: 'open',
+      }),
+    );
+    await this.disputeEventsRepo.insert({
+      dispute_case_id: disputeCase.id,
+      actor_id: userId,
+      actor_role: 'guest',
+      event_type: 'claim_raised',
+      offer_amount: dto.requestedAmount,
+      message: dto.description,
+    });
 
     const [listing, guestProfile] = await Promise.all([
       this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } }),
@@ -610,7 +669,274 @@ export class BookingsService {
       link: '/host/bookings',
     });
 
-    return { success: true, status: 'disputed' as const };
+    return { success: true, status: 'disputed' as const, disputeCaseId: disputeCase.id };
+  }
+
+  /** Guest or host of the booking only. Backs the case panel both sides
+   *  see, and the evidence-add/offer/respond/appeal endpoints' own guards. */
+  private async requireDisputeCase(userId: string, bookingId: string) {
+    const booking = await this.bookingsRepo.findOne({
+      where: { id: bookingId },
+      select: { guest_id: true, host_id: true, listing_id: true },
+    });
+    if (!booking) {
+      throw new NotFoundException('Booking not found');
+    }
+    if (booking.guest_id !== userId && booking.host_id !== userId) {
+      throw new ForbiddenException('Forbidden');
+    }
+    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    if (!disputeCase) {
+      throw new NotFoundException('No dispute found for this booking');
+    }
+    return { booking, disputeCase, viewerRole: (booking.guest_id === userId ? 'guest' : 'host') as 'guest' | 'host' };
+  }
+
+  /** Full case for the guest/host panel or admin's case view — claim,
+   *  evidence, and the whole negotiation/decision timeline. */
+  async getDisputeCase(userId: string, bookingId: string) {
+    const { disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
+    const events = await this.disputeEventsRepo.find({
+      where: { dispute_case_id: disputeCase.id },
+      order: { created_at: 'ASC' },
+    });
+    return { success: true, viewerRole, case: disputeCase, events };
+  }
+
+  /** Either party may attach more evidence to an already-open case — this
+   *  is what lets a host add their side's photos without it being folded
+   *  into the original claim DTO. Uploads to Storage itself, same pattern
+   *  as UserService.uploadAvatar: service-role client, validated
+   *  type/size, a stable-but-unguessable path, then the permanent public
+   *  CDN URL is what gets stored on the case row. */
+  async addDisputeEvidence(userId: string, bookingId: string, files: UploadedMulterFile[]) {
+    const { disputeCase } = await this.requireDisputeCase(userId, bookingId);
+    if (files.length === 0) {
+      throw new BadRequestException('No files provided');
+    }
+    if (disputeCase.evidence_urls.length + files.length > 6) {
+      throw new BadRequestException('A dispute may have at most 6 evidence files.');
+    }
+
+    const urls: string[] = [];
+    for (const file of files) {
+      const ext = EVIDENCE_ALLOWED_TYPES[file.mimetype];
+      if (!ext) {
+        throw new BadRequestException('Unsupported file type. Use JPEG, PNG or WebP.');
+      }
+      if (file.size > EVIDENCE_MAX_BYTES) {
+        throw new BadRequestException({ error: 'File too large. Maximum size is 5 MB.', statusCode: 413 });
+      }
+
+      const storagePath = `${bookingId}/${randomUUID()}.${ext}`;
+      const { error: uploadError } = await this.supabase.client.storage
+        .from('dispute-evidence')
+        .upload(storagePath, file.buffer, { contentType: file.mimetype });
+      if (uploadError) {
+        throw new InternalServerErrorException('Upload failed. Please try again.');
+      }
+
+      const {
+        data: { publicUrl },
+      } = this.supabase.client.storage.from('dispute-evidence').getPublicUrl(storagePath);
+      urls.push(publicUrl);
+    }
+
+    await this.disputeCasesRepo.update(
+      { id: disputeCase.id },
+      { evidence_urls: [...disputeCase.evidence_urls, ...urls], updated_at: new Date() },
+    );
+    return { success: true, evidenceUrls: urls };
+  }
+
+  /**
+   * A host (or guest countering back) proposes an amount-to-guest split.
+   * Turn alternates strictly by actor_role — enforced by looking at the
+   * last event's role rather than a separate "whose turn" column, since
+   * the event log is already the source of truth for everything else here.
+   */
+  async makeDisputeOffer(userId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
+    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
+    if (disputeCase.case_status !== 'open' && disputeCase.case_status !== 'negotiating') {
+      throw new ConflictException(`Cannot make an offer on a case in status "${disputeCase.case_status}"`);
+    }
+
+    const payment = await this.payments.getForBooking(bookingId);
+    if (payment && (amountToGuest < 0 || amountToGuest > payment.amount)) {
+      throw new BadRequestException('amountToGuest must be between 0 and the amount paid.');
+    }
+    if (disputeCase.negotiation_rounds >= NEGOTIATION_ROUNDS_CAP) {
+      throw new ConflictException('Negotiation rounds are exhausted — escalate to Basera instead.');
+    }
+
+    const lastEvent = await this.disputeEventsRepo.findOne({
+      where: { dispute_case_id: disputeCase.id },
+      order: { created_at: 'DESC' },
+    });
+    // The claim itself (actor_role 'guest') doesn't count as "guest's turn
+    // taken" for offer purposes — the host always makes the first offer.
+    const lastOfferRole = lastEvent?.event_type === 'claim_raised' ? null : lastEvent?.actor_role ?? null;
+    if (lastOfferRole === viewerRole) {
+      throw new ConflictException('Waiting on the other party — not your turn to offer.');
+    }
+
+    const eventType = viewerRole === 'host' ? (lastOfferRole === null ? 'host_offer' : 'host_counter') : 'guest_counter';
+
+    await this.disputeEventsRepo.insert({
+      dispute_case_id: disputeCase.id,
+      actor_id: userId,
+      actor_role: viewerRole,
+      event_type: eventType,
+      offer_amount: amountToGuest,
+      message: message ?? null,
+    });
+    await this.disputeCasesRepo.update(
+      { id: disputeCase.id },
+      { case_status: 'negotiating', negotiation_rounds: disputeCase.negotiation_rounds + 1, updated_at: new Date() },
+    );
+
+    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
+    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const recipient = viewerRole === 'host' ? booking.guest_id : booking.host_id;
+    this.notifications.notify('dispute.offer_received', recipient, {
+      listingTitle,
+      link: viewerRole === 'host' ? '/account/transactions' : '/host/bookings',
+    });
+
+    return { success: true, caseStatus: 'negotiating' as const };
+  }
+
+  /**
+   * The other party's reply to the standing offer: accept settles the
+   * dispute right there (money moves immediately, same philosophy as the
+   * existing binary resolve — resolution = payout in the same call);
+   * reject or escalate both hand the case to admin, with no distinction
+   * between the two visible to admin beyond the timeline itself.
+   */
+  async respondToDisputeOffer(userId: string, bookingId: string, action: 'accept' | 'reject' | 'escalate') {
+    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
+    if (disputeCase.case_status !== 'negotiating' && !(action === 'escalate' && disputeCase.case_status === 'open')) {
+      throw new ConflictException(`Cannot respond to a case in status "${disputeCase.case_status}"`);
+    }
+
+    if (action === 'accept') {
+      const lastOffer = await this.disputeEventsRepo.findOne({
+        where: { dispute_case_id: disputeCase.id },
+        order: { created_at: 'DESC' },
+      });
+      if (!lastOffer || lastOffer.offer_amount === null || lastOffer.actor_role === viewerRole) {
+        throw new ConflictException('No standing offer to accept.');
+      }
+
+      await this.payments.splitRelease(bookingId, lastOffer.offer_amount);
+      await this.bookingsRepo.update({ id: bookingId, status: 'disputed' }, { status: 'completed', updated_at: new Date() });
+      await this.recordEvent(bookingId, 'disputed', 'completed', userId);
+      await this.disputeEventsRepo.insert({
+        dispute_case_id: disputeCase.id,
+        actor_id: userId,
+        actor_role: viewerRole,
+        event_type: 'accepted',
+        offer_amount: lastOffer.offer_amount,
+      });
+      await this.disputeCasesRepo.update(
+        { id: disputeCase.id },
+        {
+          case_status: 'resolved',
+          resolution_amount_to_guest: lastOffer.offer_amount,
+          resolved_by: 'negotiation',
+          updated_at: new Date(),
+        },
+      );
+
+      const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
+      const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+      const otherParty = viewerRole === 'guest' ? booking.host_id : booking.guest_id;
+      this.notifications.notify('booking.completed', otherParty, {
+        listingTitle,
+        pushTitle: 'Dispute resolved',
+        pushBody: `The dispute for ${listingTitle} was settled directly between you and the other party`,
+        link: viewerRole === 'guest' ? '/host/bookings' : `/stays/${booking.listing_id}`,
+      });
+
+      return { success: true, caseStatus: 'resolved' as const };
+    }
+
+    // reject / escalate — both hand off to admin.
+    await this.disputeEventsRepo.insert({
+      dispute_case_id: disputeCase.id,
+      actor_id: userId,
+      actor_role: viewerRole,
+      event_type: action === 'reject' ? 'rejected' : 'escalated',
+    });
+    await this.disputeCasesRepo.update({ id: disputeCase.id }, { case_status: 'escalated', updated_at: new Date() });
+
+    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
+    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    this.notifications.notify('dispute.escalated', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
+      listingTitle,
+      link: '/host/bookings',
+    });
+
+    return { success: true, caseStatus: 'escalated' as const };
+  }
+
+  /** A negotiating case with no activity in NEGOTIATION_STALE_HOURS forces
+   *  to admin — called from the same cron tick as releaseExpiredHolds
+   *  rather than a second scheduler for one query. */
+  async escalateStaleNegotiations(): Promise<number> {
+    const staleBefore = new Date(Date.now() - NEGOTIATION_STALE_HOURS * 60 * 60 * 1000);
+    const stale = await this.disputeCasesRepo.find({
+      where: { case_status: 'negotiating' },
+      select: { id: true, updated_at: true },
+    });
+    const due = stale.filter((c) => c.updated_at <= staleBefore);
+    for (const c of due) {
+      await this.disputeEventsRepo.insert({
+        dispute_case_id: c.id,
+        actor_id: NIL_UUID,
+        actor_role: 'system',
+        event_type: 'escalated',
+        message: 'Auto-escalated after no activity',
+      });
+      await this.disputeCasesRepo.update({ id: c.id }, { case_status: 'escalated', updated_at: new Date() });
+    }
+    if (due.length > 0) {
+      this.logger.log(`[escalateStaleNegotiations] escalated ${due.length} stale negotiation(s)`);
+    }
+    return due.length;
+  }
+
+  /** Either party, once, after an admin decision — reopens for a final
+   *  second look. appeal_used is the entire enforcement of "once". */
+  async appealDispute(userId: string, bookingId: string, message: string) {
+    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
+    if (disputeCase.case_status !== 'admin_decided') {
+      throw new ConflictException('Only an admin-decided case may be appealed.');
+    }
+    if (disputeCase.appeal_used) {
+      throw new ConflictException('This dispute has already been appealed once.');
+    }
+
+    await this.disputeEventsRepo.insert({
+      dispute_case_id: disputeCase.id,
+      actor_id: userId,
+      actor_role: viewerRole,
+      event_type: 'appeal_raised',
+      message,
+    });
+    await this.disputeCasesRepo.update(
+      { id: disputeCase.id },
+      { case_status: 'appealed', appeal_used: true, updated_at: new Date() },
+    );
+
+    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
+    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    this.notifications.notify('dispute.appeal_raised', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
+      listingTitle,
+      link: '/host/bookings',
+    });
+
+    return { success: true, caseStatus: 'appealed' as const };
   }
 
   /**
@@ -670,14 +996,16 @@ export class BookingsService {
   }
 
   /**
-   * Admin-only resolution of a disputed booking. `release` sides with the
-   * host (money was fine, dispute didn't hold up); `refund` sides with the
-   * guest. Either way the booking's active life ends at `completed` — the
-   * distinction is only which side the money lands on.
+   * Admin resolution of an escalated case, for any split — `amountToGuest`
+   * of 0 or the full paid amount reproduces the old binary release/refund
+   * exactly, but any value between is now expressible too. Either way the
+   * booking's active life ends at `completed` — a dispute resolved in the
+   * guest's full favour is still a completed stay, not a cancellation; the
+   * distinction is only which side(s) the money lands on.
    */
-  async resolveDispute(adminUserId: string, id: string, resolution: 'refund' | 'release') {
+  async resolveDispute(adminUserId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
     const booking = await this.bookingsRepo.findOne({
-      where: { id },
+      where: { id: bookingId },
       select: { status: true, guest_id: true, host_id: true, listing_id: true },
     });
     if (!booking) {
@@ -686,22 +1014,33 @@ export class BookingsService {
     if (booking.status !== 'disputed') {
       throw new ConflictException(`Cannot resolve a booking in status "${booking.status}"`);
     }
-
-    if (resolution === 'release') {
-      await this.payments.release(id);
-    } else {
-      await this.payments.refund(id);
+    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    if (!disputeCase || disputeCase.case_status !== 'escalated') {
+      throw new ConflictException('This dispute is not awaiting admin review.');
     }
 
-    const newStatus = resolution === 'refund' ? 'cancelled' : 'completed';
+    await this.payments.splitRelease(bookingId, amountToGuest);
+
     const updateRes = await this.bookingsRepo.update(
-      { id, status: 'disputed' },
-      { status: newStatus, updated_at: new Date() },
+      { id: bookingId, status: 'disputed' },
+      { status: 'completed', updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
     }
-    await this.recordEvent(id, 'disputed', newStatus, adminUserId);
+    await this.recordEvent(bookingId, 'disputed', 'completed', adminUserId);
+    await this.disputeEventsRepo.insert({
+      dispute_case_id: disputeCase.id,
+      actor_id: adminUserId,
+      actor_role: 'admin',
+      event_type: 'admin_decision',
+      offer_amount: amountToGuest,
+      message: message ?? null,
+    });
+    await this.disputeCasesRepo.update(
+      { id: disputeCase.id },
+      { case_status: 'admin_decided', resolution_amount_to_guest: amountToGuest, resolved_by: 'admin', updated_at: new Date() },
+    );
 
     const listing = await this.listingsRepo.findOne({
       where: { id: booking.listing_id },
@@ -711,24 +1050,70 @@ export class BookingsService {
 
     this.notifications.notify('booking.completed', booking.guest_id, {
       listingTitle,
-      pushTitle: resolution === 'refund' ? 'Dispute resolved — refunded' : 'Dispute resolved',
-      pushBody:
-        resolution === 'refund'
-          ? `Your payment for ${listingTitle} has been refunded`
-          : `Your dispute for ${listingTitle} has been resolved`,
+      pushTitle: 'Dispute resolved',
+      pushBody: `Basera has resolved your dispute for ${listingTitle}`,
       link: `/stays/${booking.listing_id}`,
     });
     this.notifications.notify('booking.completed', booking.host_id, {
       listingTitle,
-      pushTitle: resolution === 'release' ? 'Dispute resolved — payment released' : 'Dispute resolved',
-      pushBody:
-        resolution === 'release'
-          ? `Payment for ${listingTitle} has been released to you`
-          : `A dispute for ${listingTitle} has been resolved in the guest's favour`,
+      pushTitle: 'Dispute resolved',
+      pushBody: `Basera has resolved the dispute for ${listingTitle}`,
       link: '/host/bookings',
     });
 
-    return { success: true, status: 'completed' as const, resolution };
+    return { success: true, status: 'completed' as const, amountToGuest };
+  }
+
+  /**
+   * Final say after one appeal — same shape as the original admin
+   * decision, but only reachable once per case (dispute_cases.appeal_used)
+   * and re-splits the payment that already "moved" on the first decision.
+   * Simulated payments make that a plain overwrite; a real gateway
+   * integration would need an actual reversal-then-reissue here instead.
+   */
+  async resolveAppeal(adminUserId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
+    const booking = await this.bookingsRepo.findOne({
+      where: { id: bookingId },
+      select: { guest_id: true, host_id: true, listing_id: true },
+    });
+    if (!booking) {
+      throw new NotFoundException('Booking not found');
+    }
+    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    if (!disputeCase || disputeCase.case_status !== 'appealed') {
+      throw new ConflictException('This dispute is not under appeal.');
+    }
+
+    await this.payments.splitRelease(bookingId, amountToGuest);
+    await this.disputeEventsRepo.insert({
+      dispute_case_id: disputeCase.id,
+      actor_id: adminUserId,
+      actor_role: 'admin',
+      event_type: 'appeal_decision',
+      offer_amount: amountToGuest,
+      message: message ?? null,
+    });
+    await this.disputeCasesRepo.update(
+      { id: disputeCase.id },
+      { case_status: 'resolved', resolution_amount_to_guest: amountToGuest, resolved_by: 'appeal', updated_at: new Date() },
+    );
+
+    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
+    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    this.notifications.notify('booking.completed', booking.guest_id, {
+      listingTitle,
+      pushTitle: 'Appeal decided',
+      pushBody: `Basera has made a final decision on the appeal for ${listingTitle}`,
+      link: `/stays/${booking.listing_id}`,
+    });
+    this.notifications.notify('booking.completed', booking.host_id, {
+      listingTitle,
+      pushTitle: 'Appeal decided',
+      pushBody: `Basera has made a final decision on the appeal for ${listingTitle}`,
+      link: '/host/bookings',
+    });
+
+    return { success: true, status: 'resolved' as const, amountToGuest };
   }
 
   /**

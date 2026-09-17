@@ -7,7 +7,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Request } from 'express';
-import { ProfileEntity } from '../entities';
+import { UserEntity } from '../entities';
 import { AuthGuard } from './auth.guard';
 import { Role } from '../common/domain';
 
@@ -26,8 +26,8 @@ function isRole(value: string): value is Role {
 export class AdminGuard implements CanActivate {
   constructor(
     private readonly authGuard: AuthGuard,
-    @InjectRepository(ProfileEntity)
-    private readonly profiles: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profiles: Repository<UserEntity>,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {

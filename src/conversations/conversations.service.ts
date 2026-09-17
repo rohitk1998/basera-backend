@@ -12,13 +12,21 @@ import {
   ConversationPresenceEntity,
   ListingEntity,
   MessageEntity,
-  ProfileEntity,
+  UserEntity,
 } from '../entities';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CreateConversationDto } from './dto/create-conversation.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { StartCallDto } from './dto/start-call.dto';
 import { UpdateCallDto } from './dto/update-call.dto';
+
+/** mm:ss, matching the format used elsewhere for call/recording lengths. */
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
 
 @Injectable()
 export class ConversationsService {
@@ -31,8 +39,8 @@ export class ConversationsService {
     private readonly calls: Repository<CallEntity>,
     @InjectRepository(ListingEntity)
     private readonly listings: Repository<ListingEntity>,
-    @InjectRepository(ProfileEntity)
-    private readonly profiles: Repository<ProfileEntity>,
+    @InjectRepository(UserEntity)
+    private readonly profiles: Repository<UserEntity>,
     @InjectRepository(ConversationPresenceEntity)
     private readonly presence: Repository<ConversationPresenceEntity>,
     private readonly notifications: NotificationsService,
@@ -76,7 +84,7 @@ export class ConversationsService {
       ...new Set(rows.map((r) => (r.guest_id === userId ? r.host_id : r.guest_id))),
     ];
 
-    const [listingRows, profileRows]: [Pick<ListingEntity, 'id' | 'draft_data'>[], Pick<ProfileEntity, 'id' | 'full_name'>[]] =
+    const [listingRows, profileRows]: [Pick<ListingEntity, 'id' | 'draft_data'>[], Pick<UserEntity, 'id' | 'full_name'>[]] =
       await Promise.all([
         listingIds.length
           ? this.listings.find({ where: listingIds.map((id) => ({ id })), select: { id: true, draft_data: true } })
@@ -223,11 +231,57 @@ export class ConversationsService {
     }
 
     const ended = dto.status === 'declined' || dto.status === 'missed' || dto.status === 'ended';
-    await this.calls.update(
-      { id: callId },
-      { status: dto.status, ended_at: ended ? new Date() : call.ended_at },
-    );
+    const endedAt = ended ? new Date() : call.ended_at;
+    // `call.status` here is still the pre-update value — the one signal
+    // available for whether this call ever connected. The frontend has no
+    // 'missed' PATCH path today (an unanswered call that times out or is
+    // hung up before being accepted still reports status: 'ended'), so a
+    // call ending from 'ringing' is treated as missed regardless of the
+    // status string the client sent.
+    const wasAnswered = call.status === 'accepted';
+    await this.calls.update({ id: callId }, { status: dto.status, ended_at: endedAt });
+
+    // One history row per call, written the moment it reaches a terminal
+    // status — see message.entity.ts. `sender_id` is always the caller so
+    // "mine"/"theirs" alignment in the thread matches who placed the call,
+    // not whichever side happened to hang up.
+    if (ended) {
+      await this.recordCallMessage(call, dto.status, wasAnswered, endedAt!);
+    }
 
     return { success: true };
+  }
+
+  private async recordCallMessage(
+    call: Pick<CallEntity, 'id' | 'conversation_id' | 'caller_id' | 'kind' | 'started_at'>,
+    status: 'declined' | 'accepted' | 'missed' | 'ended',
+    wasAnswered: boolean,
+    endedAt: Date,
+  ): Promise<void> {
+    const label = call.kind === 'video' ? 'Video call' : 'Voice call';
+    const body =
+      status === 'declined'
+        ? `${label} declined`
+        : !wasAnswered
+          ? `Missed ${label.toLowerCase()}`
+          : `${label} · ${formatDuration(endedAt.getTime() - call.started_at.getTime())}`;
+
+    try {
+      await this.messages.save(
+        this.messages.create({
+          conversation_id: call.conversation_id,
+          sender_id: call.caller_id,
+          body,
+          type: 'call',
+          call_id: call.id,
+        }),
+      );
+      await this.conversations.update({ id: call.conversation_id }, { last_message_at: endedAt });
+    } catch (err) {
+      // The unique index on call_id means a second terminal PATCH for the
+      // same call (e.g. a retry) fails here rather than duplicating the
+      // history row — not worth surfacing to the caller, who already got
+      // their 200 for the status update itself.
+    }
   }
 }
