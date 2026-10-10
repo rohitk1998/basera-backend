@@ -186,7 +186,6 @@ for (const h of HOSTS) {
     telemetry: { walkthroughPassed: true },
     banking: { upi: h.upi, name: h.fullName },
     legal: { registrationNumber: h.registrationNumber },
-    plan: { plan: 'listed' },
     media: {},
     trustScore: 95,
   };

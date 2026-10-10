@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  InternalServerErrorException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { SupabaseProvider } from '../auth/supabase.provider';
 import {
@@ -58,7 +63,9 @@ export class StorageService {
     }
 
     if (file.size > VERIFICATION_DOCUMENT_MAX_BYTES) {
-      throw new BadRequestException({ error: 'File too large. Maximum size is 8 MB.', statusCode: 413 });
+      // A real 413, not a BadRequestException(400) whose body merely
+      // claimed statusCode: 413 while Nest still returned HTTP 400.
+      throw new PayloadTooLargeException('File too large. Maximum size is 8 MB.');
     }
 
     if (!(SUPPORTED_SIGNATURE_MIME_TYPES as readonly string[]).includes(file.mimetype)) {

@@ -7,6 +7,13 @@ import type { DetectResult, TranslateProvider, TranslateResult } from './transla
 const API_BASE = 'https://api.sarvam.ai';
 const MODEL = 'sarvam-translate:v1';
 
+// Every fetch() below passes this as `signal`. Without it, a hung Sarvam
+// call holds its pLimit(20) slot indefinitely — with up to 20 slots and no
+// timeout, a sustained Sarvam stall can starve the entire translation
+// pipeline (every other in-flight and queued translate/detect call) rather
+// than just failing the one request that's actually stuck.
+const REQUEST_TIMEOUT_MS = 10_000;
+
 // Process-wide cap on concurrent outbound Sarvam calls. A single listing
 // already fans out to ~10+ calls (one per field); without a shared cap,
 // several simultaneous cache-miss listings could fan out to hundreds of
@@ -57,6 +64,7 @@ export class SarvamTranslateProvider implements TranslateProvider {
             target_language_code: toSarvamCode(to),
             model: MODEL,
           }),
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (!res.ok) {
           // Body/status only — never log the key itself or the translated text.
@@ -89,6 +97,7 @@ export class SarvamTranslateProvider implements TranslateProvider {
             target_language_code: 'en-IN',
             model: 'mayura:v1',
           }),
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (!res.ok) {
           this.logger.warn(`detect failed: HTTP ${res.status}`);

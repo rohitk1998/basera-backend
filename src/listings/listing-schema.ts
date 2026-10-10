@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { HP_DISTRICTS } from './hp-locations';
 
 /* Ported from web/lib/listing-schema.ts. One schema per wizard step, composed
    into a whole-listing schema — kept as zod here (rather than class-validator
@@ -12,13 +13,79 @@ export const parseRupees = (v: unknown) => {
   return digits ? Number.parseInt(digits, 10) : Number.NaN;
 };
 
+/* The full Airbnb-style category set, kept even for types unlikely to ever
+   list here (Boat, Windmill, Yurt, ...) — parity with the reference flow
+   was an explicit product decision, not an oversight. */
+export const PROPERTY_TYPES = [
+  'house',
+  'flat',
+  'barn',
+  'bnb',
+  'boat',
+  'cabin',
+  'campervan',
+  'casaParticular',
+  'castle',
+  'cave',
+  'container',
+  'cycladicHome',
+  'dammuso',
+  'dome',
+  'earthHome',
+  'farm',
+  'guestHouse',
+  'hotel',
+  'houseboat',
+  'minsu',
+  'riad',
+  'ryokan',
+  'shepherdsHut',
+  'tent',
+  'tinyHome',
+  'tower',
+  'treeHouse',
+  'trullo',
+  'windmill',
+  'yurt',
+] as const;
+
+export const PLACE_TYPES = ['entire', 'room', 'sharedRoom'] as const;
+
+/* Ported from web/lib/districts.ts (PLACES) — the platform only operates in
+   Himachal Pradesh, so town is drawn from this curated list of HP tourist
+   towns, and state is a fixed literal rather than free text. Keep this array
+   byte-for-byte identical to web/lib/districts.ts's PLACES. */
+export const PLACES = [
+  'Manali',
+  'Shimla',
+  'Dharamshala',
+  'McLeodganj',
+  'Kasol',
+  'Bir',
+  'Dalhousie',
+  'Kullu',
+  'Palampur',
+  'Spiti Valley',
+  'Chamba',
+  'Kufri',
+  'Manikaran',
+  'Tosh',
+  'Barot',
+  'Chitkul',
+  'Sarahan',
+  'Narkanda',
+] as const;
+
+export const HIMACHAL_PRADESH = 'Himachal Pradesh' as const;
+
 export const basicsSchema = z.object({
   title: z
     .string()
     .trim()
     .min(4, 'Give the home a name — at least 4 characters.')
     .max(60, 'Keep the name under 60 characters.'),
-  propertyType: z.enum(['cottage', 'flat', 'studio', 'homestay', 'cabin']),
+  propertyType: z.enum(PROPERTY_TYPES),
+  placeType: z.enum(PLACE_TYPES),
   beds: z.enum(['Studio', '1BHK', '2BHK', '3BHK']),
   bedrooms: z.coerce.number().int().min(0).max(10),
   bathrooms: z.coerce.number().int().min(1, 'At least one bathroom.').max(10),
@@ -26,16 +93,53 @@ export const basicsSchema = z.object({
 });
 
 export const locationSchema = z.object({
-  town: z.enum(['Dharamshala', 'Old Manali', 'Bir', 'Kasol', 'Palampur']),
-  fullAddress: z
+  /* Where in Himachal Pradesh: a district, then a tehsil under it. `town` is
+     the place name the public site groups, filters and searches by — the
+     clients set it to the tehsil. Whether the tehsil belongs to the district,
+     and whether the pin is inside the state, is checked by
+     assertLocationIsValid (location.util.ts), because this object is merged
+     into larger schemas and cannot carry a refinement itself. */
+  district: z.enum(HP_DISTRICTS, { message: 'Choose the district.' }),
+  tehsil: z.string().trim().min(2, 'Choose the tehsil.').max(80),
+  town: z.string().trim().min(2, 'Choose the tehsil.').max(80),
+  /* Structured the way Airbnb's address confirm step collects it. Composed
+     into one `fullAddress` string for storage/display (see toFullAddress
+     below) rather than adding per-field DB columns — draft_data is a
+     schemaless JSONB blob, so these just become new keys inside it. */
+  flatNumber: z.string().trim().max(60).optional().or(z.literal('')),
+  streetAddress: z.string().trim().min(3, 'Give the street address.'),
+  landmark: z.string().trim().max(120).optional().or(z.literal('')),
+  locality: z.string().trim().max(120).optional().or(z.literal('')),
+  city: z.string().trim().min(2, 'Give the city/town.'),
+  state: z.literal(HIMACHAL_PRADESH),
+  pincode: z
     .string()
     .trim()
-    .min(10, 'Give the full address — it stays private until a booking is confirmed.'),
-  /* The pin is checked against the walkthrough video's GPS at the next step,
-     so it has to be the real spot even though guests see it offset. */
-  lat: z.number().min(30).max(34, 'Drop the pin on the property.'),
-  lng: z.number().min(74).max(80, 'Drop the pin on the property.'),
+    .regex(/^\d{6}$/, 'Enter a 6-digit PIN code.'),
+  /* The pin is checked against the device-reported location of every photo and
+     the walkthrough video (capture.util.ts), so it has to be the real spot even though guests see it offset. The
+     range here is a cheap first filter; being inside Himachal Pradesh itself
+     is enforced by assertLocationIsValid. */
+  lat: z.number({ message: 'Drop the pin on the property.' }).min(30).max(34, 'Drop the pin on the property.'),
+  lng: z.number({ message: 'Drop the pin on the property.' }).min(74).max(80, 'Drop the pin on the property.'),
 });
+
+/** Composes the structured address fields into the single string the rest
+ *  of the app (listing cards, the detail page's fullLocation) displays. */
+export function toFullAddress(a: {
+  flatNumber?: string;
+  streetAddress: string;
+  landmark?: string;
+  locality?: string;
+  city: string;
+  state: string;
+  pincode: string;
+}): string {
+  return [a.flatNumber, a.streetAddress, a.landmark, a.locality, a.city, a.state, a.pincode]
+    .map((part) => part?.trim())
+    .filter(Boolean)
+    .join(', ');
+}
 
 export const descriptionSchema = z.object({
   description: z
@@ -112,27 +216,23 @@ export const identitySchema = z.object({
     .or(z.literal('')),
 });
 
-export const legalSchema = z.object({
-  registrationNumber: z
-    .string()
-    .trim()
-    .regex(/^HP\/HS\/\d{3,5}\/\d{4}$/i, 'Format: HP/HS/1234/2025.'),
-});
-
 export const telemetrySchema = z.object({
-  walkthroughPassed: z.literal(true),
-});
-
-export const bankingSchema = z.object({
-  upi: z.string().trim().regex(/^[\w.+-]+@[\w.-]+$/, 'Enter a valid UPI ID.'),
-  name: z
-    .string()
-    .trim()
-    .min(3, 'Enter the name exactly as your bank has it.'),
-});
-
-export const planSchema = z.object({
-  plan: z.enum(['listed', 'featured', 'pro']),
+  /* Client-set tick, not trusted on its own: what the server stores is decided
+     by resolveWalkthrough (host-listings.service.ts) from a receipt or from
+     what is already on the listing. It is kept as a required literal so a form
+     with no walkthrough fails with a clear message before any of that runs. */
+  walkthroughPassed: z.literal(true, { message: 'Record the walkthrough video with the camera before submitting.' }),
+  /* The server-issued receipt from POST media/walkthrough
+     (HostListingsService.verifyWalkthroughVideo): it names exactly which pin
+     the recording was checked against. Optional because a host who edits a
+     listing without recording again has no fresh receipt — the walkthrough
+     already stored on the listing is kept instead (and re-measured against
+     the pin). Without a receipt AND without a stored walkthrough, submit
+     fails regardless of what walkthroughPassed says. */
+  walkthroughToken: z.string().uuid('Record the walkthrough video again before submitting.').optional(),
+  /* Display-only and never stored from here: the video URL saved with the
+     listing is the one the server put in the receipt. */
+  walkthroughVideoUrl: z.string().url().optional(),
 });
 
 export const mediaSchema = z.object({
@@ -140,16 +240,19 @@ export const mediaSchema = z.object({
   tourUrl: z.string().url().optional().or(z.literal('')),
 });
 
-export const hostKycSchema = kindSchema.merge(identitySchema).merge(legalSchema);
+export const hostKycSchema = kindSchema.merge(identitySchema);
 
 export type HostKycPayload = z.infer<typeof hostKycSchema>;
 
-/* The one-page listing form (submit-full / resubmit). Identity/legal/host-type
-   are NOT part of it — those come from the verified profile server-side. */
+/* The one-page listing form (submit-full / resubmit). Identity/host-type
+   are NOT part of it — those come from the verified profile server-side.
+   Payout details (bankingSchema) are not part of it either: every listing pays out to the
+   host's one verified account (users.bank_account_number/bank_ifsc via the
+   account-level bank-verification flow, gated by assertVerified), never a
+   per-listing UPI/name the host retyped and that was never cross-checked
+   against anything real. */
 export const fullOnboardingSchema = listingSchema
   .merge(telemetrySchema)
-  .merge(bankingSchema)
-  .merge(planSchema)
   .merge(mediaSchema);
 
 export type FullOnboardingDraft = z.infer<typeof fullOnboardingSchema>;

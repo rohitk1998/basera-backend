@@ -8,6 +8,7 @@ export interface NotStartedStatus {
   rejectionReason: null;
   submittedAt: null;
   reviewedAt: null;
+  hasBackDocument: false;
 }
 
 export interface IdentityOrPanStatus {
@@ -17,6 +18,8 @@ export interface IdentityOrPanStatus {
   rejectionReason: string | null;
   submittedAt: string;
   reviewedAt: string | null;
+  // True only for an identity (Aadhaar) row with a back-side document stored.
+  hasBackDocument: boolean;
 }
 
 export interface BankStatus extends IdentityOrPanStatus {
@@ -26,14 +29,13 @@ export interface BankStatus extends IdentityOrPanStatus {
   bankIfsc: string | null;
 }
 
-export interface LegalStatus extends IdentityOrPanStatus {
-  registrationNumber: string | null;
-}
-
 export interface MyVerificationStatus {
   identity: NotStartedStatus | IdentityOrPanStatus;
   pan: NotStartedStatus | IdentityOrPanStatus;
   bank: NotStartedStatus | BankStatus;
-  legal: NotStartedStatus | LegalStatus;
   selfie: NotStartedStatus | IdentityOrPanStatus;
+  // The user's verified UPI ID, or null. Set only by a successful UPI check.
+  upiId: string | null;
+  // Who verifies identity + selfie: Didit's hosted flow or the admin review queue.
+  kycProvider: 'didit' | 'admin';
 }

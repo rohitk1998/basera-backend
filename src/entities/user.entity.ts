@@ -48,14 +48,7 @@ export class UserEntity {
   @Column({ type: 'text', nullable: true })
   gst: string | null;
 
-  @Column({ type: 'text', nullable: true })
-  registration_number: string | null;
-
-  @Column({ type: 'timestamptz', nullable: true })
-  kyc_completed_at: Date | null;
-
-  // Account-level verification, added alongside kyc_completed_at but
-  // applicable to guests as well as hosts — see
+  // Account-level verification — see
   // verification-gate.util.ts. selfie_url is a Supabase Storage path
   // (bucket 'selfies'), not a public URL, same private-bucket pattern
   // as the KYC document uploads.

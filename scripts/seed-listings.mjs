@@ -33,6 +33,8 @@ if (!Number.isInteger(count) || count < 1 || count > 50000) {
   process.exit(1);
 }
 
+const BATCH_SIZE = 500;
+
 const SEED_TAG = 'bulk-listings';
 
 const TOWNS = [
@@ -90,7 +92,7 @@ await client.connect();
 
 const { rows: hosts } = await client.query(
   `select id from users where email like $1 order by email`,
-  [`seed-verified-%@basera.test`],
+  [`seed-verified-%@yopmail.com`],
 );
 
 if (hosts.length === 0) {
@@ -114,10 +116,31 @@ if (alreadySeeded >= count) {
 const toCreate = count - alreadySeeded;
 console.log(`Creating ${toCreate} listings (already have ${alreadySeeded}, target ${count})...`);
 
+// Each host gets a run of 2 or 3 listings (alternating, deterministic by host
+// index) before moving to the next host, rather than a flat 1-per-host
+// round-robin — matches "2 or 3 listings per verified host" instead of
+// spreading `count` listings evenly across all `hosts.length` accounts.
+// Precomputed once (flat array, O(count) total) rather than re-walking runs
+// per listing, which would be O(count²) at 10k+ rows.
+const hostIndexForListing = [];
+{
+  let hostIdx = 0;
+  let remainingInRun = hostIdx % 2 === 0 ? 2 : 3;
+  for (let i = 0; i < count; i++) {
+    hostIndexForListing.push(hostIdx % hosts.length);
+    remainingInRun--;
+    if (remainingInRun === 0) {
+      hostIdx++;
+      remainingInRun = hostIdx % 2 === 0 ? 2 : 3;
+    }
+  }
+}
+
 let created = 0;
+const batchRows = [];
 
 for (let i = alreadySeeded; i < count; i++) {
-  const host = hosts[i % hosts.length];
+  const host = hosts[hostIndexForListing[i]];
   const town = pick(TOWNS, i);
   const propertyType = pick(PROPERTY_TYPES, i);
   const beds = pick(BEDS, i + 3);
@@ -167,19 +190,30 @@ for (let i = alreadySeeded; i < count; i++) {
     telemetry: { walkthroughPassed: true },
     banking: { upi: `seedhost${i}@okhdfcbank`, name: 'Seed Host' },
     legal: { registrationNumber: `HP/HS/${2000 + (i % 4000)}/2025` },
-    plan: { plan: 'listed' },
     media: {},
     trustScore: 80 + (i % 20),
   };
 
-  await client.query(
-    `insert into listings (id, host_id, status, draft_data, visit_status, created_at, updated_at)
-     values ($1, $2, 'live', $3, 'passed', now(), now())`,
-    [randomUUID(), host.id, JSON.stringify(draftData)],
-  );
+  batchRows.push([randomUUID(), host.id, JSON.stringify(draftData)]);
 
-  created++;
-  if (created % 500 === 0) {
+  if (batchRows.length === BATCH_SIZE || i === count - 1) {
+    // One multi-row INSERT per batch instead of one round-trip per listing —
+    // at 10k+ rows the per-row network round-trip to the remote Supabase
+    // pooler dominates wall-clock time far more than the writes themselves.
+    const values = [];
+    const placeholders = batchRows
+      .map((row) => {
+        const start = values.length;
+        values.push(...row);
+        return `($${start + 1}, $${start + 2}, 'live', $${start + 3}, 'passed', now(), now())`;
+      })
+      .join(',');
+    await client.query(
+      `insert into listings (id, host_id, status, draft_data, visit_status, created_at, updated_at) values ${placeholders}`,
+      values,
+    );
+    created += batchRows.length;
+    batchRows.length = 0;
     console.log(`  ...${created}/${toCreate} created`);
   }
 }

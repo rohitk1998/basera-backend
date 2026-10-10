@@ -1,8 +1,12 @@
-import { Injectable, InternalServerErrorException, Inject } from '@nestjs/common';
+import { ConflictException, Injectable, InternalServerErrorException, Inject } from '@nestjs/common';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, In, QueryFailedError } from 'typeorm';
 import { PaymentEntity } from '../entities';
+
+// Postgres unique_violation — see idx_payments_booking_id in
+// migrations/20260922_payments_booking_id_unique.sql.
+const PG_UNIQUE_VIOLATION = '23505';
 
 /**
  * Phase 1 — DB-level simulation only, no real Cashfree/Razorpay call.
@@ -21,19 +25,74 @@ export class PaymentsService {
     private readonly dataSource: DataSource,
   ) {}
 
-  async createHeldPayment(bookingId: string, amount: number): Promise<PaymentEntity> {
+  /** Mocked Cashfree Easy Split payload — no real Cashfree call, no real
+   *  SDK. Follows the same SIMULATED-{uuid} convention as
+   *  cashfree_order_id/cashfree_payout_id here. There is no
+   *  concept yet of a host's real Cashfree vendor id anywhere in the
+   *  schema, so `vendor_id` is a mocked placeholder derived from the host's
+   *  own id rather than a new column.
+   *
+   *  `hostPayoutAmount` is passed straight through as the split amount —
+   *  never reduced further here for a gateway/UPI fee. bookings.service.ts
+   *  create() already computed the final host payout (gross - commission);
+   *  this method must not re-derive or shrink it. */
+  buildMockedSplitPayload(
+    hostId: string,
+    hostPayoutAmount: number,
+    platformCommission: number,
+  ): PaymentEntity['cashfree_split_payload'] {
+    return {
+      cashfree_split_order_id: `SIMULATED-${randomUUID()}`,
+      splits: [{ vendor_id: `SIMULATED-VENDOR-${hostId}`, amount: hostPayoutAmount }],
+      platform_amount: platformCommission,
+    };
+  }
+
+  /** Throws ConflictException, not a raw DB error, if a payment for this
+   *  booking already exists — the unique index on booking_id
+   *  (migrations/20260922_payments_booking_id_unique.sql) is what actually
+   *  closes the race two concurrent pay() calls could otherwise hit; this
+   *  just turns that constraint violation into the same exception type the
+   *  application-level "already paid" check in bookings.service.ts already
+   *  throws, so callers don't need to special-case which layer caught it. */
+  async createHeldPayment(
+    bookingId: string,
+    amount: number,
+    split: { hostId: string; hostPayoutAmount: number; platformCommission: number },
+  ): Promise<PaymentEntity> {
     const payment = this.paymentsRepo.create({
       booking_id: bookingId,
       amount,
       cashfree_order_id: `SIMULATED-${randomUUID()}`,
       cashfree_payout_id: null,
       status: 'held',
+      cashfree_split_payload: this.buildMockedSplitPayload(
+        split.hostId,
+        split.hostPayoutAmount,
+        split.platformCommission,
+      ),
     });
-    return this.paymentsRepo.save(payment);
+    try {
+      return await this.paymentsRepo.save(payment);
+    } catch (err) {
+      if (err instanceof QueryFailedError && (err as any).code === PG_UNIQUE_VIOLATION) {
+        throw new ConflictException('This booking has already been paid for.');
+      }
+      throw err;
+    }
   }
 
   async getForBooking(bookingId: string): Promise<PaymentEntity | null> {
     return this.paymentsRepo.findOne({ where: { booking_id: bookingId } });
+  }
+
+  /** Batched form of `getForBooking` for list views — one query instead of
+   *  one per booking. Returns a map keyed by `booking_id` so callers can
+   *  look up per-row without re-scanning the result array. */
+  async getForBookings(bookingIds: string[]): Promise<Map<string, PaymentEntity>> {
+    if (bookingIds.length === 0) return new Map();
+    const rows = await this.paymentsRepo.find({ where: { booking_id: In(bookingIds) } });
+    return new Map(rows.map((row) => [row.booking_id, row]));
   }
 
   /** `held` → `released_to_host`. Called by the auto-release scheduler or an admin dispute resolution. */

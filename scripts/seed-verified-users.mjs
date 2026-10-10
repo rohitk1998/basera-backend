@@ -26,8 +26,8 @@ import { randomUUID } from 'node:crypto';
 dotenv.config();
 
 const count = Number(process.argv[2] ?? 100);
-if (!Number.isInteger(count) || count < 1 || count > 5000) {
-  console.error('Usage: node scripts/seed-verified-users.mjs [count]  (1-5000, default 100)');
+if (!Number.isInteger(count) || count < 1 || count > 20000) {
+  console.error('Usage: node scripts/seed-verified-users.mjs [count]  (1-20000, default 100)');
   process.exit(1);
 }
 
@@ -35,7 +35,11 @@ const SEED_PASSWORD = 'Test@123';
 const seedPasswordHash = await bcrypt.hash(SEED_PASSWORD, 12);
 
 const EMAIL_PREFIX = 'seed-verified-';
-const EMAIL_DOMAIN = 'basera.test';
+// yopmail.com: a real, publicly-checkable disposable inbox (unlike the
+// unroutable basera.test domain this replaced) — every seeded account's
+// inbox at yopmail.com/?seed-verified-NNNN is actually viewable, useful for
+// manually spot-checking auth/notification emails during a load test.
+const EMAIL_DOMAIN = 'yopmail.com';
 const PHONE_PREFIX = '+9190000';
 const VERIFICATION_TYPES = ['identity', 'pan', 'bank', 'legal', 'selfie'];
 
@@ -76,47 +80,70 @@ const existingEmails = new Set(existingRows.map((r) => r.email));
 let created = 0;
 let skipped = 0;
 
+// Batched multi-row inserts instead of one round-trip per row: at 10k+ users
+// (6 sequential single-row inserts each — 1 users + 5 verification_requests)
+// the naive per-row loop is ~60,000 network round-trips to the remote
+// Supabase pooler, which dominates wall-clock time far more than the actual
+// writes. Building one multi-row VALUES list per batch cuts that to
+// 2 round-trips (users + verification_requests) per BATCH_SIZE users.
+const BATCH_SIZE = 200;
+
+function buildInsert(table, columns, rows) {
+  const values = [];
+  const placeholders = rows
+    .map((row) => {
+      const start = values.length;
+      values.push(...row);
+      return `(${row.map((_, k) => `$${start + k + 1}`).join(',')})`;
+    })
+    .join(',');
+  return {
+    text: `insert into ${table} (${columns.join(',')}) values ${placeholders}`,
+    values,
+  };
+}
+
+const pending = [];
 for (let i = 1; i <= count; i++) {
   const email = `${EMAIL_PREFIX}${pad(i, 4)}@${EMAIL_DOMAIN}`;
   if (existingEmails.has(email)) {
     skipped++;
     continue;
   }
+  pending.push(i);
+}
 
-  const userId = randomUUID();
-  const firstName = randomOf(FIRST_NAMES, i);
-  const lastName = randomOf(LAST_NAMES, i + 7);
-  const fullName = `${firstName} ${lastName}`;
-  const phone = `${PHONE_PREFIX}${pad(i, 4)}`;
-  const isHost = i % 2 === 0;
-  const registrationNumber = `HP/HS/${pad(1000 + i, 4)}/2025`;
-  const pan = `ABCDE${pad(i % 10000, 4)}F`;
+for (let b = 0; b < pending.length; b += BATCH_SIZE) {
+  const batch = pending.slice(b, b + BATCH_SIZE);
   const now = new Date();
+  const userRows = [];
+  const verificationRows = [];
 
-  await client.query('begin');
-  try {
-    await client.query(
-      `insert into users (
-         id, full_name, email, phone, "isHost", host_kind, pan,
-         registration_number, kyc_completed_at, selfie_uploaded_at,
-         bank_upi, bank_account_name, bank_verified_at, created_at,
-         password_hash
-       ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$9,$9,$12)`,
-      [
-        userId,
-        fullName,
-        email,
-        phone,
-        isHost,
-        isHost ? 'individual' : null,
-        pan,
-        registrationNumber,
-        now,
-        `${firstName.toLowerCase()}${i}@okhdfcbank`,
-        fullName,
-        seedPasswordHash,
-      ],
-    );
+  for (const i of batch) {
+    const email = `${EMAIL_PREFIX}${pad(i, 4)}@${EMAIL_DOMAIN}`;
+    const userId = randomUUID();
+    const firstName = randomOf(FIRST_NAMES, i);
+    const lastName = randomOf(LAST_NAMES, i + 7);
+    const fullName = `${firstName} ${lastName}`;
+    const phone = `${PHONE_PREFIX}${pad(i, 4)}`;
+    const isHost = i % 2 === 0;
+    const registrationNumber = `HP/HS/${pad(1000 + i, 4)}/2025`;
+    const pan = `ABCDE${pad(i % 10000, 4)}F`;
+
+    userRows.push([
+      userId,
+      fullName,
+      email,
+      phone,
+      isHost,
+      isHost ? 'individual' : null,
+      pan,
+      registrationNumber,
+      now,
+      `${firstName.toLowerCase()}${i}@okhdfcbank`,
+      fullName,
+      seedPasswordHash,
+    ]);
 
     for (const type of VERIFICATION_TYPES) {
       // legal/bank carry their own type-specific fields; identity/pan/selfie
@@ -126,32 +153,56 @@ for (let i = 1; i <= count; i++) {
       const isLegal = type === 'legal';
       const isIdentity = type === 'identity';
 
-      await client.query(
-        `insert into verification_requests (
-           id, user_id, verification_type, document_subtype, status,
-           bank_account_number, bank_ifsc, bank_account_holder_name, bank_name,
-           registration_number, submitted_at, reviewed_at, updated_at
-         ) values ($1,$2,$3,$4,'verified',$5,$6,$7,$8,$9,$10,$10,$10)`,
-        [
-          randomUUID(),
-          userId,
-          type,
-          isIdentity ? 'aadhaar' : null,
-          isBank ? `50100${pad(i, 6)}` : null,
-          isBank ? 'HDFC0001234' : null,
-          isBank ? fullName : null,
-          isBank ? 'HDFC Bank' : null,
-          isLegal ? registrationNumber : null,
-          now,
-        ],
-      );
+      verificationRows.push([
+        randomUUID(),
+        userId,
+        type,
+        isIdentity ? 'aadhaar' : null,
+        isBank ? `50100${pad(i, 6)}` : null,
+        isBank ? 'HDFC0001234' : null,
+        isBank ? fullName : null,
+        isBank ? 'HDFC Bank' : null,
+        isLegal ? registrationNumber : null,
+        now,
+      ]);
     }
+  }
+
+  await client.query('begin');
+  try {
+    const usersInsert = buildInsert(
+      'users',
+      [
+        'id', 'full_name', 'email', 'phone', '"isHost"', 'host_kind', 'pan',
+        'registration_number', 'kyc_completed_at', 'selfie_uploaded_at',
+        'bank_upi', 'bank_account_name', 'bank_verified_at', 'created_at',
+        'password_hash',
+      ],
+      userRows.map((r) => [
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[8], r[9], r[10], r[8], r[8], r[11],
+      ]),
+    );
+    await client.query(usersInsert.text, usersInsert.values);
+
+    const verificationInsert = buildInsert(
+      'verification_requests',
+      [
+        'id', 'user_id', 'verification_type', 'document_subtype', 'status',
+        'bank_account_number', 'bank_ifsc', 'bank_account_holder_name', 'bank_name',
+        'registration_number', 'submitted_at', 'reviewed_at', 'updated_at',
+      ],
+      verificationRows.map((r) => [
+        r[0], r[1], r[2], r[3], 'verified', r[4], r[5], r[6], r[7], r[8], r[9], r[9], r[9],
+      ]),
+    );
+    await client.query(verificationInsert.text, verificationInsert.values);
 
     await client.query('commit');
-    created++;
+    created += batch.length;
+    console.log(`  ...${created}/${pending.length} created`);
   } catch (err) {
     await client.query('rollback');
-    console.error(`Failed to seed user ${i} (${email}):`, err.message);
+    console.error(`Failed to seed batch starting at index ${batch[0]}:`, err.message);
   }
 }
 

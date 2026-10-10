@@ -7,6 +7,7 @@ import { CreateConversationDto } from './dto/create-conversation.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { StartCallDto } from './dto/start-call.dto';
 import { UpdateCallDto } from './dto/update-call.dto';
+import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
 @Controller('api/conversations')
 @UseGuards(AuthGuard)
@@ -18,6 +19,7 @@ export class ConversationsController {
     return this.conversations.list(user.userId);
   }
 
+  @ResponseMessage('Conversation ready.')
   @Post()
   getOrCreate(@CurrentUser() user: AuthUser, @Body() dto: CreateConversationDto) {
     return this.conversations.getOrCreate(user.userId, dto);
@@ -26,6 +28,7 @@ export class ConversationsController {
   // Message history itself is read directly by the browser via Supabase
   // (RLS-gated) with a postgres_changes subscription for live delivery —
   // no GET route here. This is the only write path.
+  @ResponseMessage('Message sent.')
   @Post(':id/messages')
   sendMessage(
     @CurrentUser() user: AuthUser,
@@ -38,11 +41,13 @@ export class ConversationsController {
   // Called every ~15s by the client while the thread is open and the tab
   // is foregrounded — see ConversationPresenceEntity. No response body
   // needed; the caller doesn't act on this beyond firing it.
+  @ResponseMessage('Presence updated.')
   @Post(':id/presence')
   heartbeat(@CurrentUser() user: AuthUser, @Param('id') conversationId: string) {
     return this.conversations.heartbeat(user.userId, conversationId);
   }
 
+  @ResponseMessage('Call started.')
   @Post(':id/calls')
   startCall(
     @CurrentUser() user: AuthUser,
@@ -52,6 +57,7 @@ export class ConversationsController {
     return this.conversations.startCall(user.userId, conversationId, dto);
   }
 
+  @ResponseMessage('Call updated.')
   @Patch(':id/calls/:callId')
   updateCall(
     @CurrentUser() user: AuthUser,

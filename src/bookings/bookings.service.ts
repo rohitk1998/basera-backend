@@ -6,9 +6,11 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  PayloadTooLargeException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { LessThanOrEqual, Repository } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, EntityManager, LessThanOrEqual, Repository } from 'typeorm';
 import { randomInt, randomUUID } from 'crypto';
 import {
   BookingEntity,
@@ -20,10 +22,10 @@ import { agreeTerms } from '../common/domain';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SupabaseProvider } from '../auth/supabase.provider';
-import { assertVerified } from '../user/verification-gate.util';
+import { assertKycVerified } from '../user/verification-gate.util';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { DisputeBookingDto } from './dto/dispute-booking.dto';
-import { ReviewEntity, DisputeCaseEntity, DisputeEventEntity } from '../entities';
+import { ReviewEntity, DisputeCaseEntity, DisputeEventEntity, VerificationRequestEntity } from '../entities';
 
 type UploadedMulterFile = { buffer: Buffer; mimetype: string; size: number };
 
@@ -84,15 +86,25 @@ export class BookingsService {
     private readonly notifications: NotificationsService,
     private readonly payments: PaymentsService,
     private readonly supabase: SupabaseProvider,
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
+    private readonly config: ConfigService,
   ) { }
 
+  /** `manager` defaults to the module-level repo (every existing caller's
+   *  behavior, unchanged) but can be passed an in-transaction EntityManager
+   *  so this insert commits or rolls back together with whatever else that
+   *  transaction is doing — see dispute() for the one caller that needs
+   *  that. */
   private async recordEvent(
     bookingId: string,
     fromStatus: string | null,
     toStatus: string,
     actor: string,
+    manager?: EntityManager,
   ): Promise<void> {
-    await this.bookingEventsRepo.insert({
+    const repo = manager ? manager.getRepository(BookingEventEntity) : this.bookingEventsRepo;
+    await repo.insert({
       booking_id: bookingId,
       from_status: fromStatus,
       to_status: toStatus,
@@ -127,11 +139,19 @@ export class BookingsService {
       throw new ForbiddenException('You must switch to guest mode to book a property.');
     }
 
-    const requestingProfile = { id: userId, kyc_completed_at: new Date(), selfie_uploaded_at: new Date(), bank_verified_at: new Date() };
+    const [requestingProfile, latestIdentity] = await Promise.all([
+      this.profilesRepo.findOne({ where: { id: userId }, select: { id: true, selfie_uploaded_at: true } }),
+      this.dataSource.getRepository(VerificationRequestEntity).findOne({
+        where: { user_id: userId, verification_type: 'identity' },
+        order: { submitted_at: 'DESC' },
+      }),
+    ]);
+    if (!requestingProfile) {
+      throw new NotFoundException('Profile not found');
+    }
     // The gate is for the person, not the API — same principle as
-    // host-listings.service.ts submitFull(). Guests never need
-    // kyc_completed_at (that's host-only HP Tourism/PAN verification).
-    assertVerified(requestingProfile, { requireHostKyc: false });
+    // host-listings.service.ts submitFull().
+    assertKycVerified(requestingProfile, { identity: { status: latestIdentity?.status ?? 'not_started' } });
 
     const moveInDate = new Date(dto.moveIn);
     const moveOutDate = new Date(dto.moveOut);
@@ -177,13 +197,34 @@ export class BookingsService {
       (listing.draft_data as Record<string, any>)?.property_details ?? {};
     const listingTitle = propertyDetails.title ?? 'the listing';
     const dailyBaseRate = propertyDetails.dailyBaseRate ?? Math.round((propertyDetails.price || propertyDetails.monthlyRent || 12000) / 30);
-    
+
     if (typeof dailyBaseRate !== 'number' || isNaN(dailyBaseRate)) {
       throw new InternalServerErrorException('Listing is missing pricing information');
     }
 
-    const weeklyDiscountPct = propertyDetails.weeklyDiscountPct || 15;
-    const monthlyDiscountPct = propertyDetails.monthlyDiscountPct || 40;
+    const weeklyDiscountPct = propertyDetails.weeklyDiscountPct ?? 15;
+    const monthlyDiscountPct = propertyDetails.monthlyDiscountPct ?? 40;
+
+    // Infants and pets don't count against a bed/room capacity limit the
+    // same way an adult or child does — matches how GuestsPicker's own
+    // client-side copy frames them (infants: "Under 2", pets: a separate
+    // "bringing a service animal?" link, not folded into headcount).
+    const adults = dto.adults ?? 1;
+    const children = dto.children ?? 0;
+    const infants = dto.infants ?? 0;
+    const pets = dto.pets ?? 0;
+    const partySize = adults + children;
+    const maxGuests = propertyDetails.maxGuests;
+    if (typeof maxGuests === 'number' && partySize > maxGuests) {
+      throw new BadRequestException(
+        `This property sleeps up to ${maxGuests} guest${maxGuests === 1 ? '' : 's'} — reduce your party size and try again.`,
+      );
+    }
+
+    const minDays = propertyDetails.minDays;
+    if (typeof minDays === 'number' && dto.days < minDays) {
+      throw new BadRequestException(`This property has a minimum stay of ${minDays} day${minDays === 1 ? '' : 's'}.`);
+    }
 
     // agreeTerms is pure arithmetic (see common/domain.ts) — it never
     // throws, so nothing before the insert below can produce a client-
@@ -200,6 +241,11 @@ export class BookingsService {
       dto.paymentMethod
     );
 
+    const commissionPercentage = this.config.get<number>('PLATFORM_COMMISSION_PERCENTAGE')!;
+    const grossBookingAmount = terms.totalRent;
+    const platformCommission = Math.round(grossBookingAmount * (commissionPercentage / 100));
+    const hostPayoutAmount = grossBookingAmount - platformCommission;
+
     let inserted;
     try {
       inserted = await this.bookingsRepo.insert({
@@ -210,10 +256,17 @@ export class BookingsService {
         move_in: dto.moveIn,
         move_out: dto.moveOut,
         months: dto.days, // Storing days in the legacy "months" column
+        adults,
+        children,
+        infants,
+        pets,
         monthly_rent: terms.totalRent, // Storing total rent in the legacy "monthly_rent" column
         deposit: terms.deposit,
         payment_method: terms.paymentMethod,
         due_at_move_in: terms.dueAtMoveIn,
+        gross_booking_amount: grossBookingAmount,
+        platform_commission: platformCommission,
+        host_payout_amount: hostPayoutAmount,
       });
     } catch (e: any) {
       this.logger.error('[create] booking insert failed', e);
@@ -247,11 +300,22 @@ export class BookingsService {
   /**
    * The caller's own bookings, as guest or host. Rows are flattened with the
    * listing title read out of `draft_data` here rather than handed back raw.
+   * Paginated — this list has no natural cap (every booking a user has ever
+   * made) and was previously fetched in full on every call.
    */
-  async list(userId: string, role: 'host' | 'guest') {
-    const rows = await this.bookingsRepo.find({
-      where: role === 'host' ? { host_id: userId } : { guest_id: userId },
+  async list(
+    userId: string,
+    role: 'host' | 'guest',
+    pagination: { page: number; pageSize: number },
+  ) {
+    const { page, pageSize } = pagination;
+    const where = role === 'host' ? { host_id: userId } : { guest_id: userId };
+
+    const [rows, total] = await this.bookingsRepo.findAndCount({
+      where,
       order: { created_at: 'DESC' },
+      take: pageSize,
+      skip: (page - 1) * pageSize,
     });
 
     const listingIds = Array.from(new Set(rows.map((r) => r.listing_id)));
@@ -259,14 +323,14 @@ export class BookingsService {
       new Set(rows.map((r) => (role === 'host' ? r.guest_id : r.host_id))),
     );
 
-    const [listingRows, profileRows, paymentResults, reviewsRows] = await Promise.all([
+    const [listingRows, profileRows, paymentsByBookingId, reviewsRows] = await Promise.all([
       listingIds.length
         ? this.listingsRepo.find({ where: listingIds.map((id) => ({ id })), select: { id: true, draft_data: true } })
         : Promise.resolve([] as ListingEntity[]),
       counterpartIds.length
         ? this.profilesRepo.find({ where: counterpartIds.map((id) => ({ id })), select: { id: true, full_name: true } })
         : Promise.resolve([] as UserEntity[]),
-      Promise.all(rows.map((row) => this.payments.getForBooking(row.id))),
+      this.payments.getForBookings(rows.map((row) => row.id)),
       this.reviewsRepo.find({ where: { author_id: userId }, select: { booking_id: true } }),
     ]);
 
@@ -275,7 +339,9 @@ export class BookingsService {
     );
     const nameById = new Map(profileRows.map((p) => [p.id, p.full_name ?? 'Basera user']));
     const paidByBookingId = new Set(
-      paymentResults.filter((p) => p && p.status !== 'refunded').map((p) => p!.booking_id)
+      Array.from(paymentsByBookingId.values())
+        .filter((p) => p.status !== 'refunded')
+        .map((p) => p.booking_id),
     );
 
     const bookings = rows.map((row) => ({
@@ -286,10 +352,17 @@ export class BookingsService {
       moveIn: row.move_in,
       moveOut: row.move_out,
       days: row.months,
+      adults: row.adults,
+      children: row.children,
+      infants: row.infants,
+      pets: row.pets,
       totalRent: row.monthly_rent,
       deposit: row.deposit,
       paymentMethod: row.payment_method as 'upi' | 'cash',
       dueAtMoveIn: row.due_at_move_in,
+      grossBookingAmount: row.gross_booking_amount,
+      platformCommission: row.platform_commission,
+      hostPayoutAmount: row.host_payout_amount,
       checkinCode: row.checkin_code,
       checkinTime: row.checkin_time,
       escrowReleaseTime: row.escrow_release_time,
@@ -300,7 +373,7 @@ export class BookingsService {
       createdAt: row.created_at,
     }));
 
-    return { success: true, bookings };
+    return { success: true, bookings, page, pageSize, total };
   }
 
   /**
@@ -332,10 +405,17 @@ export class BookingsService {
       moveIn: row.move_in,
       moveOut: row.move_out,
       days: row.months,
+      adults: row.adults,
+      children: row.children,
+      infants: row.infants,
+      pets: row.pets,
       totalRent: row.monthly_rent,
       deposit: row.deposit,
       paymentMethod: row.payment_method as 'upi' | 'cash',
       dueAtMoveIn: row.due_at_move_in,
+      grossBookingAmount: row.gross_booking_amount,
+      platformCommission: row.platform_commission,
+      hostPayoutAmount: row.host_payout_amount,
       rejectionReason: row.rejection_reason,
       checkinCode: row.checkin_code,
       checkinTime: row.checkin_time,
@@ -504,7 +584,15 @@ export class BookingsService {
   async pay(userId: string, id: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, due_at_move_in: true },
+      select: {
+        status: true,
+        guest_id: true,
+        host_id: true,
+        listing_id: true,
+        due_at_move_in: true,
+        host_payout_amount: true,
+        platform_commission: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -520,7 +608,23 @@ export class BookingsService {
       throw new ConflictException('This booking has already been paid for.');
     }
 
-    await this.payments.createHeldPayment(id, booking.due_at_move_in);
+    // This check-then-insert is a fast path, not the actual guarantee: two
+    // concurrent pay() calls can both pass the check above before either
+    // commits. The unique index on payments.booking_id (see
+    // createHeldPayment) is what closes that race — its second insert
+    // fails and createHeldPayment turns that into the same
+    // ConflictException this method would have thrown had it lost the race
+    // up here instead.
+    //
+    // The mocked Cashfree Easy Split payload built inside createHeldPayment
+    // uses host_payout_amount/platform_commission exactly as computed at
+    // booking creation — no additional gateway/UPI fee is deducted from the
+    // host's split here.
+    await this.payments.createHeldPayment(id, booking.due_at_move_in, {
+      hostId: booking.host_id,
+      hostPayoutAmount: booking.host_payout_amount,
+      platformCommission: booking.platform_commission,
+    });
 
     const listing = await this.listingsRepo.findOne({
       where: { id: booking.listing_id },
@@ -626,32 +730,43 @@ export class BookingsService {
       throw new BadRequestException('Requested amount cannot exceed the amount paid.');
     }
 
-    const updateRes = await this.bookingsRepo.update(
-      { id, status: 'checked_in' },
-      { status: 'disputed', updated_at: new Date() },
-    );
-    if (updateRes.affected === 0) {
-      throw new ConflictException('Booking status changed during operation');
-    }
-    await this.recordEvent(id, 'checked_in', 'disputed', userId);
+    // All 4 writes below (status update, booking event, dispute case,
+    // dispute event) commit or roll back together — a crash or error
+    // between any two of them used to leave a booking marked `disputed`
+    // with no corresponding dispute_cases row, or a case with no opening
+    // event.
+    const disputeCase = await this.dataSource.transaction(async (manager) => {
+      const updateRes = await manager.update(
+        BookingEntity,
+        { id, status: 'checked_in' },
+        { status: 'disputed', updated_at: new Date() },
+      );
+      if (updateRes.affected === 0) {
+        throw new ConflictException('Booking status changed during operation');
+      }
+      await this.recordEvent(id, 'checked_in', 'disputed', userId, manager);
 
-    const disputeCase = await this.disputeCasesRepo.save(
-      this.disputeCasesRepo.create({
-        booking_id: id,
-        category: dto.category,
-        description: dto.description,
-        requested_amount: dto.requestedAmount,
-        evidence_urls: [],
-        case_status: 'open',
-      }),
-    );
-    await this.disputeEventsRepo.insert({
-      dispute_case_id: disputeCase.id,
-      actor_id: userId,
-      actor_role: 'guest',
-      event_type: 'claim_raised',
-      offer_amount: dto.requestedAmount,
-      message: dto.description,
+      const disputeCasesRepo = manager.getRepository(DisputeCaseEntity);
+      const savedCase = await disputeCasesRepo.save(
+        disputeCasesRepo.create({
+          booking_id: id,
+          category: dto.category,
+          description: dto.description,
+          requested_amount: dto.requestedAmount,
+          evidence_urls: [],
+          case_status: 'open',
+        }),
+      );
+      await manager.getRepository(DisputeEventEntity).insert({
+        dispute_case_id: savedCase.id,
+        actor_id: userId,
+        actor_role: 'guest',
+        event_type: 'claim_raised',
+        offer_amount: dto.requestedAmount,
+        message: dto.description,
+      });
+
+      return savedCase;
     });
 
     const [listing, guestProfile] = await Promise.all([
@@ -725,7 +840,7 @@ export class BookingsService {
         throw new BadRequestException('Unsupported file type. Use JPEG, PNG or WebP.');
       }
       if (file.size > EVIDENCE_MAX_BYTES) {
-        throw new BadRequestException({ error: 'File too large. Maximum size is 5 MB.', statusCode: 413 });
+        throw new PayloadTooLargeException('File too large. Maximum size is 5 MB.');
       }
 
       const storagePath = `${bookingId}/${randomUUID()}.${ext}`;

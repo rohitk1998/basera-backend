@@ -21,6 +21,7 @@ import { ProfilePayloadDto } from './dto/profile-payload.dto';
 import { BecomeHostDto } from './dto/become-host.dto';
 import { PushTokenDto } from './dto/push-token.dto';
 import { SetLocaleDto } from './dto/set-locale.dto';
+import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
 interface UploadedMulterFile {
   buffer: Buffer;
@@ -42,6 +43,7 @@ export class UserController {
     return this.userService.getProfile(user.userId);
   }
 
+  @ResponseMessage('Profile saved.')
   @Post('profile')
   async updateProfile(@CurrentUser() user: AuthUser, @Body() dto: ProfilePayloadDto) {
     const { isFirstTimeSignup } = await this.userService.updateProfile(user.userId, dto);
@@ -69,12 +71,14 @@ export class UserController {
    * point. Deliberately narrower than POST above: never touches name,
    * avatar, or languages.
    */
+  @ResponseMessage((_r, req) => (req.body?.isHost ? 'You are now a host.' : 'Host mode turned off.'))
   @Patch('profile')
   becomeHost(@CurrentUser() user: AuthUser, @Body() dto: BecomeHostDto) {
     return this.userService.setIsHost(user.userId, dto.isHost);
   }
 
 
+  @ResponseMessage('Profile photo updated.')
   @Post('avatar')
   @UseInterceptors(FileInterceptor('avatar'))
   uploadAvatar(@CurrentUser() user: AuthUser, @UploadedFile() file?: UploadedMulterFile) {
@@ -84,16 +88,19 @@ export class UserController {
     return this.userService.uploadAvatar(user.userId, file);
   }
 
+  @ResponseMessage('Notifications enabled on this device.')
   @Post('push-token')
   addPushToken(@CurrentUser() user: AuthUser, @Body() dto: PushTokenDto) {
     return this.userService.addPushToken(user.userId, dto.token);
   }
 
+  @ResponseMessage('Notifications disabled on this device.')
   @Delete('push-token')
   removePushToken(@CurrentUser() user: AuthUser, @Body() dto: PushTokenDto) {
     return this.userService.removePushToken(user.userId, dto.token);
   }
 
+  @ResponseMessage('Language updated.')
   @Post('locale')
   setLocale(@CurrentUser() user: AuthUser, @Body() dto: SetLocaleDto) {
     if (!isSupportedLocale(dto.locale)) {

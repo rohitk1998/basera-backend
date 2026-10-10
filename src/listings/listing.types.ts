@@ -14,7 +14,9 @@ export type AmenityGroup =
   | 'kitchen'
   | 'work'
   | 'safety'
-  | 'outside';
+  | 'outside'
+  | 'entertainment'
+  | 'family';
 
 export type Amenity = { id: string; label: string; group: AmenityGroup };
 
@@ -63,10 +65,6 @@ export type Listing = {
   tourUrl?: string;
   houseRules: HouseRules;
   cancellation: 'flexible' | 'moderate' | 'firm';
-  /** HP Tourism Home Stay registration — Layer 1, shown publicly. null when
-   *  the host has not supplied one; callers omit the line rather than print a
-   *  placeholder certificate number. */
-  hpRegistrationNo: string | null;
   /** Approximate location — used for the map view's pins. null when the host
    *  never dropped a pin, so the map can skip it instead of stacking every
    *  such listing on one default point. */

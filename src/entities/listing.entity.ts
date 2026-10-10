@@ -1,4 +1,4 @@
-import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
 @Entity('listings')
 export class ListingEntity {
@@ -8,10 +8,14 @@ export class ListingEntity {
   @Column('uuid')
   host_id: string;
 
+  // Every public search/summary query starts with `WHERE status = 'live'`
+  // (also the admin dashboard's per-status counts) — see
+  // migrations/20260921_perf_indexes.sql.
+  @Index()
   @Column()
   status: string;
 
-  // Schema-on-read JSON blob holding property_details/telemetry/banking/plan/legal.
+  // Schema-on-read JSON blob holding property_details/telemetry/banking.
   // See lib/listing-mapper.ts (rowToListing) in the original Next.js app for the
   // exact read shape this must be ported to match.
   @Column('jsonb', { nullable: true })

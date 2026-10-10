@@ -4,12 +4,14 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/types';
 import { ReviewsService } from './reviews.service';
 import { CreateReviewDto } from './dto/create-review.dto';
+import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
 @Controller('api/reviews')
 export class ReviewsController {
   constructor(private readonly reviewsService: ReviewsService) {}
 
   @UseGuards(AuthGuard)
+  @ResponseMessage('Thanks for your review.')
   @Post('booking/:bookingId')
   createReview(
     @CurrentUser() user: AuthUser,

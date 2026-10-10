@@ -1,35 +1,39 @@
 import {
   BadRequestException,
   Body,
-  ConflictException,
   Controller,
-  forwardRef,
   Get,
   HttpCode,
-  Inject,
-  InternalServerErrorException,
   Logger,
   Post,
   Req,
   Res,
   UnauthorizedException,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { Throttle } from '@nestjs/throttler';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
 import type { Request, Response } from 'express';
-import * as crypto from 'node:crypto';
 import * as jwt from 'jsonwebtoken';
-import * as bcrypt from 'bcrypt';
-import { FirebaseAdminProvider } from './firebase-admin.provider';
-import { UserEntity, EmailOtpEntity } from '../entities';
 import { AuthGuard, SESSION_COOKIE } from './auth.guard';
+import { AuthService, AvatarUploadFile, SessionTokens } from './auth.service';
 import { AdminLoginDto } from './dto/admin-login.dto';
 import { SendEmailOtpDto } from './dto/send-email-otp.dto';
 import { VerifyEmailOtpDto } from './dto/verify-email-otp.dto';
 import { CompleteSignupDto } from './dto/complete-signup.dto';
-import { NotificationsService } from '../notifications/notifications.service';
+import { ResponseMessage } from '../common/decorators/response-message.decorator';
+
+interface UploadedMulterFile {
+  buffer?: Buffer;
+  mimetype: string;
+  size: number;
+}
+
+const AVATAR_MAX_BYTES = 5 * 1024 * 1024; // matches UserService.uploadAvatar's own cap
 
 const WEEK_SECONDS = 60 * 60 * 24 * 7;
 const YEAR_SECONDS = 60 * 60 * 24 * 365;
@@ -37,72 +41,17 @@ const REFRESH_TOKEN_SECONDS = YEAR_SECONDS / 12; // 30 days — outlives the 7-d
 
 const REFRESH_COOKIE = 'basera_refresh_token';
 
-// TTL for the proof-of-identity token minted by session()/verifyEmailOtp()
-// for a brand-new signup — see issueProofToken below. Long enough to fill
-// out ProfileScreen, short enough that a leaked/abandoned token is useless
-// shortly after.
-const PROFILE_COMPLETION_TOKEN_MINUTES = 10;
-
-// Distinct `purpose` claim, checked explicitly by completeSignup() and never
-// set by issueSession() — this is what makes it impossible for this token to
-// be mistaken for (or replayed as) a real session. It also has no `sub`
-// claim, which independently makes AuthGuard.verify() reject it (it throws
-// 'No user ID in token' when decoded.sub is missing), so even if this token
-// were ever presented as a session cookie, AuthGuard would already refuse it
-// before the purpose check would even matter.
-const PROFILE_COMPLETION_TOKEN_PURPOSE = 'profile-completion';
-
-interface ProfileCompletionClaims extends jwt.JwtPayload {
-  purpose: typeof PROFILE_COMPLETION_TOKEN_PURPOSE;
-  phone?: string;
-  email?: string;
-  firebaseUid?: string;
-}
-
-// Email OTP tuning — see web/supabase/migrations/20260916_email_otps.sql.
-const OTP_LENGTH = 6;
-const OTP_EXPIRY_MINUTES = 10;
-const OTP_RESEND_DEBOUNCE_SECONDS = 60;
-const OTP_MAX_ATTEMPTS = 5;
-
-function hashRefreshToken(token: string): string {
-  return crypto.createHash('sha256').update(token).digest('hex');
-}
-
-// Same sha256 hashing approach as hashRefreshToken above — see
-// EmailOtpEntity.code_hash for why this isn't bcrypt.
-function hashOtpCode(code: string): string {
-  return crypto.createHash('sha256').update(code).digest('hex');
-}
-
-function generateOtpCode(): string {
-  // 6-digit numeric, zero-padded — crypto.randomInt is uniform and
-  // cryptographically strong, unlike Math.random().
-  return crypto.randomInt(0, 10 ** OTP_LENGTH).toString().padStart(OTP_LENGTH, '0');
-}
-
-// Deterministic Firebase UID -> Supabase-shaped UUID mapping. Ported as-is
-// from web/app/api/auth/session/route.ts — changing the derivation would
-// orphan every existing profile row from its Firebase account.
-function firebaseUidToSupabaseUuid(uid: string): string {
-  const md5 = crypto.createHash('md5').update(uid).digest('hex');
-  return `${md5.slice(0, 8)}-${md5.slice(8, 12)}-4${md5.slice(13, 16)}-a${md5.slice(17, 20)}-${md5.slice(20, 32)}`;
-}
-
+/**
+ * HTTP layer only — reads the request, calls AuthService for every bit of
+ * actual business logic (bcrypt/jwt/OTP handling, repository access), and
+ * shapes cookies/responses from what AuthService returns. AuthService never
+ * touches Request/Response, so every cookie write stays here.
+ */
 @Controller('api/auth')
 export class AuthController {
   private readonly logger = new Logger(AuthController.name);
 
-  constructor(
-    private readonly firebase: FirebaseAdminProvider,
-    private readonly config: ConfigService,
-    @InjectRepository(UserEntity)
-    private readonly profiles: Repository<UserEntity>,
-    @InjectRepository(EmailOtpEntity)
-    private readonly emailOtps: Repository<EmailOtpEntity>,
-    @Inject(forwardRef(() => NotificationsService))
-    private readonly notifications: NotificationsService,
-  ) {}
+  constructor(private readonly auth: AuthService) {}
 
   /**
    * Hands the caller their own current session token back, for the one
@@ -128,6 +77,7 @@ export class AuthController {
     return { token };
   }
 
+  @ResponseMessage((r) => (r.isNewUser ? 'Phone verified. Finish setting up your profile.' : 'Signed in.'))
   @Post('session')
   async session(
     @Body('firebaseToken') firebaseToken: string,
@@ -137,13 +87,7 @@ export class AuthController {
       throw new BadRequestException('No token provided');
     }
 
-    let decodedToken: { uid: string; phone_number?: string };
-    try {
-      decodedToken = await this.firebase.auth.verifyIdToken(firebaseToken);
-    } catch (err: any) {
-      const isAuthError = typeof err?.code === 'string' && err.code.startsWith('auth/');
-      throw new BadRequestException(isAuthError ? err.code : 'Internal Server Error');
-    }
+    const decodedToken = await this.auth.verifyFirebaseToken(firebaseToken);
 
     const { uid } = decodedToken;
     const phone = decodedToken.phone_number;
@@ -151,9 +95,8 @@ export class AuthController {
       throw new BadRequestException('No phone number found on token');
     }
 
-    const supabaseUuid = firebaseUidToSupabaseUuid(uid);
-
-    const existingProfile = await this.profiles.findOne({ where: { id: supabaseUuid } });
+    const userId = this.auth.firebaseUidToUserId(uid);
+    const existingProfile = await this.auth.findProfileById(userId);
 
     if (!existingProfile) {
       // Genuinely new signup: no row exists for this Firebase identity yet.
@@ -162,7 +105,7 @@ export class AuthController {
       // short-lived proof-of-identity token instead of a session so the
       // frontend can prove "this phone/uid was just OTP-verified" without
       // us having created an account or signed anyone in yet.
-      const proofToken = this.issueProofToken({ phone, firebaseUid: uid });
+      const proofToken = this.auth.issueProofToken({ phone, firebaseUid: uid });
       return { success: true, phone, isNewUser: true, proofToken };
     }
 
@@ -175,7 +118,7 @@ export class AuthController {
     // still report isNewUser so the frontend sends them to ProfileScreen.
     const isNewUser = !existingProfile.full_name;
 
-    await this.issueSession(res, { userId: supabaseUuid, phone, firebaseUid: uid });
+    await this.setSessionCookies(res, await this.auth.issueSession({ userId, phone, firebaseUid: uid }));
 
     return { success: true, phone, isNewUser };
   }
@@ -188,25 +131,20 @@ export class AuthController {
    * — there is no self-serve way to create an admin or set this password;
    * see scripts/seed-admin.mjs.
    */
+  // Tighter than the 60/min global default — a bcrypt.compare admin-login
+  // endpoint is exactly what brute-force rate limiting exists for, and
+  // there was previously no limit on it at all.
+  @Throttle({ default: { ttl: 60_000, limit: 5 } })
+  @ResponseMessage('Signed in as admin.')
   @Post('admin-login')
   @HttpCode(200)
   async adminLogin(@Body() body: AdminLoginDto, @Res({ passthrough: true }) res: Response) {
-    const profile = await this.profiles.findOne({ where: { email: body.email } });
+    const profile = await this.auth.verifyAdminCredentials(body.email, body.password);
 
-    // Same "invalid credentials" message whether the email doesn't exist,
-    // isn't an admin, or has no password set — never reveal which.
-    const invalid = () => new UnauthorizedException('Invalid email or password');
-
-    if (!profile || profile.role !== 'admin' || !profile.password_hash) {
-      throw invalid();
-    }
-
-    const passwordMatches = await bcrypt.compare(body.password, profile.password_hash);
-    if (!passwordMatches) {
-      throw invalid();
-    }
-
-    await this.issueSession(res, { userId: profile.id, phone: profile.phone ?? undefined });
+    await this.setSessionCookies(
+      res,
+      await this.auth.issueSession({ userId: profile.id, phone: profile.phone ?? undefined }),
+    );
 
     return { success: true, redirectTo: '/admin' };
   }
@@ -218,66 +156,17 @@ export class AuthController {
    * an existing account (any signup method) or none yet; verifyEmailOtp is
    * what decides new-signup vs. existing-login, same split session() makes
    * for phone-OTP.
-   *
-   * Debounced at 60s per email via last_sent_at rather than a rate-limiting
-   * package — consistent with this codebase's earlier decision to defer
-   * that dependency. One row per email (upsert), so a second send for the
-   * same email always overwrites rather than accumulating rows.
    */
+  // The 60s-per-email debounce (inside AuthService.sendEmailOtp) stops
+  // repeat sends to the *same* address; it does nothing against one
+  // attacker cycling through many addresses. This IP-scoped limit covers
+  // that gap.
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
+  @ResponseMessage('Verification code sent to your email.')
   @Post('email-otp/send')
   @HttpCode(200)
   async sendEmailOtp(@Body() body: SendEmailOtpDto) {
-    const email = body.email.trim().toLowerCase();
-
-    const existing = await this.emailOtps.findOne({ where: { email } });
-    if (existing) {
-      const elapsedSeconds = (Date.now() - existing.last_sent_at.getTime()) / 1000;
-      if (elapsedSeconds < OTP_RESEND_DEBOUNCE_SECONDS) {
-        throw new BadRequestException(
-          `Please wait ${Math.ceil(OTP_RESEND_DEBOUNCE_SECONDS - elapsedSeconds)}s before requesting another code.`,
-        );
-      }
-    }
-
-    const code = generateOtpCode();
-    const now = new Date();
-
-    // Send BEFORE persisting: if SMTP fails, no row (and no resend-debounce
-    // window) should exist for a code the user never actually received —
-    // otherwise a transient send failure would lock them out of retrying
-    // for OTP_RESEND_DEBOUNCE_SECONDS with nothing to show for it. Via SMTP,
-    // not Resend: Resend's shared test sender only delivers to a handful of
-    // Resend-owned addresses until a real domain is verified, which makes
-    // it useless for a code that has to reach an arbitrary inbox right now
-    // — see NotificationsService.sendEmailOtpViaSmtp.
-    //
-    // Explicitly caught rather than left to bubble as a raw 500: SMTP
-    // failures (missing config, Gmail rate-limiting, a transient network
-    // error) are a realistic, foreseeable failure mode for this brand-new
-    // code path, and the caller needs a clear, actionable message — there's
-    // no other way for them to know the code never arrived.
-    try {
-      await this.notifications.sendEmailOtpViaSmtp(email, {
-        code,
-        expiresInMinutes: OTP_EXPIRY_MINUTES,
-      });
-    } catch (err: any) {
-      this.logger.error(`[sendEmailOtp] SMTP send failed for ${email}`, err);
-      throw new InternalServerErrorException(
-        'Could not send the verification code. Please try again in a moment.',
-      );
-    }
-
-    await this.emailOtps.save(
-      this.emailOtps.create({
-        email,
-        code_hash: hashOtpCode(code),
-        expires_at: new Date(now.getTime() + OTP_EXPIRY_MINUTES * 60_000),
-        attempt_count: 0,
-        last_sent_at: now,
-      }),
-    );
-
+    await this.auth.sendEmailOtp(body.email);
     return { success: true };
   }
 
@@ -291,185 +180,94 @@ export class AuthController {
    * can never be reused. Locks out after OTP_MAX_ATTEMPTS wrong guesses,
    * requiring a fresh send.
    */
+  // OTP_MAX_ATTEMPTS (inside AuthService) already caps guesses against one
+  // email/code; this IP-scoped limit caps how many different codes one
+  // caller can attempt across many emails in a burst.
+  @Throttle({ default: { ttl: 60_000, limit: 20 } })
+  @ResponseMessage((r) => (r.isNewUser ? 'Email verified. Finish setting up your profile.' : 'Signed in.'))
   @Post('email-otp/verify')
   @HttpCode(200)
   async verifyEmailOtp(@Body() body: VerifyEmailOtpDto, @Res({ passthrough: true }) res: Response) {
-    const email = body.email.trim().toLowerCase();
+    const result = await this.auth.verifyEmailOtp(body.email, body.code);
 
-    const otp = await this.emailOtps.findOne({ where: { email } });
-    const invalidCode = () => new UnauthorizedException('Invalid or expired code.');
-
-    if (!otp) {
-      throw invalidCode();
-    }
-
-    if (otp.expires_at.getTime() < Date.now()) {
-      await this.emailOtps.delete({ email });
-      throw invalidCode();
-    }
-
-    if (otp.attempt_count >= OTP_MAX_ATTEMPTS) {
-      await this.emailOtps.delete({ email });
-      throw new UnauthorizedException('Too many incorrect attempts. Request a new code.');
-    }
-
-    if (hashOtpCode(body.code) !== otp.code_hash) {
-      await this.emailOtps.update({ email }, { attempt_count: otp.attempt_count + 1 });
-      throw invalidCode();
-    }
-
-    // Consume the code — single use, whether this exchange is a signup or
-    // a login below.
-    await this.emailOtps.delete({ email });
-
-    const existingProfile = await this.profiles.findOne({ where: { email } });
-
-    if (!existingProfile) {
-      // Genuinely new signup: no row exists for this email yet. Same
-      // deferred treatment as session()'s phone-OTP path above — no row,
-      // no session, until ProfileScreen completes. The eventual row's id
-      // is generated at completeSignup() time instead of here, since there
-      // is no longer an insert on this path to race against; see
-      // completeSignup() for how a concurrent duplicate-email race is
-      // handled there instead.
-      const proofToken = this.issueProofToken({ email });
+    if (!('profile' in result)) {
+      // Genuinely new signup — same deferred treatment as session()'s
+      // phone-OTP path: no row, no session, until ProfileScreen completes.
+      const proofToken = this.auth.issueProofToken({ email: result.email });
       return { success: true, isNewUser: true, proofToken };
     }
 
-    // Backward compatibility: a row exists but was never completed (old
-    // pre-fix code path, or a phone-signup account whose email is only now
-    // being verified). Nothing left to defer — issue a session immediately,
-    // same as any other existing-user login.
-    const isNewUser = !existingProfile.full_name;
+    await this.setSessionCookies(
+      res,
+      await this.auth.issueSession({
+        userId: result.profile.id,
+        phone: result.profile.phone ?? undefined,
+      }),
+    );
 
-    await this.issueSession(res, { userId: existingProfile.id, phone: existingProfile.phone ?? undefined });
-
-    return { success: true, isNewUser };
+    return { success: true, isNewUser: result.isNewUser };
   }
 
   /**
    * The atomic "actually create the account" step for a brand-new signup —
    * called by ProfileScreen's submit, not by the OTP-verify screens. Only
    * reachable with a valid, unexpired proof-of-identity token from
-   * session()/verifyEmailOtp() (see issueProofToken/verifyProofToken below);
-   * there is no session cookie yet at this point; the token is what proves
-   * "this phone/email was just OTP-verified" without an account existing.
+   * session()/verifyEmailOtp(). Row creation and session issuance happen
+   * together (inside AuthService.completeSignup + the setSessionCookies
+   * call below), so there is no window where a permanent account row
+   * exists without a completed profile.
    *
-   * Row creation and session issuance happen together, in this one handler,
-   * so there is no window where a permanent account row exists without a
-   * completed profile — the exact gap this whole redesign closes. An
-   * existing/returning user never reaches this endpoint: session() and
-   * verifyEmailOtp() only mint a proofToken for the genuinely-new-row case,
-   * and issue a real session directly for every other case (see both
-   * methods above).
+   * Multipart, not JSON: the picked avatar photo (if any) rides along in
+   * the same request that creates the account, so AuthService can validate
+   * and upload it as part of one atomic completeSignup() call instead of a
+   * separate follow-up request made after the account already exists — see
+   * AuthService.completeSignup's doc comment for why that used to let
+   * signup "succeed" while silently dropping a photo. `languages` arrives
+   * JSON-stringified (multipart has no native array field), same pattern
+   * VerificationController.parseBankDetails already uses for its own
+   * JSON-in-a-multipart-field case.
    */
+  @ResponseMessage('Your account is ready.')
   @Post('complete-signup')
   @HttpCode(200)
-  async completeSignup(@Body() dto: CompleteSignupDto, @Res({ passthrough: true }) res: Response) {
-    const claims = this.verifyProofToken(dto.proofToken);
-
-    let userId: string;
-    let phone: string | undefined;
-    let firebaseUid: string | undefined;
-
-    if (claims.firebaseUid) {
-      // Phone-OTP signup — id is deterministic from the Firebase uid, same
-      // derivation session() uses, so this always lands on the same row a
-      // second completion attempt (or a stale duplicate token) would.
-      phone = claims.phone;
-      firebaseUid = claims.firebaseUid;
-      userId = firebaseUidToSupabaseUuid(claims.firebaseUid);
-
-      const alreadyExists = await this.profiles.findOne({ where: { id: userId } });
-      if (alreadyExists) {
-        // Token was replayed, or a second tab finished ProfileScreen first.
-        // Nothing to insert — fall through and just (re-)issue a session,
-        // same effect as a normal login, rather than erroring. Still subject
-        // to the same email-uniqueness check as the insert branch below: a
-        // stale replay that now names someone else's email must not silently
-        // steal it either.
-        try {
-          await this.profiles.update(userId, {
-            full_name: dto.name,
-            email: dto.email,
-            languages: dto.languages,
-            isHost: dto.isHost ?? false,
-            avatar_url: dto.avatar_url,
-          });
-        } catch (err: any) {
-          if (err?.code === '23505') {
-            throw new ConflictException('An account with this email already exists.');
-          }
-          throw err;
-        }
-      } else {
-        // `email` is unique-constrained independently of `id` — a brand-new
-        // phone signup can still collide if the email entered on
-        // ProfileScreen already belongs to a different existing account
-        // (e.g. one made via email-OTP, or another phone account that
-        // already claimed it). This is a real, user-facing conflict, not a
-        // race — surface it clearly instead of letting the raw 23505 bubble
-        // up as an opaque 500.
-        try {
-          await this.profiles.insert({
-            id: userId,
-            phone,
-            full_name: dto.name,
-            email: dto.email,
-            languages: dto.languages,
-            isHost: dto.isHost ?? false,
-            avatar_url: dto.avatar_url,
-            created_at: new Date(),
-          });
-        } catch (err: any) {
-          if (err?.code === '23505') {
-            throw new ConflictException('An account with this email already exists.');
-          }
-          throw err;
-        }
-      }
-    } else if (claims.email) {
-      // Email-OTP signup — no deterministic id scheme (unlike phone), so
-      // generate one now. Same 23505 race-safe retry pattern the old
-      // verifyEmailOtp() used for its insert, kept here since the insert
-      // moved but the race it guards against did not.
-      const email = claims.email;
-      const id = crypto.randomUUID();
-      try {
-        await this.profiles.insert({
-          id,
-          email,
-          full_name: dto.name,
-          languages: dto.languages,
-          isHost: dto.isHost ?? false,
-          avatar_url: dto.avatar_url,
-          created_at: new Date(),
-        });
-        userId = id;
-      } catch (err: any) {
-        if (err?.code !== '23505') throw err;
-        // Two completions for the same brand-new email raced. The DB
-        // unique constraint is the real guard; fall back to the row that
-        // won and update it with this submission's fields.
-        const winner = await this.profiles.findOne({ where: { email } });
-        if (!winner) throw err;
-        userId = winner.id;
-        await this.profiles.update(userId, {
-          full_name: dto.name,
-          languages: dto.languages,
-          isHost: dto.isHost ?? false,
-          avatar_url: dto.avatar_url,
-        });
-      }
-    } else {
-      // Should be unreachable — verifyProofToken already requires at least
-      // one of phone/firebaseUid or email on every token this app mints.
-      throw new UnauthorizedException('Invalid verification token');
+  @UseInterceptors(FileInterceptor('avatar', { limits: { fileSize: AVATAR_MAX_BYTES } }))
+  async completeSignup(
+    @Body('name') name: string,
+    @Body('email') email: string,
+    @Body('languages') languagesJson: string,
+    @Body('isHost') isHostRaw: string | undefined,
+    @Body('proofToken') proofToken: string,
+    @UploadedFile() file: UploadedMulterFile | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    let languages: unknown;
+    try {
+      languages = JSON.parse(languagesJson ?? '[]');
+    } catch {
+      throw new BadRequestException('languages must be valid JSON.');
     }
 
-    await this.issueSession(res, { userId, phone, firebaseUid });
+    const dto = plainToInstance(CompleteSignupDto, {
+      name,
+      email,
+      languages,
+      isHost: isHostRaw === 'true',
+      proofToken,
+    });
+    const errors = await validate(dto, { whitelist: true });
+    if (errors.length > 0) {
+      const message = errors.flatMap((e) => Object.values(e.constraints ?? {})).join(' ');
+      throw new BadRequestException(message || 'Invalid request.');
+    }
 
-    return { success: true };
+    const avatarFile: AvatarUploadFile | undefined =
+      file?.buffer && file.buffer.length > 0
+        ? { buffer: file.buffer, mimetype: file.mimetype, size: file.size }
+        : undefined;
+
+    const { userId, phone, firebaseUid, avatar_url } = await this.auth.completeSignup(dto, avatarFile);
+    await this.setSessionCookies(res, await this.auth.issueSession({ userId, phone, firebaseUid }));
+    return { success: true, avatar_url };
   }
 
   /**
@@ -478,6 +276,7 @@ export class AuthController {
    * phone-OTP/password again. Called by the frontend when a request comes
    * back 401 with an expired session — see web/lib/auth-fetch.ts.
    */
+  @ResponseMessage('Session refreshed.')
   @Post('refresh')
   @HttpCode(200)
   async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
@@ -503,24 +302,21 @@ export class AuthController {
       throw new UnauthorizedException('No session to refresh');
     }
 
-    const profile = await this.profiles.findOne({ where: { id: userId } });
-    const tokenHash = hashRefreshToken(rawRefreshToken);
-    const notExpired =
-      profile?.refresh_token_expires_at && profile.refresh_token_expires_at.getTime() > Date.now();
+    const profile = await this.auth.verifyRefreshToken(userId, rawRefreshToken);
 
-    if (!profile || profile.refresh_token_hash !== tokenHash || !notExpired) {
-      throw new UnauthorizedException('Invalid or expired refresh token');
-    }
-
-    await this.issueSession(res, {
-      userId: profile.id,
-      phone: profile.phone ?? undefined,
-      firebaseUid: claims?.firebase_uid,
-    });
+    await this.setSessionCookies(
+      res,
+      await this.auth.issueSession({
+        userId: profile.id,
+        phone: profile.phone ?? undefined,
+        firebaseUid: claims?.firebase_uid,
+      }),
+    );
 
     return { success: true };
   }
 
+  @ResponseMessage('Signed out.')
   @Post('logout')
   @HttpCode(200)
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
@@ -533,9 +329,7 @@ export class AuthController {
     }
     const userId = accessToken ? (jwt.decode(accessToken) as jwt.JwtPayload | null)?.sub : undefined;
     if (userId) {
-      // Revoke server-side so a stolen refresh-token cookie can't renew
-      // sessions after logout.
-      await this.profiles.update(userId, { refresh_token_hash: null, refresh_token_expires_at: null });
+      await this.auth.revokeRefreshToken(userId);
     }
 
     res.clearCookie(SESSION_COOKIE, { path: '/' });
@@ -545,53 +339,26 @@ export class AuthController {
     return { success: true };
   }
 
-  /** Shared by both login methods — every session this app issues has the
-   *  same JWT shape and the same 3 cookies, regardless of how the caller
-   *  authenticated. `role: 'authenticated'` here is the JWT's own claim
-   *  (PostgREST-style), unrelated to profiles.role which is what
-   *  AdminGuard actually checks. */
-  private async issueSession(
-    res: Response,
-    opts: { userId: string; phone?: string; firebaseUid?: string },
-  ): Promise<void> {
-    const deviceId = crypto.randomUUID();
-
-    const supabaseToken = jwt.sign(
-      {
-        aud: 'authenticated',
-        exp: Math.floor(Date.now() / 1000) + WEEK_SECONDS,
-        sub: opts.userId,
-        phone: opts.phone,
-        role: 'authenticated',
-        device_id: deviceId,
-        ...(opts.firebaseUid ? { firebase_uid: opts.firebaseUid } : {}),
-      },
-      this.config.get<string>('SUPABASE_JWT_SECRET')!,
-    );
-
-    const rawRefreshToken = crypto.randomBytes(32).toString('hex');
-    await this.profiles.update(opts.userId, {
-      refresh_token_hash: hashRefreshToken(rawRefreshToken),
-      refresh_token_expires_at: new Date(Date.now() + REFRESH_TOKEN_SECONDS * 1000),
-    });
-
+  /** Shared by every path above that issues a session — the same 4 cookies,
+   *  the same shape, regardless of how the caller authenticated. */
+  private async setSessionCookies(res: Response, tokens: SessionTokens): Promise<void> {
     const isProd = process.env.NODE_ENV === 'production';
 
-    res.cookie(SESSION_COOKIE, JSON.stringify({ access_token: supabaseToken, refresh_token: '' }), {
+    res.cookie(SESSION_COOKIE, JSON.stringify({ access_token: tokens.accessToken, refresh_token: '' }), {
       httpOnly: true,
       secure: isProd,
       sameSite: 'lax',
       maxAge: WEEK_SECONDS * 1000,
       path: '/',
     });
-    res.cookie(REFRESH_COOKIE, rawRefreshToken, {
+    res.cookie(REFRESH_COOKIE, tokens.refreshToken, {
       httpOnly: true,
       secure: isProd,
       sameSite: 'lax',
       maxAge: REFRESH_TOKEN_SECONDS * 1000,
       path: '/',
     });
-    res.cookie('device_id', deviceId, {
+    res.cookie('device_id', tokens.deviceId, {
       httpOnly: true,
       secure: isProd,
       sameSite: 'lax',
@@ -605,54 +372,5 @@ export class AuthController {
       maxAge: WEEK_SECONDS * 1000,
       path: '/',
     });
-  }
-
-  /**
-   * Mints the short-lived proof-of-identity token returned by session()/
-   * verifyEmailOtp() for a brand-new signup instead of a session — signed
-   * with the same SUPABASE_JWT_SECRET/jsonwebtoken issueSession() uses, but
-   * deliberately NOT shaped like a session token: no `sub` claim (AuthGuard
-   * requires one and would reject this immediately even without the
-   * purpose check below) and a `purpose` claim issueSession() never sets,
-   * so this token can never be confused with, or accepted as, a real
-   * session by AuthGuard or anything gated by it.
-   */
-  private issueProofToken(opts: { phone?: string; email?: string; firebaseUid?: string }): string {
-    const claims: ProfileCompletionClaims = {
-      purpose: PROFILE_COMPLETION_TOKEN_PURPOSE,
-      phone: opts.phone,
-      email: opts.email,
-      firebaseUid: opts.firebaseUid,
-    };
-    return jwt.sign(claims, this.config.get<string>('SUPABASE_JWT_SECRET')!, {
-      expiresIn: `${PROFILE_COMPLETION_TOKEN_MINUTES}m`,
-    });
-  }
-
-  /**
-   * Verifies a proof-of-identity token passed to completeSignup(). Checked
-   * against the same secret issueProofToken() signs with; jwt.verify()
-   * already rejects an expired or tampered token (thrown as
-   * TokenExpiredError/JsonWebTokenError), and the explicit `purpose` check
-   * below rejects any other token this app issues (e.g. a real session
-   * token, or a refresh token) even though those would never carry this
-   * claim in the first place.
-   */
-  private verifyProofToken(token: string): ProfileCompletionClaims {
-    const invalid = () =>
-      new UnauthorizedException('Your verification expired. Please start over.');
-
-    let decoded: jwt.JwtPayload;
-    try {
-      decoded = jwt.verify(token, this.config.get<string>('SUPABASE_JWT_SECRET')!) as jwt.JwtPayload;
-    } catch {
-      throw invalid();
-    }
-
-    if (decoded.purpose !== PROFILE_COMPLETION_TOKEN_PURPOSE || (!decoded.phone && !decoded.email)) {
-      throw invalid();
-    }
-
-    return decoded as ProfileCompletionClaims;
   }
 }

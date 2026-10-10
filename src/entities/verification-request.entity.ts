@@ -1,7 +1,7 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
-// One row per verification submission, across all four verification
-// types (identity / pan / bank / legal) via the `verification_type`
+// One row per verification submission, across all verification
+// types (identity / pan / bank / selfie) via the `verification_type`
 // discriminator — see migrations/20260913_verification_requests.sql for
 // the full rationale. A row only exists once a user has submitted
 // something: there is no "not_started" status — that state is the
@@ -18,10 +18,10 @@ export class VerificationRequestEntity {
   user_id: string;
 
   @Column()
-  verification_type: string; // identity | pan | bank | legal
+  verification_type: string; // identity | pan | bank | selfie
 
   @Column({ type: 'text', nullable: true })
-  document_subtype: string | null; // identity only: aadhaar | passport | driving_licence
+  document_subtype: string | null; // identity only: 'aadhaar'
 
   @Column({ default: 'pending' })
   status: string; // pending | verified | rejected
@@ -31,6 +31,11 @@ export class VerificationRequestEntity {
   // submission may carry only account details, no document.
   @Column({ type: 'text', nullable: true })
   document_path: string | null;
+
+  // Back side of the Aadhaar card. Same storage-path shape as document_path.
+  // Null for every non-identity row.
+  @Column({ type: 'text', nullable: true })
+  document_path_back: string | null;
 
   // Bank-specific fields, only populated when verification_type = 'bank'.
   // UPI/account-holder-name identity checks stay on profiles
@@ -47,13 +52,6 @@ export class VerificationRequestEntity {
 
   @Column({ type: 'text', nullable: true })
   bank_name: string | null;
-
-  // Legal-specific field, only populated when verification_type = 'legal'.
-  // HP Tourism registration number (format HP/HS/1234/2025); the
-  // certificate itself is the row's document_path, same as every other
-  // document-based verification type.
-  @Column({ type: 'text', nullable: true })
-  registration_number: string | null;
 
   // Output of DocumentAnalysisService — structural/quality signals only,
   // never extracted sensitive field values (no PAN/aadhaar/account

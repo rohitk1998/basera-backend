@@ -1,6 +1,10 @@
 import { Module } from '@nestjs/common';
+import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
+import { ApiExceptionFilter } from './common/filters/api-exception.filter';
+import { ResponseMessageInterceptor } from './common/interceptors/response-message.interceptor';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { validateEnv } from './config/env.validation';
 import * as entities from './entities';
@@ -8,20 +12,25 @@ import { AuthModule } from './auth/auth.module';
 import { ListingsModule } from './listings/listings.module';
 import { BookingsModule } from './bookings/bookings.module';
 import { PaymentsModule } from './payments/payments.module';
-import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 import { AdminModule } from './admin/admin.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { StorageModule } from './storage/storage.module';
 import { UserModule } from './user/user.module';
-import { MocksModule } from './mocks/mocks.module';
 import { ConversationsModule } from './conversations/conversations.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { VerificationModule } from './verification/verification.module';
+import { AttractionsModule } from './attractions/attractions.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
     ScheduleModule.forRoot(),
+    // Global default: 60 requests/minute per IP. Applied to every route via
+    // the APP_GUARD below; individual auth endpoints (admin login, OTP
+    // send/verify) layer a much stricter @Throttle() on top — see
+    // auth.controller.ts. There was no rate limiting anywhere before this,
+    // so OTP/admin-login had no brute-force protection at all.
+    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 60 }]),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -63,6 +72,10 @@ import { VerificationModule } from './verification/verification.module';
           max: config.get<number>('DB_POOL_MAX') ?? 10,
           idleTimeoutMillis: 30_000,
           connectionTimeoutMillis: 8_000,
+          // Notice a pooler that has dropped an idle connection instead of
+          // handing the dead socket to the next request.
+          keepAlive: true,
+          keepAliveInitialDelayMillis: 10_000,
         },
       }),
     }),
@@ -70,15 +83,20 @@ import { VerificationModule } from './verification/verification.module';
     ListingsModule,
     BookingsModule,
     PaymentsModule,
-    SubscriptionsModule,
     AdminModule,
     NotificationsModule,
     StorageModule,
     UserModule,
-    MocksModule,
     ConversationsModule,
     ReviewsModule,
     VerificationModule,
+    AttractionsModule,
+  ],
+  providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    // Every success carries a message and every failure a readable one.
+    { provide: APP_INTERCEPTOR, useClass: ResponseMessageInterceptor },
+    { provide: APP_FILTER, useClass: ApiExceptionFilter },
   ],
 })
 export class AppModule { }

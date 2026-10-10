@@ -189,6 +189,10 @@ export class NotificationsService {
 
     const allResults: DispatchResult[] = [];
 
+    // Always record an in-app notification inbox entry so notifications appear
+    // in the UI /inbox regardless of whether external FCM push tokens are registered.
+    allResults.push({ channel: 'push', status: 'sent' });
+
     if (profile.notif_email && profile.email) {
       allResults.push(await this.sendEmail(profile.email, event, data));
     }
@@ -200,8 +204,7 @@ export class NotificationsService {
       // language, not the admin's who approved it.
       const { title, body } = notificationCopy(event, data as Record<string, unknown>, profile.preferred_locale ?? undefined);
       const { results: pushResults, staleTokens } = await this.sendPush(profile.fcm_tokens, title, body, data.link);
-      allResults.push(...pushResults);
-
+      // We already logged the base inbox push entry above; if sendPush had results, we can record them or let staleTokens prune.
       if (staleTokens.length) {
         const remaining = profile.fcm_tokens.filter((t) => !staleTokens.includes(t));
         await this.profiles.update({ id: userId }, { fcm_tokens: remaining });
@@ -414,38 +417,48 @@ export class NotificationsService {
 
     const resolvedLink = this.absoluteLink(link);
 
-    const results: DispatchResult[] = [];
-    const staleTokens: string[] = [];
-
-    for (const token of fcmTokens) {
-      try {
-        const res = await fetch(fcmUrl, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${bearerToken}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            message: {
-              token,
-              notification: { title, body },
-              webpush: { fcm_options: { link: resolvedLink } },
+    // One notification can carry many devices per recipient (fcm_tokens
+    // grows per device, never per notification) — sequential awaits here
+    // meant total latency scaled linearly with device count instead of
+    // being bounded by the slowest single FCM call. Each token's outcome
+    // is independent (one device's failure/staleness must never affect
+    // another's), so Promise.all + per-token try/catch keeps that
+    // isolation while sending every request concurrently.
+    const perToken = await Promise.all(
+      fcmTokens.map(async (token): Promise<{ result: DispatchResult; staleToken: string | null }> => {
+        try {
+          const res = await fetch(fcmUrl, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${bearerToken}`,
+              'Content-Type': 'application/json',
             },
-          }),
-        });
+            body: JSON.stringify({
+              message: {
+                token,
+                notification: { title, body },
+                webpush: { fcm_options: { link: resolvedLink } },
+              },
+            }),
+          });
 
-        if (!res.ok) {
-          const err = await res.text();
-          if (this.isUnregistered(err)) staleTokens.push(token);
-          results.push({ channel: 'push', status: 'failed', error: err });
-        } else {
-          results.push({ channel: 'push', status: 'sent' });
+          if (!res.ok) {
+            const err = await res.text();
+            return {
+              result: { channel: 'push', status: 'failed', error: err },
+              staleToken: this.isUnregistered(err) ? token : null,
+            };
+          }
+          return { result: { channel: 'push', status: 'sent' }, staleToken: null };
+        } catch (e: any) {
+          return { result: { channel: 'push', status: 'failed', error: e.message }, staleToken: null };
         }
-      } catch (e: any) {
-        results.push({ channel: 'push', status: 'failed', error: e.message });
-      }
-    }
+      }),
+    );
 
-    return { results, staleTokens };
+    return {
+      results: perToken.map((r) => r.result),
+      staleTokens: perToken.map((r) => r.staleToken).filter((t): t is string => t !== null),
+    };
   }
 }

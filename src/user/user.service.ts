@@ -5,10 +5,11 @@ import {
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  PayloadTooLargeException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { UserEntity } from '../entities';
+import { UserEntity, VerificationRequestEntity } from '../entities';
 import { SupabaseProvider } from '../auth/supabase.provider';
 import { ProfilePayloadDto } from './dto/profile-payload.dto';
 
@@ -44,6 +45,8 @@ export class UserService {
   constructor(
     @InjectRepository(UserEntity)
     private readonly profiles: Repository<UserEntity>,
+    @InjectRepository(VerificationRequestEntity)
+    private readonly verificationRequests: Repository<VerificationRequestEntity>,
     private readonly supabase: SupabaseProvider,
   ) {}
 
@@ -52,6 +55,15 @@ export class UserService {
     if (!profile) {
       throw new NotFoundException('Profile not found');
     }
+
+    // Identity approval lives in verification_requests (newest identity row
+    // wins), not on `users`. Returned with the profile so every client reads
+    // the same answer instead of each one re-deriving — or losing — it.
+    const latestIdentity = await this.verificationRequests.findOne({
+      where: { user_id: userId, verification_type: 'identity' },
+      order: { submitted_at: 'DESC' },
+      select: { id: true, status: true },
+    });
 
     return {
       success: true,
@@ -68,13 +80,12 @@ export class UserService {
         host_kind: profile.host_kind ?? null,
         pan: profile.pan || '',
         gst: profile.gst || '',
-        registration_number: profile.registration_number || '',
-        kyc_completed_at: profile.kyc_completed_at ?? null,
         selfie_url: profile.selfie_url || '',
         selfie_uploaded_at: profile.selfie_uploaded_at ?? null,
         bank_upi: profile.bank_upi || '',
         bank_account_name: profile.bank_account_name || '',
         bank_verified_at: profile.bank_verified_at ?? null,
+        identity_verified: latestIdentity?.status === 'verified',
       },
       editUnlocksAt: profile.created_at ? editUnlocksAt(profile.created_at).toISOString() : null,
     };
@@ -163,17 +174,17 @@ export class UserService {
     return { success: true, isHost };
   }
 
-  async uploadAvatar(userId: string, file: { buffer: Buffer; mimetype: string; size: number }) {
+  /** Size/type checks only — no I/O. Split out from uploadAvatarToStorage so
+   *  a caller (e.g. AuthService.completeSignup) can validate a picked file
+   *  BEFORE committing to anything that needs rolling back on failure —
+   *  these checks alone are what "too large"/unsupported
+   *  type actually come from, and none of them require a userId or a
+   *  storage call to evaluate. */
+  validateAvatarFile(file: { size: number; mimetype: string } | null | undefined): void {
     const ALLOWED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
-    const EXT_MAP: Record<string, string> = {
-      'image/jpeg': 'jpg',
-      'image/png': 'png',
-      'image/webp': 'webp',
-      'image/gif': 'gif',
-    };
-    // 5 MB hard cap and 1 MB minimum — enforced server-side. The client
-    // check is a UX convenience only; the server is the gate.
-    const MIN_BYTES = 1 * 1024 * 1024;
+    // 5 MB hard cap, enforced server-side (the client check is a UX
+    // convenience only; the server is the gate). There is deliberately no
+    // minimum: phone crops and small avatars are normal.
     const MAX_BYTES = 5 * 1024 * 1024;
 
     if (!file || file.size === 0) {
@@ -182,13 +193,23 @@ export class UserService {
     if (!ALLOWED_TYPES.has(file.mimetype)) {
       throw new BadRequestException('Unsupported file type. Use JPEG, PNG, WebP or GIF.');
     }
-    if (file.size < MIN_BYTES) {
-      throw new BadRequestException('File too small. Minimum size is 1 MB.');
-    }
     if (file.size > MAX_BYTES) {
-      throw new BadRequestException({ error: 'File too large. Maximum size is 5 MB.', statusCode: 413 });
+      throw new PayloadTooLargeException('File too large. Maximum size is 5 MB.');
     }
+  }
 
+  /** Uploads an already-validated file to storage and returns its public
+   *  URL — no DB write. Split out so completeSignup() can upload using a
+   *  userId that only exists once the account row itself is created,
+   *  without this method also trying to update a profiles row (which
+   *  completeSignup's own insert already sets avatar_url on directly). */
+  async uploadAvatarToStorage(userId: string, file: { buffer: Buffer; mimetype: string }): Promise<string> {
+    const EXT_MAP: Record<string, string> = {
+      'image/jpeg': 'jpg',
+      'image/png': 'png',
+      'image/webp': 'webp',
+      'image/gif': 'gif',
+    };
     const ext = EXT_MAP[file.mimetype];
     const storagePath = `${userId}_avatar.${ext}`;
 
@@ -208,6 +229,13 @@ export class UserService {
     const {
       data: { publicUrl },
     } = this.supabase.client.storage.from('avatars').getPublicUrl(storagePath);
+
+    return publicUrl;
+  }
+
+  async uploadAvatar(userId: string, file: { buffer: Buffer; mimetype: string; size: number }) {
+    this.validateAvatarFile(file);
+    const publicUrl = await this.uploadAvatarToStorage(userId, file);
 
     try {
       await this.profiles.update({ id: userId }, { avatar_url: publicUrl });

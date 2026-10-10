@@ -6,6 +6,7 @@ import { isSupportedLocale } from '../common/supported-locales';
 import { NotificationsService } from './notifications.service';
 import { MarkReadDto } from './dto/mark-read.dto';
 import { ListNotificationsQueryDto } from './dto/list-notifications-query.dto';
+import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
 /**
  * The caller's own notification history — what /notifications reads.
@@ -30,6 +31,7 @@ export class NotificationsController {
     return { success: true, notifications, nextCursor };
   }
 
+  @ResponseMessage('Notifications marked as read.')
   @Post('mark-read')
   async markRead(@CurrentUser() user: AuthUser, @Body() dto: MarkReadDto) {
     await this.notifications.markRead(user.userId, dto);
