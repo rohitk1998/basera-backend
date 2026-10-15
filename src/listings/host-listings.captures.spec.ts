@@ -103,7 +103,7 @@ describe('HostListingsService: camera-captured media at submit', () => {
         bank_verified_at: new Date(),
       }),
     };
-    const verification = { getMyStatus: async () => ({ identity: { status: 'verified' }, pan: { status: 'verified' } }) };
+    const verification = { getMyStatus: async () => ({ identity: { status: 'verified' }, pan: { status: 'verified' }, bank: { status: 'verified' } }) };
     const dataSource = { transaction: async (fn: any) => fn({ getRepository: () => listings }) };
     service = new HostListingsService(listings as any, profiles as any, {} as any, redisSvc as any, verification as any, dataSource as any);
   });
@@ -261,6 +261,19 @@ describe('HostListingsService: camera-captured media at submit', () => {
     const saved = rows['L1'].draft_data.property_details;
     expect(saved.title).toBeUndefined();
     expect(saved.photos).toEqual([]);
+  });
+
+  it('keeps the wizard place in the draft, ignores a malformed one, and drops it on submit', async () => {
+    listing({ ...capturedDraft(), property_details: { ...PIN, photos: photoList(1, 2, 3, 4, 5) } }, 'draft');
+    const wizard = { currentStep: 'amen', visitedSteps: ['basics', 'size', 'amen'], updatedAt: '2026-10-15T00:00:00.000Z' };
+    await service.saveDraft('u1', { title: 'Half done', wizard }, 'L1');
+    expect(rows['L1'].draft_data.wizard).toEqual(wizard);
+    expect(rows['L1'].draft_data.property_details.wizard).toBeUndefined();
+    await service.saveDraft('u1', { title: 'Half done', wizard: { currentStep: '../x' } }, 'L1');
+    expect(rows['L1'].draft_data.wizard).toEqual(wizard);
+    expect((await service.findLatestDraft('u1', 'L1')).listing?.wizard).toEqual(wizard);
+    await service.resubmit('u1', 'L1', body());
+    expect(rows['L1'].draft_data.wizard).toBeUndefined();
   });
 
   describe('save-draft', () => {

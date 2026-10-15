@@ -28,14 +28,14 @@ describe('AuthService', () => {
   let profiles: ReturnType<typeof mockRepo<UserEntity>>;
   let emailOtps: ReturnType<typeof mockRepo<EmailOtpEntity>>;
   let firebase: { auth: { verifyIdToken: jest.Mock } };
-  let notifications: { sendEmailOtpViaSmtp: jest.Mock };
+  let notifications: { sendEmailOtpViaSmtp: jest.Mock; notify: jest.Mock };
   let userService: { validateAvatarFile: jest.Mock; uploadAvatarToStorage: jest.Mock };
 
   beforeEach(async () => {
     profiles = mockRepo<UserEntity>();
     emailOtps = mockRepo<EmailOtpEntity>();
     firebase = { auth: { verifyIdToken: jest.fn() } };
-    notifications = { sendEmailOtpViaSmtp: jest.fn() };
+    notifications = { sendEmailOtpViaSmtp: jest.fn(), notify: jest.fn() };
     userService = {
       validateAvatarFile: jest.fn(),
       uploadAvatarToStorage: jest.fn().mockResolvedValue('https://cdn.example/avatar.jpg'),
@@ -141,6 +141,28 @@ describe('AuthService', () => {
         expect.objectContaining({ code: expect.any(String) }),
       );
       expect(emailOtps.save).toHaveBeenCalled();
+    });
+
+    it('uses the signup purpose for an email with no completed account', async () => {
+      emailOtps.findOne.mockResolvedValue(null);
+      profiles.findOne.mockResolvedValue(null);
+      notifications.sendEmailOtpViaSmtp.mockResolvedValue(undefined);
+      await service.sendEmailOtp('new@example.com');
+      expect(notifications.sendEmailOtpViaSmtp).toHaveBeenCalledWith(
+        'new@example.com',
+        expect.objectContaining({ purpose: 'signup', expiresInMinutes: 10 }),
+      );
+    });
+
+    it('uses the login purpose for an existing, completed account', async () => {
+      emailOtps.findOne.mockResolvedValue(null);
+      profiles.findOne.mockResolvedValue({ id: 'u1', full_name: 'Jane' });
+      notifications.sendEmailOtpViaSmtp.mockResolvedValue(undefined);
+      await service.sendEmailOtp('jane@example.com');
+      expect(notifications.sendEmailOtpViaSmtp).toHaveBeenCalledWith(
+        'jane@example.com',
+        expect.objectContaining({ purpose: 'login' }),
+      );
     });
 
     it('rejects a resend within the debounce window', async () => {
@@ -329,6 +351,50 @@ describe('AuthService', () => {
       );
     });
 
+    describe('welcome notification (user.welcome)', () => {
+      const dto = (token: string) =>
+        ({ proofToken: token, name: 'Jane', email: 'jane@example.com', languages: ['en'], isHost: true }) as any;
+
+      it('fires once for a brand-new account, with name, host flag and link', async () => {
+        profiles.insert.mockResolvedValue({});
+        const result = await service.completeSignup(dto(proofToken({ email: 'jane@example.com' })));
+        expect(notifications.notify).toHaveBeenCalledTimes(1);
+        expect(notifications.notify).toHaveBeenCalledWith('user.welcome', result.userId, {
+          userName: 'Jane',
+          isHost: true,
+          link: '/host/start',
+        });
+      });
+
+      it('does not fire again for a replayed token on an already-completed phone account', async () => {
+        profiles.findOne.mockResolvedValue({ id: 'x', full_name: 'Jane' });
+        profiles.update.mockResolvedValue({});
+        await service.completeSignup(dto(proofToken({ phone: '+91123', firebaseUid: 'uid-1' })));
+        expect(notifications.notify).not.toHaveBeenCalled();
+      });
+
+      it('does not fire for the loser of a concurrent signup race', async () => {
+        profiles.insert.mockRejectedValue({ code: '23505' });
+        profiles.findOne.mockResolvedValue({ id: 'winner-id' });
+        profiles.update.mockResolvedValue({});
+        await service.completeSignup(dto(proofToken({ email: 'jane@example.com' })));
+        expect(notifications.notify).not.toHaveBeenCalled();
+      });
+
+      it('does not fire when the avatar upload fails and the row is rolled back', async () => {
+        profiles.insert.mockResolvedValue({});
+        userService.uploadAvatarToStorage.mockRejectedValue(new Error('boom'));
+        await expect(
+          service.completeSignup(dto(proofToken({ email: 'jane@example.com' })), {
+            buffer: Buffer.from('x'),
+            mimetype: 'image/jpeg',
+            size: 1,
+          }),
+        ).rejects.toThrow('boom');
+        expect(notifications.notify).not.toHaveBeenCalled();
+      });
+    });
+
     it('falls back to the winning row on a concurrent email-OTP signup race', async () => {
       const token = proofToken({ email: 'jane@example.com' });
       profiles.insert.mockRejectedValue({ code: '23505' });
@@ -447,6 +513,65 @@ describe('AuthService', () => {
 
       const result = await service.verifyRefreshToken('user-1', rawRefreshToken);
       expect(result).toEqual(expect.objectContaining({ id: 'user-1' }));
+    });
+  });
+
+  describe('rotateSession', () => {
+    const raw = 'raw-refresh-token';
+    const hash = require('node:crypto').createHash('sha256').update(raw).digest('hex');
+    const liveProfile = () => ({
+      id: 'user-1',
+      phone: '+91123',
+      refresh_token_hash: hash,
+      refresh_token_expires_at: new Date(Date.now() + 60_000),
+    });
+
+    afterEach(() => jest.useRealTimers());
+
+    it('hands two near-simultaneous requests with the same token the same new tokens', async () => {
+      profiles.findOne.mockResolvedValue(liveProfile());
+
+      const [a, b] = await Promise.all([service.rotateSession('user-1', raw), service.rotateSession('user-1', raw)]);
+
+      expect(b).toBe(a);
+      expect(profiles.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('still honours the old token just after the winner rotated it', async () => {
+      profiles.findOne.mockResolvedValue(liveProfile());
+      const first = await service.rotateSession('user-1', raw);
+      // The DB now holds the rotated hash, so the old token no longer matches.
+      profiles.findOne.mockResolvedValue({ ...liveProfile(), refresh_token_hash: 'rotated' });
+
+      await expect(service.rotateSession('user-1', raw)).resolves.toBe(first);
+    });
+
+    it('rejects a reused token once the grace window has passed', async () => {
+      jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+      profiles.findOne.mockResolvedValue(liveProfile());
+      await service.rotateSession('user-1', raw);
+      profiles.findOne.mockResolvedValue({ ...liveProfile(), refresh_token_hash: 'rotated' });
+      jest.setSystemTime(Date.now() + 16_000);
+
+      await expect(service.rotateSession('user-1', raw)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('does not extend the grace to a different user id', async () => {
+      profiles.findOne.mockResolvedValue(liveProfile());
+      await service.rotateSession('user-1', raw);
+      profiles.findOne.mockResolvedValue({ ...liveProfile(), id: 'user-2', refresh_token_hash: 'rotated' });
+
+      await expect(service.rotateSession('user-2', raw)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('does not cache a rejection', async () => {
+      profiles.findOne.mockResolvedValue({ ...liveProfile(), refresh_token_hash: 'other' });
+      await expect(service.rotateSession('user-1', raw)).rejects.toThrow(UnauthorizedException);
+
+      profiles.findOne.mockResolvedValue(liveProfile());
+      await expect(service.rotateSession('user-1', raw)).resolves.toEqual(
+        expect.objectContaining({ refreshToken: expect.any(String) }),
+      );
     });
   });
 

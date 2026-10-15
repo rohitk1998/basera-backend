@@ -44,6 +44,7 @@ const envSchema = z.object({
   SMTP_PORT: z.string().optional(),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().optional(),
 
   UNSPLASH_ACCESS_KEY: z.string().optional(),
 
@@ -97,6 +98,10 @@ const envSchema = z.object({
   // are still required). Refuses to boot when NODE_ENV=production.
   CAPTURE_LOCATION_BYPASS: envBoolean,
 
+  // TEST ONLY. Lets a guest or host check out before the move-out date and the
+  // listing's checkout time. Refuses to boot when NODE_ENV=production.
+  CHECKOUT_DATE_BYPASS: envBoolean,
+
   PLATFORM_COMMISSION_PERCENTAGE: z.coerce
     .number()
     .default(6)
@@ -111,6 +116,9 @@ export function validateEnv(config: Record<string, unknown>): Env {
   const env = envSchema.parse(config);
   if (env.CAPTURE_LOCATION_BYPASS && config.NODE_ENV === 'production') {
     throw new Error('CAPTURE_LOCATION_BYPASS must never be enabled in production');
+  }
+  if (env.CHECKOUT_DATE_BYPASS && config.NODE_ENV === 'production') {
+    throw new Error('CHECKOUT_DATE_BYPASS must never be enabled in production');
   }
   return env;
 }

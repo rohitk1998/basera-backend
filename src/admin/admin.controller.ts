@@ -73,8 +73,8 @@ export class AdminController {
   }
 
   @Get('disputes/:bookingId')
-  getDisputeCase(@Param('bookingId') bookingId: string, @CurrentUser() admin: AuthUser) {
-    return this.adminService.getDisputeCase(bookingId, admin.userId);
+  getDisputeCase(@Param('bookingId') bookingId: string) {
+    return this.adminService.getDisputeCase(bookingId);
   }
 
   // Money-moving: validated the same way bookings' own dispute-offer

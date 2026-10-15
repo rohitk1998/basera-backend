@@ -32,6 +32,11 @@ export class ReviewsService {
       throw new ForbiddenException('You are not a party to this booking');
     }
 
+    const content = dto.content.trim();
+    if (!content) {
+      throw new BadRequestException('Please write a short comment');
+    }
+
     const isGuest = booking.guest_id === userId;
     const targetUserId = isGuest ? booking.host_id : booking.guest_id;
     const role = isGuest ? 'guest_reviewing_host' : 'host_reviewing_guest';
@@ -52,7 +57,7 @@ export class ReviewsService {
         listing_id: isGuest ? booking.listing_id : null,
         role,
         rating: dto.rating,
-        content: dto.content,
+        content,
       });
     } catch (err: any) {
       // Race: a double-submit (slow network, impatient double-tap) or a

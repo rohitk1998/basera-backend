@@ -1,4 +1,5 @@
 import { Controller, Get, Param, Query, Req } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import type { Request } from 'express';
@@ -25,7 +26,7 @@ export class ListingsController {
    * The one listing list/search/filter endpoint. All params optional and
    * AND-combined: `q` (free text over place, district, tehsil, property name;
    * `town`/`location` are old aliases), `district` (must be an HP district),
-   * `tehsil`, `category`, `guests`, `date`, `dateEnd`, `sort=trust`, `locale`,
+   * `tehsil`, `category`, `guests`, `pets`, `date`, `dateEnd`, `sort=trust`, `locale`,
    * `page`, `pageSize` (default 48, max 200) and `facets=1` for per-district /
    * per-place counts. Bad values are ignored, never a 4xx/5xx — see
    * normalizeListingSearch().
@@ -33,6 +34,9 @@ export class ListingsController {
    * Takes the raw query object (not individual @Query params) because a
    * repeated `?q=a&q=b` arrives as an array.
    */
+  // Every page of the site (search bar, footer, featured towns) calls this, so
+  // the global 60/min per-IP default is far too tight for it.
+  @Throttle({ default: { ttl: 60_000, limit: 600 } })
   @Get()
   async search(@Query() query: Record<string, unknown>) {
     const params = normalizeListingSearch(query ?? {});

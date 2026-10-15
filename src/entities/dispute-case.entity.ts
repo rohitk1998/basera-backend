@@ -14,13 +14,17 @@ export class DisputeCaseEntity {
   booking_id: string;
 
   @Column()
-  category: string; // not_as_described | cleanliness | damage_safety | host_unresponsive_or_cancelled | other
+  category: string; // not_as_described | cleanliness | damage_safety | host_unresponsive_or_cancelled | early_departure | other
 
   @Column('text')
   description: string;
 
   @Column('int')
   requested_amount: number;
+
+  /** early_departure only: the day the guest says they are leaving. */
+  @Column({ type: 'date', nullable: true })
+  leaving_on: string | null;
 
   @Column('text', { array: true, default: () => "'{}'" })
   evidence_urls: string[];

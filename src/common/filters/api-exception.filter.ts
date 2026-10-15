@@ -37,13 +37,25 @@ export class ApiExceptionFilter implements ExceptionFilter {
     if (res.headersSent) return;
 
     const { status, message, errors } = this.describe(exception);
+    // A deliberate 429 (e.g. the check-in lockout) can say how long to wait:
+    // sent as the standard Retry-After header and as a body field.
+    const retryAfterSeconds = this.retryAfterSeconds(exception);
+    if (retryAfterSeconds !== undefined) res.setHeader('Retry-After', String(retryAfterSeconds));
     res.status(status).json({
       success: false,
       statusCode: status,
       message,
       error: message,
       ...(errors ? { errors } : {}),
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
     });
+  }
+
+  private retryAfterSeconds(exception: unknown): number | undefined {
+    if (!(exception instanceof HttpException)) return undefined;
+    const response = exception.getResponse();
+    const value = typeof response === 'object' ? (response as { retryAfterSeconds?: unknown }).retryAfterSeconds : undefined;
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
   }
 
   private describe(exception: unknown): { status: number; message: string; errors?: string[] } {

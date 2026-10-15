@@ -100,6 +100,12 @@ export class UserController {
     return this.userService.removePushToken(user.userId, dto.token);
   }
 
+  @ResponseMessage('Welcome dismissed.')
+  @Post('welcome-seen')
+  markWelcomeSeen(@CurrentUser() user: AuthUser) {
+    return this.userService.markWelcomeSeen(user.userId);
+  }
+
   @ResponseMessage('Language updated.')
   @Post('locale')
   setLocale(@CurrentUser() user: AuthUser, @Body() dto: SetLocaleDto) {

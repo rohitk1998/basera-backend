@@ -14,8 +14,9 @@ export class BookingEventEntity {
   @Column()
   to_status: string;
 
-  @Column('uuid')
-  actor: string;
+  /** NULL = the system (e.g. the scheduled payout release). */
+  @Column({ type: 'uuid', nullable: true })
+  actor: string | null;
 
   @Column({ type: 'timestamptz', default: () => 'now()' })
   at: Date;

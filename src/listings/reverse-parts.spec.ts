@@ -46,8 +46,24 @@ describe('matchTehsil', () => {
 });
 
 describe('streetFrom', () => {
+  it('strips a Plus Code, keeping any real street after it', () => {
+    expect(streetFrom('V77G+3Q Manjhli, Himachal Pradesh 175141, India')).toBe('Manjhli');
+    expect(streetFrom('V77G+3Q Manjhli, Himachal Pradesh 175141, India', ['Manjhli'])).toBeUndefined();
+    expect(streetFrom('V77G+3Q, Main Road, Manjhli')).toBe('Main Road, Manjhli');
+  });
   it('drops the state, PIN and country the form has its own fields for', () => {
     expect(streetFrom('NH103, Sohal, Ghumarwin, Himachal Pradesh 174021, India')).toBe('NH103, Sohal, Ghumarwin');
+  });
+  it('drops segments that repeat the locality, city, district or a bare PIN', () => {
+    expect(streetFrom('Old Manali, Manali, Kullu, 175131, Himachal Pradesh, India', ['Old Manali', 'Manali', 'Kullu'])).toBeUndefined();
+    expect(streetFrom('Club House Rd, old manali, Manali, Kullu, 175131', ['Old Manali', 'Manali', 'Kullu'])).toBe('Club House Rd');
+  });
+  it('does not repeat the city and PIN in a Nominatim street', () => {
+    const p = partsFromNominatim(
+      { village: 'Sohal', suburb: 'Sohal', state_district: 'Bilaspur', postcode: '174021' },
+      'NH103, Sohal, Ghumarwin, Bilaspur, 174021, Himachal Pradesh, India',
+    );
+    expect(p.street).toBe('NH103, Ghumarwin');
   });
   it('copes with nothing useful', () => {
     expect(streetFrom(undefined)).toBeUndefined();
@@ -80,7 +96,7 @@ describe('partsFromGoogle', () => {
       city: 'Ghumarwin',
       locality: 'Sohal',
       pincode: '174021',
-      street: 'NH103, Sohal, Ghumarwin',
+      street: 'NH103',
     });
   });
 

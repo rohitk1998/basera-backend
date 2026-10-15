@@ -81,6 +81,16 @@ describe('ListingsService.findLive', () => {
     expect(district[1][1]).toEqual({ district: 'kullu' });
   });
 
+  it('filters out homes that do not allow pets when pets >= 1, and only then', async () => {
+    const withPets = makeService();
+    await withPets.service.findLive(search({ pets: '1' }));
+    const where = withPets.calls.filter(([n]) => n === 'andWhere').map(([, a]) => String(a[0]));
+    expect(where.some((w) => w.includes("'pets'") && w.includes("= 'true'"))).toBe(true);
+    const without = makeService();
+    await without.service.findLive(search({ guests: '2' }));
+    expect(without.calls.some(([n, a]) => n === 'andWhere' && String(a[0]).includes("'pets'"))).toBe(false);
+  });
+
   it('casts the stored value, not the key name, in a dated search', async () => {
     const { service, calls } = makeService();
     await service.findLive(search({ date: '2026-10-02', dateEnd: '2026-10-31' }));
@@ -127,6 +137,7 @@ describe('search cache key', () => {
       keyFor({ tehsil: 'Bhuntar' }),
       keyFor({ category: 'work' }),
       keyFor({ guests: '2' }),
+      keyFor({ pets: '1' }),
       keyFor({ sort: 'trust' }),
       keyFor({ locale: 'hi' }),
       keyFor({ page: '2' }),
@@ -176,5 +187,43 @@ describe('rowToListing display vs filter consistency', () => {
     expect(none.town).toBe('');
     expect(none.fullLocation).toBe('Nowhere, Himachal Pradesh');
     expect(none.description).not.toContain(' in ,');
+  });
+});
+
+describe('ListingsService facets', () => {
+  const rawRows = [
+    { district: 'Kangra', place: 'Dharamshala', count: '2', min_rate: null, min_disc: null, cover_url: 'late.jpg', cover_at: '2026-02-01T00:00:00Z' },
+    { district: 'Kangra', place: 'Palampur', count: '1', min_rate: null, min_disc: null, cover_url: 'early.jpg', cover_at: '2026-01-01T00:00:00Z' },
+    { district: '', place: null, count: '1', min_rate: null, min_disc: null, cover_url: null, cover_at: null },
+  ];
+  const build = (getRawMany: () => Promise<unknown[]>) => {
+    const { service, store } = makeService();
+    (service as any).listings.createQueryBuilder = () => {
+      const qb: any = new Proxy(
+        {},
+        { get: (_t, n: string) => (n === 'getRawMany' ? getRawMany : n === 'getCount' ? async () => 0 : n === 'getMany' ? async () => [] : () => qb) },
+      );
+      return qb;
+    };
+    return { service, store };
+  };
+
+  it('derives districts (counts and earliest cover) and places from one scan, and caches it', async () => {
+    let scans = 0;
+    const { service } = build(async () => (scans++, rawRows));
+    const first = await service.findLive(search({ facets: '1', pageSize: '1' }));
+    expect(first.facets?.districts).toEqual([{ name: 'Kangra', count: 3, coverUrl: 'early.jpg' }]);
+    expect(first.facets?.places.map((p) => p.tehsil)).toEqual(['Dharamshala', 'Palampur']);
+    expect(scans).toBe(1);
+    await service.findLive(search({ facets: '1', pageSize: '2' })); // other page size: facets cache hit
+    expect(scans).toBe(1);
+  });
+
+  it('never caches a failed facets query', async () => {
+    const { service, store } = build(async () => {
+      throw new Error('db down');
+    });
+    await expect(service.findLive(search({ facets: '1' }))).rejects.toThrow('db down');
+    expect([...store.keys()].filter((k) => k.includes('facets'))).toEqual([]);
   });
 });

@@ -30,6 +30,11 @@ export class BookingEntity {
   @Column('date')
   move_out: string;
 
+  /** Set when a dispute resolves: the day the stay really ended. Availability
+   *  and overlap checks use COALESCE(actual_move_out, move_out). */
+  @Column({ type: 'date', nullable: true })
+  actual_move_out: string | null;
+
   @Column('int')
   months: number;
 

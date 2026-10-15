@@ -27,6 +27,7 @@ export type AvatarUploadFile = { buffer: Buffer; mimetype: string; size: number 
 const WEEK_SECONDS = 60 * 60 * 24 * 7;
 const YEAR_SECONDS = 60 * 60 * 24 * 365;
 const REFRESH_TOKEN_SECONDS = YEAR_SECONDS / 12; // 30 days — outlives the 7-day access token so it can renew it
+const REFRESH_GRACE_MS = 15_000; // a just-rotated refresh token still answers with the same new tokens for this long
 
 // TTL for the proof-of-identity token minted by session()/verifyEmailOtp()
 // for a brand-new signup — see issueProofToken below. Long enough to fill
@@ -100,6 +101,8 @@ function firebaseUidToSupabaseUuid(uid: string): string {
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  /** Old refresh-token hash -> the tokens it was rotated into; see rotateSession. */
+  private readonly recentRotations = new Map<string, { userId: string; at: number; tokens: Promise<SessionTokens> }>();
 
   constructor(
     private readonly firebase: FirebaseAdminProvider,
@@ -199,6 +202,12 @@ export class AuthService {
       }
     }
 
+    // Decided here, never taken from the client: an address with no completed
+    // account is finishing a signup, anyone else is signing in. Only changes
+    // the wording of the email.
+    const account = await this.profiles.findOne({ where: { email }, select: { id: true, full_name: true } });
+    const purpose = account?.full_name ? 'login' : 'signup';
+
     const code = generateOtpCode();
     const now = new Date();
 
@@ -220,6 +229,7 @@ export class AuthService {
       await this.notifications.sendEmailOtpViaSmtp(email, {
         code,
         expiresInMinutes: OTP_EXPIRY_MINUTES,
+        purpose,
       });
     } catch (err: any) {
       this.logger.error(`[sendEmailOtp] SMTP send failed for ${email}`, err);
@@ -340,6 +350,9 @@ export class AuthService {
     // pre-existing account it merely updated (a replayed token, or the
     // winner of a concurrent-signup race).
     let didInsert = false;
+    // True only for the call that completes the account for the first time —
+    // a replayed token or a lost concurrent-signup race must not re-welcome.
+    let firstCompletion = false;
 
     if (claims.firebaseUid) {
       // Phone-OTP signup — id is deterministic from the Firebase uid, same
@@ -350,6 +363,9 @@ export class AuthService {
       userId = firebaseUidToSupabaseUuid(claims.firebaseUid);
 
       const alreadyExists = await this.profiles.findOne({ where: { id: userId } });
+      // A row left behind without a name was never completed; this call is
+      // its first real completion, so it still earns the welcome.
+      firstCompletion = !alreadyExists || !alreadyExists.full_name;
       if (alreadyExists) {
         // Token was replayed, or a second tab finished ProfileScreen first.
         // Nothing to insert — fall through and just (re-)issue a session,
@@ -417,6 +433,7 @@ export class AuthService {
         });
         userId = id;
         didInsert = true;
+        firstCompletion = true;
       } catch (err: any) {
         if (err?.code !== '23505') throw err;
         // Two completions for the same brand-new email raced. The DB
@@ -458,6 +475,15 @@ export class AuthService {
       }
     }
 
+    if (firstCompletion) {
+      // Fire-and-forget, after everything that can still roll the row back.
+      this.notifications.notify('user.welcome', userId, {
+        userName: dto.name,
+        isHost: dto.isHost ?? false,
+        link: dto.isHost ? '/host/start' : '/stays',
+      });
+    }
+
     return { userId, phone, firebaseUid, avatar_url: avatarUrl };
   }
 
@@ -476,6 +502,39 @@ export class AuthService {
     }
 
     return profile;
+  }
+
+  /** The whole refresh step: validate the refresh token, then rotate it.
+   *  Two requests carrying the same cookie (two tabs, a double-fired client)
+   *  arrive near-simultaneously; the loser would otherwise find the hash the
+   *  winner just rotated away and 401. Within REFRESH_GRACE_MS the same old
+   *  token therefore gets the SAME freshly issued tokens back (idempotent).
+   *  Past the window a reused token is rejected as before. Per-process memory
+   *  only — no schema change; across instances the grace simply doesn't apply. */
+  async rotateSession(
+    userId: string,
+    rawRefreshToken: string,
+    firebaseUid?: string,
+  ): Promise<SessionTokens> {
+    const key = hashRefreshToken(rawRefreshToken);
+    const now = Date.now();
+    for (const [k, v] of this.recentRotations) {
+      if (now - v.at > REFRESH_GRACE_MS) this.recentRotations.delete(k);
+    }
+
+    const recent = this.recentRotations.get(key);
+    if (recent && recent.userId === userId) return recent.tokens;
+
+    const tokens = (async () => {
+      const profile = await this.verifyRefreshToken(userId, rawRefreshToken);
+      return this.issueSession({ userId: profile.id, phone: profile.phone ?? undefined, firebaseUid });
+    })();
+    const entry = { userId, at: now, tokens };
+    this.recentRotations.set(key, entry);
+    tokens.catch(() => {
+      if (this.recentRotations.get(key) === entry) this.recentRotations.delete(key);
+    });
+    return tokens;
   }
 
   /** Revoke server-side so a stolen refresh-token cookie can't renew

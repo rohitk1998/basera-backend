@@ -11,7 +11,8 @@ import {
 } from '@nestjs/common';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
-import { assertLocationIsValid, upgradeLegacyLocation } from './location.util';
+import { GeocodeService } from './geocode.service';
+import { assertLocationAgrees, assertLocationIsValid, upgradeLegacyLocation } from './location.util';
 import { createReadStream } from 'fs';
 import { mkdtemp, readFile, rm, unlink, writeFile } from 'fs/promises';
 import * as os from 'os';
@@ -65,6 +66,8 @@ function captureReceiptKey(userId: string, url: string): string {
 }
 import {
   fullOnboardingSchema,
+  listingIssues,
+  clampPastAvailableFrom,
   listingSchema,
   mediaSchema,
   photoSchema,
@@ -79,6 +82,15 @@ import { z } from 'zod';
  *  after the first one or two has a short list. The minimum applies at submit. */
 const draftPropertySchema = listingSchema.partial().extend({ photos: z.array(photoSchema).optional() });
 const draftSchema = fullOnboardingSchema.partial().extend({ photos: z.array(photoSchema).optional() });
+
+/** Where the host was in the listing wizard (chapter keys, not indexes), kept in
+ *  `draft_data.wizard` so a reload or another device reopens at the same place.
+ *  Not listing data: it is dropped on submit and never read by a public path. */
+const wizardProgressSchema = z.object({
+  currentStep: z.string().regex(/^[a-z]{2,12}$/),
+  visitedSteps: z.array(z.string().regex(/^[a-z]{2,12}$/)).max(20),
+  updatedAt: z.string().max(40),
+});
 
 type UploadedMulterFile = {
   buffer?: Buffer;
@@ -185,6 +197,8 @@ export class HostListingsService implements OnModuleDestroy {
     private readonly dataSource: DataSource,
     // Optional so a context without it (older specs) behaves as bypass OFF.
     @Optional() private readonly captureConfig?: CaptureConfigService,
+    // Optional for the same reason: without it the pin-vs-district check is not run.
+    @Optional() private readonly geocode?: GeocodeService,
   ) {}
 
   /** TEST ONLY switch (CAPTURE_LOCATION_BYPASS); server-side, never from a client. */
@@ -667,10 +681,26 @@ export class HostListingsService implements OnModuleDestroy {
     })();
   }
 
+  /** The pin must sit in the chosen district and PIN area; skipped under the test bypass, fails open. */
+  private async assertPinAgrees(p: { district: string; pincode: string; lat: number; lng: number }) {
+    if (!this.geocode) return;
+    await assertLocationAgrees(p, (lat, lng) => this.geocode!.reverseCheck(lat, lng), { skip: this.locationBypass });
+  }
+
   /** The full property schema, plus the location rules a schema cannot hold. */
-  private parseProperty(d: Parameters<typeof listingSchema.parse>[0]) {
-    const property = listingSchema.parse(d);
-    assertLocationIsValid(property);
+  private parseProperty(
+    d: Parameters<typeof listingSchema.parse>[0],
+    opts: { clampPastDate?: boolean } = {},
+  ) {
+    // Editing a listing that was already submitted: a date that has since passed
+    // becomes today (and is stored so) rather than blocking every edit.
+    // Hosts are in India; compare the date-only value against today there.
+    const property = listingSchema.parse(
+      opts.clampPastDate ? clampPastAvailableFrom(d as { availableFrom?: string }, 'Asia/Kolkata') : d,
+    );
+    assertLocationIsValid(property, { skipPinRegion: this.locationBypass });
+    const issue = Object.values(listingIssues(property, { timeZone: 'Asia/Kolkata' }))[0];
+    if (issue) throw new BadRequestException(issue);
     return property;
   }
 
@@ -1009,7 +1039,9 @@ export class HostListingsService implements OnModuleDestroy {
     // as the original submit is. A host who did not record again keeps the
     // walkthrough already on the listing (resolveWalkthrough).
     const pin = { lat: d.lat, lng: d.lng };
-    const property = this.parseProperty(d);
+    // A draft going out for the first time keeps the "today or later" rule.
+    const property = this.parseProperty(d, { clampPastDate: existing.status !== 'draft' });
+    await this.assertPinAgrees(property);
     const { captures } = await this.resolvePhotoCaptures(userId, property.photos, existing, pin);
     this.assertVideoUrlUnchanged(d.videoUrl, existing);
     // Last of the checks: it spends the one-time walkthrough receipt, so
@@ -1017,7 +1049,7 @@ export class HostListingsService implements OnModuleDestroy {
     const telemetry = await this.resolveWalkthrough(userId, d.walkthroughToken, pin, existing);
 
     const priorDraft = (existing.draft_data as Record<string, any>) ?? {};
-    const { banking: _droppedBanking, ...priorDraftWithoutBanking } = priorDraft;
+    const { banking: _droppedBanking, wizard: _droppedWizard, ...priorDraftWithoutBanking } = priorDraft;
     const draft_data = {
       ...priorDraftWithoutBanking,
       property_details: property,
@@ -1174,8 +1206,13 @@ export class HostListingsService implements OnModuleDestroy {
       }
     }
 
+    // Not in the draft schema (which drops unknown keys), so read on its own;
+    // an unreadable value keeps whatever was saved before.
+    const wizard = wizardProgressSchema.safeParse((body as { wizard?: unknown } | null)?.wizard);
+
     const draft_data = {
       ...priorDraft,
+      ...(wizard.success ? { wizard: wizard.data } : {}),
       kind: { host_kind: profile.host_kind },
       identity: { pan: profile.pan, gst: profile.gst ?? '' },
       property_details: property,
@@ -1236,6 +1273,7 @@ export class HostListingsService implements OnModuleDestroy {
           ...(draft.banking ?? {}),
             ...(draft.media ?? {}),
         },
+        wizard: draft.wizard ?? null,
       },
     };
   }
@@ -1291,6 +1329,7 @@ export class HostListingsService implements OnModuleDestroy {
     // likewise be a camera capture near this pin (resolvePhotoCaptures).
     const pin = { lat: d.lat, lng: d.lng };
     const property = this.parseProperty(d);
+    await this.assertPinAgrees(property);
     const { captures } = await this.resolvePhotoCaptures(userId, property.photos, existing, pin);
     this.assertVideoUrlUnchanged(d.videoUrl, existing);
     // Last of the checks: it spends the one-time walkthrough receipt, so

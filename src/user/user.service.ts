@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
   PayloadTooLargeException,
 } from '@nestjs/common';
@@ -42,6 +43,9 @@ export interface ProfileEditLockedError {
 
 @Injectable()
 export class UserService {
+  private readonly logger = new Logger(UserService.name);
+  private warnedMissingWelcomeColumn = false;
+
   constructor(
     @InjectRepository(UserEntity)
     private readonly profiles: Repository<UserEntity>,
@@ -49,6 +53,50 @@ export class UserService {
     private readonly verificationRequests: Repository<VerificationRequestEntity>,
     private readonly supabase: SupabaseProvider,
   ) {}
+
+  /**
+   * Stamps `users.welcome_seen_at` once. Raw query on purpose: the column is
+   * deliberately NOT mapped on UserEntity so an unapplied migration can't
+   * break every users query. Idempotent: a second call changes no row and
+   * still succeeds; a missing column (42703) is logged once and swallowed.
+   */
+  async markWelcomeSeen(userId: string) {
+    try {
+      await this.profiles.manager.query(
+        'update users set welcome_seen_at = now() where id = $1 and welcome_seen_at is null',
+        [userId],
+      );
+    } catch (err) {
+      const code = (err as { code?: string; driverError?: { code?: string } })?.code
+        ?? (err as { driverError?: { code?: string } })?.driverError?.code;
+      if (code !== '42703') throw err;
+      if (!this.warnedMissingWelcomeColumn) {
+        this.warnedMissingWelcomeColumn = true;
+        this.logger.warn('users.welcome_seen_at is missing - apply migrations/20261014_user_welcome_seen.sql');
+      }
+    }
+    return { success: true };
+  }
+
+  /**
+   * Reads `users.welcome_seen_at` (raw, column is not mapped on UserEntity).
+   * Returns an ISO string, null (never seen), or undefined when the column is
+   * missing (42703) so clients treat it as unknown.
+   */
+  private async readWelcomeSeenAt(userId: string): Promise<string | null | undefined> {
+    try {
+      const rows: Array<{ welcome_seen_at: Date | string | null }> =
+        await this.profiles.manager.query('select welcome_seen_at from users where id = $1', [userId]);
+      const v = rows?.[0]?.welcome_seen_at;
+      if (v === null || v === undefined) return null;
+      return v instanceof Date ? v.toISOString() : new Date(v).toISOString();
+    } catch (err) {
+      const code = (err as { code?: string; driverError?: { code?: string } })?.code
+        ?? (err as { driverError?: { code?: string } })?.driverError?.code;
+      if (code !== '42703') throw err;
+      return undefined;
+    }
+  }
 
   async getProfile(userId: string) {
     const profile = await this.profiles.findOne({ where: { id: userId } });
@@ -64,6 +112,8 @@ export class UserService {
       order: { submitted_at: 'DESC' },
       select: { id: true, status: true },
     });
+
+    const welcomeSeenAt = await this.readWelcomeSeenAt(userId);
 
     return {
       success: true,
@@ -86,6 +136,7 @@ export class UserService {
         bank_account_name: profile.bank_account_name || '',
         bank_verified_at: profile.bank_verified_at ?? null,
         identity_verified: latestIdentity?.status === 'verified',
+        ...(welcomeSeenAt !== undefined && { welcomeSeenAt }),
       },
       editUnlocksAt: profile.created_at ? editUnlocksAt(profile.created_at).toISOString() : null,
     };

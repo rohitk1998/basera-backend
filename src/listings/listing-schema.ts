@@ -115,7 +115,7 @@ export const locationSchema = z.object({
   pincode: z
     .string()
     .trim()
-    .regex(/^\d{6}$/, 'Enter a 6-digit PIN code.'),
+    .regex(/^17[1-7]\d{3}$/, 'Enter a Himachal Pradesh PIN code (171xxx–177xxx).'),
   /* The pin is checked against the device-reported location of every photo and
      the walkthrough video (capture.util.ts), so it has to be the real spot even though guests see it offset. The
      range here is a cheap first filter; being inside Himachal Pradesh itself
@@ -173,6 +173,56 @@ export const pricingSchema = z.object({
   availableFrom: z.string().min(10, 'Pick the first date the home is free.'),
   billsIncluded: z.enum(['all', 'electricity_extra', 'none']),
 });
+
+/** Bedrooms a size label implies: a Studio has none, "NBHK" has N. */
+const BEDROOMS_FOR_SIZE: Record<string, number> = { Studio: 0, '1BHK': 1, '2BHK': 2, '3BHK': 3 };
+
+/** Today as YYYY-MM-DD in the given IST-or-local frame (date-only, so no timezone drift). */
+const todayIso = (timeZone?: string) =>
+  new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+
+/** An edit of an already-submitted listing may carry an availability date that
+ *  has since passed; it is moved to today (in the given timezone) instead of
+ *  being refused. Anything that is not a plain past YYYY-MM-DD is returned as is. */
+export function clampPastAvailableFrom<T extends { availableFrom?: string }>(d: T, timeZone?: string): T {
+  const today = todayIso(timeZone);
+  if (d.availableFrom && /^\d{4}-\d{2}-\d{2}$/.test(d.availableFrom) && d.availableFrom < today) {
+    return { ...d, availableFrom: today };
+  }
+  return d;
+}
+
+/** The cross-field rules a schema cannot hold (these schemas are merged into
+ *  larger ones, which rules out wrapping them in a refinement): returned as
+ *  field errors for the form. Whole-listing submits only — drafts are partial. */
+export function listingIssues(
+  d: {
+    beds?: string;
+    bedrooms?: number | string;
+    weeklyDiscountPct?: number | string;
+    monthlyDiscountPct?: number | string;
+    availableFrom?: string;
+  },
+  opts: { timeZone?: string } = {},
+): Partial<Record<'bedrooms' | 'weeklyDiscountPct' | 'availableFrom', string>> {
+  const issues: Partial<Record<'bedrooms' | 'weeklyDiscountPct' | 'availableFrom', string>> = {};
+  const expected = d.beds ? BEDROOMS_FOR_SIZE[d.beds] : undefined;
+  if (expected !== undefined && d.bedrooms !== undefined && d.bedrooms !== '' && Number(d.bedrooms) !== expected) {
+    issues.bedrooms =
+      expected === 0
+        ? 'A studio has no separate bedroom — enter 0, or pick a bigger size.'
+        : `A ${d.beds} has ${expected} bedroom${expected === 1 ? '' : 's'} — enter ${expected}, or change the size.`;
+  }
+  const weekly = Number(d.weeklyDiscountPct);
+  const monthly = Number(d.monthlyDiscountPct);
+  if (Number.isFinite(weekly) && Number.isFinite(monthly) && weekly > monthly) {
+    issues.weeklyDiscountPct = 'The weekly discount cannot be bigger than the monthly discount.';
+  }
+  if (d.availableFrom && /^\d{4}-\d{2}-\d{2}$/.test(d.availableFrom) && d.availableFrom < todayIso(opts.timeZone)) {
+    issues.availableFrom = 'Pick today or a later date — the home cannot be available in the past.';
+  }
+  return issues;
+}
 
 export const rulesSchema = z.object({
   checkIn: z.string().trim().min(3),
@@ -237,7 +287,16 @@ export const telemetrySchema = z.object({
 
 export const mediaSchema = z.object({
   videoUrl: z.string().url().optional().or(z.literal('')),
-  tourUrl: z.string().url().optional().or(z.literal('')),
+  /* http(s) only: a `javascript:` or `data:` link is valid to `.url()` but is
+     an XSS vector once it is rendered as an href. */
+  tourUrl: z
+    .string()
+    .trim()
+    .max(500, 'Keep the tour link under 500 characters.')
+    .url('Enter a valid tour link.')
+    .refine((v) => /^https?:\/\//i.test(v), 'The tour link must start with http:// or https://.')
+    .optional()
+    .or(z.literal('')),
 });
 
 export const hostKycSchema = kindSchema.merge(identitySchema);

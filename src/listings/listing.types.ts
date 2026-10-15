@@ -41,6 +41,8 @@ export type Listing = {
   term: string;
   minDays: number;
   verified: boolean;
+  /** Set on the single-listing response only: true when the camera-capture check genuinely passed (not bypassed, not approved by override). */
+  captureCheckPassed?: boolean;
   /** null when no verification data exists yet — never a placeholder number. */
   trust: number | null;
   /** null until there are real reviews. There is no reviews table, so any

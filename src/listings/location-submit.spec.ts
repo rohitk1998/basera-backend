@@ -1,5 +1,5 @@
 import { fullOnboardingSchema } from './listing-schema';
-import { assertLocationIsValid, upgradeLegacyLocation } from './location.util';
+import { assertLocationAgrees, assertLocationIsValid, upgradeLegacyLocation } from './location.util';
 
 /** A complete, valid listing payload, without the location fields. */
 const rest = {
@@ -92,5 +92,39 @@ describe('submitting a listing location', () => {
 
   it('refuses a state other than Himachal Pradesh', () => {
     expect(accept({ ...rest, district: 'Kullu', tehsil: 'Manali', state: 'Punjab', lat: 32.2, lng: 77.1 }).ok).toBe(false);
+  });
+});
+
+describe('PIN code and pin agreement', () => {
+  const base = { district: 'Kullu', pincode: '175131', lat: 32.27, lng: 77.17 };
+
+  it('refuses a PIN outside the Himachal 171-177 range', () => {
+    const r = accept({ ...rest, district: 'Kullu', tehsil: 'Manali', lat: 32.27, lng: 77.17, pincode: '160055' });
+    expect(r).toMatchObject({ ok: false, message: 'Enter a Himachal Pradesh PIN code (171xxx–177xxx).' });
+  });
+
+  it('refuses a pin that reverse-geocodes to another district', async () => {
+    await expect(assertLocationAgrees(base, async () => ({ district: 'Shimla', pincode: '175131' }))).rejects.toThrow(
+      'The pin is in Shimla district, but you chose Kullu.',
+    );
+  });
+
+  it('refuses a PIN that differs from the pin postcode', async () => {
+    await expect(assertLocationAgrees(base, async () => ({ district: 'Kullu', pincode: '175101' }))).rejects.toThrow(/175101/);
+  });
+
+  it('accepts when they agree or the geocoder gave only part', async () => {
+    await expect(assertLocationAgrees(base, async () => ({ district: 'Kullu', pincode: '175131' }))).resolves.toBeUndefined();
+    await expect(assertLocationAgrees(base, async () => ({ district: 'Kullu' }))).resolves.toBeUndefined();
+  });
+
+  it('skips the check under the test bypass without calling the geocoder', async () => {
+    const lookup = jest.fn(async () => ({ district: 'Shimla' }));
+    await expect(assertLocationAgrees(base, lookup, { skip: true })).resolves.toBeUndefined();
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('fails open when the geocoder returns nothing', async () => {
+    await expect(assertLocationAgrees(base, async () => null)).resolves.toBeUndefined();
   });
 });

@@ -26,6 +26,7 @@ import {
   VerificationAuditLogEntity,
   VerificationRequestEntity,
 } from '../src/entities';
+import { CaptureConfigService } from '../src/listings/capture-config.service';
 import { HostListingsController } from '../src/listings/host-listings.controller';
 import { HostListingsService } from '../src/listings/host-listings.service';
 import { ListingTranslationService } from '../src/listings/listing-translation.service';
@@ -772,7 +773,8 @@ describe('Host listings API (/api/host/listings)', () => {
   let profiles: Row[];
   let redisStore: Map<string, string>;
   let versionBumps: number;
-  let verificationStatus: { identity: { status: string }; pan: { status: string } };
+  let verificationStatus: { identity: { status: string }; pan: { status: string }; bank: { status: string } };
+  let captureConfig: { locationBypass: boolean };
 
   const PIN = { lat: 32.2701, lng: 77.1755 }; // Manali
   const TOKEN = '3b2d1623-b9fd-42f0-984e-97ef53a95a9f';
@@ -841,13 +843,15 @@ describe('Host listings API (/api/host/listings)', () => {
     profiles = [{ ...USERS.host }, { ...USERS.other }, { ...USERS.guest }];
     redisStore = new Map();
     versionBumps = 0;
-    verificationStatus = { identity: { status: 'verified' }, pan: { status: 'verified' } };
+    verificationStatus = { identity: { status: 'verified' }, pan: { status: 'verified' }, bank: { status: 'verified' } };
+    captureConfig = { locationBypass: false };
 
     const listingsRepo = makeRepo(listings);
     const moduleRef = await Test.createTestingModule({
       controllers: [HostListingsController],
       providers: [
         HostListingsService,
+        { provide: CaptureConfigService, useValue: captureConfig },
         AuthGuard,
         { provide: APP_INTERCEPTOR, useClass: ResponseMessageInterceptor },
         { provide: APP_FILTER, useClass: ApiExceptionFilter },
@@ -1163,10 +1167,38 @@ describe('Host listings API (/api/host/listings)', () => {
 
     it('bank and PAN are NOT part of the gate: identity + selfie alone are enough to submit', async () => {
       ready();
-      profiles[0].bank_verified_at = null;
       verificationStatus.pan.status = 'rejected';
-      const res = await host('post', `${U}/submit-full`).send(body());
-      expect(res.status).not.toBe(403);
+      verificationStatus.bank.status = 'not_started';
+      await host('post', `${U}/submit-full`).send(body()).expect(201);
+      expect(listings).toHaveLength(1);
+    });
+
+    describe('pin outside Himachal (Mohali), CAPTURE_LOCATION_BYPASS', () => {
+      const MOHALI = { lat: 30.7046, lng: 76.7179 };
+      const mohali = () => body({ ...MOHALI, district: 'Solan', tehsil: 'Parwanoo', town: 'Parwanoo' });
+      const readyAt = () => (seedWalkthrough('host1', TOKEN, MOHALI), seedPhotos('host1', photoUrls, MOHALI));
+
+      it('bypass OFF: refused as outside Himachal Pradesh, nothing stored', async () => {
+        readyAt();
+        expectError(await host('post', `${U}/submit-full`).send(mohali()), 400, /outside Himachal Pradesh/);
+        expect(listings).toHaveLength(0);
+      });
+
+      it('bypass ON: the same submission is accepted and goes in_review', async () => {
+        captureConfig.locationBypass = true;
+        readyAt();
+        const res = await host('post', `${U}/submit-full`).send(mohali()).expect(201);
+        expect(res.body).toMatchObject({ success: true, status: 'in_review' });
+        expect(listings[0].draft_data.property_details).toMatchObject({ lat: MOHALI.lat, lng: MOHALI.lng });
+      });
+
+      it('bypass ON does not relax the gate or the tehsil/district rule', async () => {
+        captureConfig.locationBypass = true;
+        readyAt();
+        expectError(await host('post', `${U}/submit-full`).send({ ...mohali(), district: 'Kangra' }), 400, /belongs to Kangra district/);
+        verificationStatus.identity.status = 'pending';
+        expectError(await host('post', `${U}/submit-full`).send(mohali()), 403, /Verify your identity/);
+      });
     });
 
     it('404 when the caller has no profile', async () => {

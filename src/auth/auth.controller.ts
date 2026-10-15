@@ -267,7 +267,7 @@ export class AuthController {
 
     const { userId, phone, firebaseUid, avatar_url } = await this.auth.completeSignup(dto, avatarFile);
     await this.setSessionCookies(res, await this.auth.issueSession({ userId, phone, firebaseUid }));
-    return { success: true, avatar_url };
+    return { success: true, avatar_url, userId };
   }
 
   /**
@@ -302,16 +302,7 @@ export class AuthController {
       throw new UnauthorizedException('No session to refresh');
     }
 
-    const profile = await this.auth.verifyRefreshToken(userId, rawRefreshToken);
-
-    await this.setSessionCookies(
-      res,
-      await this.auth.issueSession({
-        userId: profile.id,
-        phone: profile.phone ?? undefined,
-        firebaseUid: claims?.firebase_uid,
-      }),
-    );
+    await this.setSessionCookies(res, await this.auth.rotateSession(userId, rawRefreshToken, claims?.firebase_uid));
 
     return { success: true };
   }

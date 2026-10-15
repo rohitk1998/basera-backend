@@ -22,6 +22,8 @@ export type ListingSearchParams = {
   tehsil?: string;
   category?: CategoryId;
   minGuests?: number;
+  /** Pets travelling: >= 1 keeps only homes whose house rules allow pets. */
+  pets?: number;
   moveIn?: string;
   moveOut?: string;
   sortByTrust?: boolean;
@@ -29,6 +31,8 @@ export type ListingSearchParams = {
   page?: number;
   pageSize?: number;
   facets?: boolean;
+  /** `exact=1`: use `q` as typed — no "did you mean" retry. */
+  exact?: boolean;
 };
 
 /** A repeated query param (`?q=a&q=b`) arrives as an array — take the first value. */
@@ -93,6 +97,7 @@ export function clampPagination(page: unknown, pageSize: unknown): { page: numbe
 export function normalizeListingSearch(raw: Record<string, unknown>): ListingSearchParams {
   const q = cleanText(raw.q) ?? cleanText(raw.town) ?? cleanText(raw.location);
   const guests = parseInteger(raw.guests);
+  const pets = parseInteger(raw.pets);
   const facets = firstValue(raw.facets);
   const sort = firstValue(raw.sort);
   const locale = cleanText(raw.locale, 16);
@@ -104,12 +109,14 @@ export function normalizeListingSearch(raw: Record<string, unknown>): ListingSea
     tehsil: cleanText(raw.tehsil),
     category: parseCategory(raw.category),
     minGuests: guests && guests > 0 ? Math.min(guests, MAX_GUESTS) : undefined,
+    pets: pets && pets > 0 ? Math.min(pets, MAX_GUESTS) : undefined,
     moveIn: parseIsoDate(raw.date),
     moveOut: parseIsoDate(raw.dateEnd),
     sortByTrust: sort === 'trust',
     locale,
     page,
     pageSize,
+    exact: firstValue(raw.exact) === '1' ? true : undefined,
     facets: facets === '1' || facets === 'true' || facets === 1 || facets === true,
   };
 }

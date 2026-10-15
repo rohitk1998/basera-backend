@@ -47,6 +47,27 @@ export const PLACE_ALIASES: Readonly<Record<string, PlaceAlias>> = {
   // --- common alternative spellings ---
   'mcleod ganj': { district: 'Kangra', tehsil: 'Dharamshala' },
   dharamsala: { district: 'Kangra', tehsil: 'Dharamshala' },
+  dharmshala: { district: 'Kangra', tehsil: 'Dharamshala' },
+  dharmsala: { district: 'Kangra', tehsil: 'Dharamshala' },
+  mcleodgunj: { district: 'Kangra', tehsil: 'Dharamshala' },
+  'mcleod gunj': { district: 'Kangra', tehsil: 'Dharamshala' },
+  mcleod: { district: 'Kangra', tehsil: 'Dharamshala' },
+  simla: { district: 'Shimla', tehsil: 'Shimla Urban' },
+  kulu: { district: 'Kullu', tehsil: 'Kullu' },
+  manaali: { district: 'Kullu', tehsil: 'Manali' },
+  kasauli: { district: 'Solan', tehsil: 'Kasauli' },
+  kasoli: { district: 'Solan', tehsil: 'Kasauli' },
+
+  // --- villages and trailheads that belong to a nearby town's tehsil (labels: NEARBY_PLACES in place-fuzzy.ts) ---
+  bhagsu: { district: 'Kangra', tehsil: 'Dharamshala' },
+  bhagsunag: { district: 'Kangra', tehsil: 'Dharamshala' },
+  'bhagsu nag': { district: 'Kangra', tehsil: 'Dharamshala' },
+  dharamkot: { district: 'Kangra', tehsil: 'Dharamshala' },
+  naddi: { district: 'Kangra', tehsil: 'Dharamshala' },
+  'kotwali bazaar': { district: 'Kangra', tehsil: 'Dharamshala' },
+  gunehar: { district: 'Kangra', tehsil: 'Dharamshala' },
+  triund: { district: 'Kangra', tehsil: 'Dharamshala' },
+  naggar: { district: 'Kullu', tehsil: 'Kullu' },
 };
 
 /** Lower-case, trim and collapse whitespace so "  Spiti   VALLEY " finds its alias. */

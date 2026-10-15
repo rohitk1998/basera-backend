@@ -124,3 +124,17 @@ export function evaluateCaptureEvidence(draft: Record<string, any>): CaptureEvid
   const status = walkthrough.state === 'missing' ? 'not_started' : problems.length === 0 ? 'passed' : 'submitted';
   return { status, problems, pin, walkthrough, photos, deviceReported: true };
 }
+
+/**
+ * Whether guest-facing copy may say the camera-capture check "passed" for a
+ * live listing: the evidence itself passes (no bypassed capture, nothing
+ * missing or out of range) AND no admin approved it past that check with an
+ * override. Anything else is "reviewed by our team", never "passed".
+ */
+export function captureCheckTrulyPassed(draft: Record<string, any>): boolean {
+  if (evaluateCaptureEvidence(draft).status !== 'passed') return false;
+  const overrides: { unmetChecks?: unknown }[] = Array.isArray(draft.approval_overrides) ? draft.approval_overrides : [];
+  return !overrides.some(
+    (o) => Array.isArray(o?.unmetChecks) && o.unmetChecks.some((c) => typeof c === 'string' && c.startsWith('Camera capture')),
+  );
+}

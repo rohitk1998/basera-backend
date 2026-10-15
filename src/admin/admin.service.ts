@@ -311,7 +311,7 @@ export class AdminService {
           title: `Banking Penny-Drop — ${banking.status === 'passed' ? 'Passed ✓' : banking.status === 'failed' ? 'Failed ✗' : 'Submitted'}`,
           desc:
             banking.pennyDropStatus === 'matched'
-              ? `₹1 penny-drop confirmed. Account name "${banking.accountName || '—'}" matches PAN and certificate.`
+              ? `₹1 penny-drop confirmed. Account name "${banking.accountName || '—'}" matches PAN.`
               : `₹1 penny-drop initiated for UPI ${banking.upiId || '—'}.`,
           actor: 'Basera Banking Verification',
           time: when,
@@ -981,8 +981,8 @@ export class AdminService {
   /** Full case detail for the admin's case-review view — claim, evidence,
    *  and the whole negotiation/decision timeline, not just the isolated
    *  claim text `getDisputes` summarizes for the list. */
-  async getDisputeCase(bookingId: string, adminUserId: string) {
-    return this.bookingsService.getDisputeCase(adminUserId, bookingId);
+  async getDisputeCase(bookingId: string) {
+    return this.bookingsService.getDisputeCaseForAdmin(bookingId);
   }
 
   /** Admin resolution of an escalated case, for any amount to the guest —

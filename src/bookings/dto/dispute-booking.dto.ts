@@ -1,6 +1,6 @@
-import { IsIn, IsInt, IsString, Min, MaxLength, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsString, Matches, Min, MaxLength, MinLength, ValidateIf } from 'class-validator';
 
-const DISPUTE_CATEGORIES = ['not_as_described', 'cleanliness', 'damage_safety', 'host_unresponsive_or_cancelled', 'other'];
+const DISPUTE_CATEGORIES = ['not_as_described', 'cleanliness', 'damage_safety', 'host_unresponsive_or_cancelled', 'early_departure', 'other'];
 
 /** Kept hand-in-sync with web/lib/dispute-schema.ts's zod shape — the two
  *  can't literally share a definition across the Next.js/NestJS package
@@ -19,7 +19,16 @@ export class DisputeBookingDto {
   @MaxLength(2000)
   description: string;
 
+  // Optional only for an early-departure report (no automatic refund applies).
+  @ValidateIf((o: DisputeBookingDto) => o.category !== 'early_departure' || o.requestedAmount != null)
   @IsInt()
   @Min(1)
-  requestedAmount: number;
+  requestedAmount?: number;
+
+  // Required only for an early-departure report: the day the guest leaves
+  // (YYYY-MM-DD). The today-or-later / before-move-out bounds need the
+  // booking, so they're enforced in BookingsService.dispute().
+  @ValidateIf((o: DisputeBookingDto) => o.category === 'early_departure')
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  leavingOn?: string;
 }

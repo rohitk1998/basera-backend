@@ -101,6 +101,13 @@ describe('normalizeListingSearch', () => {
     });
   });
 
+  it('parses pets as a positive integer and drops anything else', () => {
+    expect(normalizeListingSearch({ pets: '1' }).pets).toBe(1);
+    expect(normalizeListingSearch({ pets: '0' }).pets).toBeUndefined();
+    expect(normalizeListingSearch({ pets: 'x' }).pets).toBeUndefined();
+    expect(normalizeListingSearch({ guests: '2' }).pets).toBeUndefined();
+  });
+
   it('always returns bounded pagination', () => {
     expect(normalizeListingSearch({})).toMatchObject({ page: 1, pageSize: 48 });
     expect(normalizeListingSearch({ pageSize: '99999', page: '-1' })).toMatchObject({ page: 1, pageSize: 200 });

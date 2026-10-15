@@ -54,13 +54,24 @@ export function matchTehsil(district: HpDistrict, name: string | undefined): str
   return loose.length === 1 ? loose[0] : undefined; // "Shimla" fits both Shimla Urban and Shimla Rural: leave it to the host
 };
 
+/** An Open Location Code ("V77G+3Q"), which Google returns as a street when it has nothing better. */
+const PLUS_CODE = /^[23456789CFGHJMPQRVWX]{2,8}\+[23456789CFGHJMPQRVWX]{2,}\b\s*/i;
+
 /** Drops ", India" and the "Himachal Pradesh 174021" segment: the form has fields for those. */
-export function streetFrom(formatted: string | undefined): string | undefined {
+export function streetFrom(formatted: string | undefined, drop: (string | undefined)[] = []): string | undefined {
   if (!formatted) return undefined;
+  const dropped = new Set(drop.filter(Boolean).map((s) => s!.trim().toLowerCase()));
   const kept = formatted
     .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s && !/^india$/i.test(s) && !/^himachal pradesh\b/i.test(s));
+    .map((s) => s.trim().replace(PLUS_CODE, ''))
+    .filter(
+      (s) =>
+        s &&
+        !/^india$/i.test(s) &&
+        !/^himachal pradesh\b/i.test(s) &&
+        !/^\d{6}$/.test(s) &&
+        !dropped.has(s.toLowerCase()),
+    );
   return kept.length ? kept.join(', ') : undefined;
 }
 
@@ -76,6 +87,13 @@ function finish(
   if (tehsil) parts.tehsil = tehsil;
   // Never echo the same name into "City" and "Area".
   if (parts.locality && parts.city && norm(parts.locality) === norm(parts.city)) delete parts.locality;
+  // The street must not repeat what the City, Area and District fields already say.
+  if (parts.street) {
+    // Nothing left (a bare Plus Code, or only names the other fields hold): fall back to the locality, never the code.
+    parts.street =
+      streetFrom(parts.street, [parts.locality, parts.city, parts.district, 'Himachal Pradesh']) ??
+      (PLUS_CODE.test(parts.street.trim()) ? parts.locality ?? parts.city : parts.street);
+  }
   return Object.fromEntries(Object.entries(parts).filter(([, v]) => v)) as AddressParts;
 }
 

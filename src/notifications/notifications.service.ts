@@ -7,10 +7,33 @@ import * as nodemailer from 'nodemailer';
 import { NotificationLogEntity, UserEntity } from '../entities';
 import { EMAIL_TEMPLATES } from './email-templates';
 import { notificationCopy } from './notification-copy';
+import { describeFcmError, parseFcmError } from './fcm-errors';
 import { NotificationData, NotificationEvent } from './notifications.types';
 import { MarkReadDto } from './dto/mark-read.dto';
 
 const PAGE_SIZE = 10;
+
+/** Guest-facing request outcomes go out over the Gmail SMTP transport: Resend's
+ *  shared sender only delivers to Resend-owned test addresses, so a real
+ *  guest's inbox never received these. */
+const SMTP_EMAIL_EVENTS = new Set([
+  'user.welcome',
+  'booking.confirmed',
+  'booking.declined',
+  'booking.payment_receipt',
+  'booking.checkin_confirmed',
+  'booking.requested',
+  'booking.payment_held',
+  'booking.checked_in',
+  'booking.disputed',
+  'dispute.raised_confirmation',
+  'dispute.offer_received',
+  'dispute.offer_accepted',
+  'dispute.offer_rejected',
+  'dispute.escalated',
+  'dispute.resolved',
+  'dispute.appeal_raised',
+]);
 
 export interface NotificationListItem {
   id: string;
@@ -191,7 +214,18 @@ export class NotificationsService {
 
     // Always record an in-app notification inbox entry so notifications appear
     // in the UI /inbox regardless of whether external FCM push tokens are registered.
-    allResults.push({ channel: 'push', status: 'sent' });
+    // Saved before any email/push network call: those can take seconds (SMTP),
+    // and the bell badge / inbox read this row, so it must not wait on them.
+    await this.notificationLog.save(
+      this.notificationLog.create({
+        user_id: userId,
+        event,
+        channel: 'push',
+        status: 'sent',
+        error: null,
+        payload: data as Record<string, unknown>,
+      }),
+    );
 
     if (profile.notif_email && profile.email) {
       allResults.push(await this.sendEmail(profile.email, event, data));
@@ -206,8 +240,7 @@ export class NotificationsService {
       const { results: pushResults, staleTokens } = await this.sendPush(profile.fcm_tokens, title, body, data.link);
       // We already logged the base inbox push entry above; if sendPush had results, we can record them or let staleTokens prune.
       if (staleTokens.length) {
-        const remaining = profile.fcm_tokens.filter((t) => !staleTokens.includes(t));
-        await this.profiles.update({ id: userId }, { fcm_tokens: remaining });
+        await this.pruneTokens(userId, staleTokens);
       }
     }
 
@@ -281,6 +314,10 @@ export class NotificationsService {
       // interchangeable with the same `secure` flag.
       secure: Number(port) === 465,
       auth: { user, pass },
+      // Keep the authenticated connection open and reuse it, instead of a
+      // fresh TCP + TLS + AUTH handshake to Gmail on every code (most of the
+      // multi-second send time).
+      pool: true,
     });
     return this.smtpTransporter;
   }
@@ -294,10 +331,13 @@ export class NotificationsService {
     });
 
     const transporter = this.getSmtpTransporter();
-    const from = this.config.get<string>('SMTP_USER')!;
+    // SMTP_FROM overrides the visible sender (e.g. "Basera <no-reply@basera.in>");
+    // the SMTP server must be allowed to send as that address. Defaults to the
+    // authenticated account, as before.
+    const from = this.config.get<string>('SMTP_FROM') ?? `Basera <${this.config.get<string>('SMTP_USER')!}>`;
 
     try {
-      await transporter.sendMail({ from: `Basera <${from}>`, to, subject, html });
+      await transporter.sendMail({ from, to, subject, html });
     } catch (e: any) {
       throw new Error(e?.message ?? 'Failed to send OTP email via SMTP');
     }
@@ -312,14 +352,25 @@ export class NotificationsService {
     const template = EMAIL_TEMPLATES[event];
     if (!template) return { channel: 'email', status: 'skipped' };
 
-    const resendKey = this.config.get<string>('RESEND_API_KEY');
-    if (!resendKey) return { channel: 'email', status: 'skipped' };
-
     const { subject, html } = template(data, {
       absoluteLink: (link) => this.absoluteLink(link),
       appUrl: this.appUrl,
       logoIconUrl: this.logoIconUrl,
     });
+
+    if (SMTP_EMAIL_EVENTS.has(event)) {
+      try {
+        const from = this.config.get<string>('SMTP_FROM') ?? `Basera <${this.config.get<string>('SMTP_USER')}>`;
+        await this.getSmtpTransporter().sendMail({ from, to, subject, html });
+        return { channel: 'email', status: 'sent' };
+      } catch (e: any) {
+        this.logger.error(`[email] SMTP send failed for event=${event}: ${e?.message ?? e}`);
+        return { channel: 'email', status: 'failed', error: e?.message ?? String(e) };
+      }
+    }
+
+    const resendKey = this.config.get<string>('RESEND_API_KEY');
+    if (!resendKey) return { channel: 'email', status: 'skipped' };
 
     // Falls back to Resend's shared test sender, which works with zero
     // setup, while basera.in (or any real domain) is unverified in the
@@ -383,11 +434,18 @@ export class NotificationsService {
       });
 
       const tokenData = await tokenRes.json();
+      if (!tokenRes.ok || !tokenData.access_token) {
+        // Google's OAuth error is { error, error_description } — safe to log, it
+        // never echoes the assertion or key.
+        this.logger.warn(
+          `[FCM] OAuth token exchange failed: http=${tokenRes.status} error=${tokenData?.error ?? 'n/a'} description="${String(tokenData?.error_description ?? '').slice(0, 200)}"`,
+        );
+      }
       this.fcmToken = tokenData.access_token ?? null;
       this.fcmTokenExpiry = Date.now() + (tokenData.expires_in ?? 3600) * 1000 - 60_000;
       return this.fcmToken;
     } catch (e) {
-      this.logger.error('[FCM] Token fetch failed', e as Error);
+      this.logger.error(`[FCM] Token fetch failed: ${(e as Error)?.name}: ${(e as Error)?.message}`);
       return null;
     }
   }
@@ -397,8 +455,21 @@ export class NotificationsService {
   // the device unregistered, the browser data was cleared, or the token
   // rotated. Without pruning these, profiles.fcm_tokens only ever grows and
   // every future push re-attempts (and re-fails) every dead entry forever.
-  private isUnregistered(errBody: string): boolean {
-    return errBody.includes('UNREGISTERED') || errBody.includes('NotRegistered');
+  // Re-reads the row so a token the browser registered while this push was in
+  // flight is not wiped out by a stale in-memory copy of the array.
+  async pruneTokens(userId: string, staleTokens: string[]): Promise<void> {
+    if (!staleTokens.length) return;
+    try {
+      const row = await this.profiles.findOne({ where: { id: userId }, select: { id: true, fcm_tokens: true } });
+      const current = row?.fcm_tokens ?? [];
+      const remaining = current.filter((t) => !staleTokens.includes(t));
+      if (remaining.length !== current.length) {
+        await this.profiles.update({ id: userId }, { fcm_tokens: remaining });
+        this.logger.log(`[FCM] Pruned ${current.length - remaining.length} dead push token(s) for user ${userId}`);
+      }
+    } catch (e) {
+      this.logger.warn(`[FCM] Pruning dead push tokens failed: ${(e as Error)?.name}: ${(e as Error)?.message}`);
+    }
   }
 
   private async sendPush(
@@ -410,7 +481,10 @@ export class NotificationsService {
     if (!fcmTokens.length) return { results: [], staleTokens: [] };
 
     const bearerToken = await this.getFcmBearerToken();
-    if (!bearerToken) return { results: [{ channel: 'push', status: 'skipped' }], staleTokens: [] };
+    if (!bearerToken) {
+      this.logger.warn('[FCM] Push skipped: no bearer token (FIREBASE_CLIENT_EMAIL/PRIVATE_KEY missing or OAuth failed)');
+      return { results: [{ channel: 'push', status: 'skipped' }], staleTokens: [] };
+    }
 
     const projectId = this.config.get<string>('FIREBASE_PROJECT_ID');
     const fcmUrl = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
@@ -444,13 +518,18 @@ export class NotificationsService {
 
           if (!res.ok) {
             const err = await res.text();
+            const info = parseFcmError(res.status, err);
+            this.logger.warn(`[FCM] Push send failed: ${describeFcmError(info)}${info.tokenDead ? ' (token will be pruned)' : ''}`);
+            // A 401 means our cached bearer is bad; drop it so the next send re-authenticates.
+            if (res.status === 401) this.fcmToken = null;
             return {
-              result: { channel: 'push', status: 'failed', error: err },
-              staleToken: this.isUnregistered(err) ? token : null,
+              result: { channel: 'push', status: 'failed', error: `${info.status || res.status} ${info.errorCode}`.trim() },
+              staleToken: info.tokenDead ? token : null,
             };
           }
           return { result: { channel: 'push', status: 'sent' }, staleToken: null };
         } catch (e: any) {
+          this.logger.warn(`[FCM] Push send threw: ${e?.name}: ${e?.message}`);
           return { result: { channel: 'push', status: 'failed', error: e.message }, staleToken: null };
         }
       }),

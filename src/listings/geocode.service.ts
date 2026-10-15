@@ -140,7 +140,9 @@ export class GeocodeService {
    * for a provider problem: an empty address means "could not read one".
    */
   async reverse(lat: number, lng: number): Promise<ReverseResult> {
-    if (!Number.isFinite(lat) || !Number.isFinite(lng) || !isInsideHimachal(lat, lng)) {
+    // TEST ONLY (CAPTURE_LOCATION_BYPASS): read the address of a pin outside the state too.
+    const bypass = ['true', '1'].includes(String(this.config.get('CAPTURE_LOCATION_BYPASS')));
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || (!bypass && !isInsideHimachal(lat, lng))) {
       throw new BadRequestException('That spot is outside Himachal Pradesh.');
     }
     const key = `rev|${lat.toFixed(4)},${lng.toFixed(4)}`;
@@ -163,6 +165,21 @@ export class GeocodeService {
     if (!value) return { address: '', parts: {}, source: 'none' }; // not cached: retry next time
     this.remember(key, value);
     return value;
+  }
+
+  /**
+   * The district and PIN a pin sits in, for checking it against what the host
+   * typed. Null when no provider could say (the caller fails open).
+   */
+  async reverseCheck(lat: number, lng: number): Promise<{ district?: string; pincode?: string } | null> {
+    try {
+      const r = await this.reverse(lat, lng);
+      if (r.source === 'none') return null;
+      return { district: r.parts.district, pincode: r.parts.pincode };
+    } catch (err) {
+      this.logger.warn(`Reverse check failed: ${(err as Error).message}`);
+      return null;
+    }
   }
 
   private async resolve(

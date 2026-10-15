@@ -548,16 +548,17 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
   describe('POST /api/bookings/:id/approve', () => {
     const approve = (id: string, user = HOST) => api().post(`/api/bookings/${id}/approve`).set('Cookie', as(user));
 
-    it('201: host approves, gets a 4-digit check-in code, guest is notified (code only to host)', async () => {
+    it('201: host approves; no check-in code exists yet (unpaid) and guest is notified', async () => {
       const b = seedBooking(s);
       const res = await approve(b.id);
       expect(res.status).toBe(201);
       expect(res.body).toMatchObject({ success: true, message: 'Booking approved.', status: 'confirmed' });
-      expect(res.body.checkinCode).toMatch(/^\d{4}$/);
-      expect(b).toMatchObject({ status: 'confirmed', checkin_code: res.body.checkinCode });
+      expect(res.body.checkinCode).toBeUndefined();
+      expect(b.status).toBe('confirmed');
+      expect(b.checkin_code).toBeNull();
       expect(s.events.rows.at(-1)).toMatchObject({ from_status: 'requested', to_status: 'confirmed', actor: HOST });
       expect(s.notify).toHaveBeenCalledWith('booking.confirmed', GUEST, expect.not.objectContaining({ checkinCode: expect.anything() }));
-      expect(s.notify).toHaveBeenCalledWith('booking.checkin_code_ready', HOST, expect.objectContaining({ checkinCode: res.body.checkinCode }));
+      expect(s.notify).not.toHaveBeenCalledWith('booking.checkin_code_ready', expect.anything(), expect.anything());
     });
     it('403 for the guest (wrong role) and for a stranger', async () => {
       const b = seedBooking(s);
@@ -669,6 +670,25 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       });
       expect(s.payments.rows[0].cashfree_order_id).toMatch(/^SIMULATED-/);
       expect(s.notify).toHaveBeenCalledWith('booking.payment_held', HOST, expect.anything());
+      // The code is generated only after payment, never put in a notification payload.
+      expect(b.checkin_code).toMatch(/^\d{4}$/);
+      expect(s.notify).toHaveBeenCalledWith('booking.checkin_code_ready', HOST, expect.not.objectContaining({ checkinCode: expect.anything() }));
+    });
+    it('check-in code is visible to the host but never to the guest (list)', async () => {
+      const b = seedBooking(s, { status: 'confirmed', checkin_code: '4821' });
+      const hostList = await api().get('/api/bookings?role=host').set('Cookie', as(HOST));
+      const guestList = await api().get('/api/bookings?role=guest').set('Cookie', as(GUEST));
+      expect(JSON.stringify(guestList.body)).not.toContain('4821');
+      expect(hostList.body.bookings.find((x: any) => x.id === b.id).checkinCode).toBe('4821');
+    });
+    it('locks check-in after 5 wrong codes, even for the right one', async () => {
+      const b = seedBooking(s, { status: 'confirmed', checkin_code: '1234' });
+      s.payments.seed({ booking_id: b.id, status: 'held', amount: 1 });
+      for (let i = 0; i < 5; i++) {
+        expectError(await api().post(`/api/bookings/${b.id}/checkin`).set('Cookie', as(GUEST)).send({ code: '0000' }), 400);
+      }
+      expectError(await api().post(`/api/bookings/${b.id}/checkin`).set('Cookie', as(GUEST)).send({ code: '1234' }), 429);
+      expect(b.status).toBe('confirmed');
     });
     it('403 for the host (only the guest pays) and for a stranger', async () => {
       const b = seedBooking(s, { status: 'confirmed' });

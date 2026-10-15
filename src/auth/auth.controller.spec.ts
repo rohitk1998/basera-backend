@@ -26,6 +26,7 @@ function mockAuthService() {
     verifyEmailOtp: jest.fn(),
     completeSignup: jest.fn(),
     verifyRefreshToken: jest.fn(),
+    rotateSession: jest.fn(),
     revokeRefreshToken: jest.fn(),
     issueSession: jest.fn(async () => ({
       accessToken: jwt.sign({ sub: 'user-1' }, JWT_SECRET),
@@ -199,7 +200,7 @@ describe('AuthController', () => {
         res,
       );
 
-      expect(result).toEqual({ success: true, avatar_url: 'https://cdn.example/avatar.jpg' });
+      expect(result).toEqual({ success: true, avatar_url: 'https://cdn.example/avatar.jpg', userId: 'user-1' });
       expect(auth.issueSession).toHaveBeenCalledWith({ userId: 'user-1', phone: '+91123', firebaseUid: 'uid-1' });
       expect(res.cookie).toHaveBeenCalled();
     });
@@ -239,7 +240,7 @@ describe('AuthController', () => {
 
     it('rejects when there is no refresh token cookie', async () => {
       await expect(controller.refresh(req({}), mockResponse())).rejects.toThrow(UnauthorizedException);
-      expect(auth.verifyRefreshToken).not.toHaveBeenCalled();
+      expect(auth.rotateSession).not.toHaveBeenCalled();
     });
 
     it('rejects when the (expired) access token has no sub claim to identify the user', async () => {
@@ -257,7 +258,7 @@ describe('AuthController', () => {
 
     it('issues a new session when AuthService confirms the refresh token', async () => {
       const accessToken = jwt.sign({ sub: 'user-1' }, JWT_SECRET, { expiresIn: '-1h' });
-      auth.verifyRefreshToken.mockResolvedValue({ id: 'user-1', phone: '+91123' });
+      auth.rotateSession.mockResolvedValue({ accessToken: 'a', refreshToken: 'r', deviceId: 'd' });
       const res = mockResponse();
 
       const result = await controller.refresh(
@@ -269,13 +270,13 @@ describe('AuthController', () => {
       );
 
       expect(result).toEqual({ success: true });
-      expect(auth.verifyRefreshToken).toHaveBeenCalledWith('user-1', 'raw-refresh-token');
+      expect(auth.rotateSession).toHaveBeenCalledWith('user-1', 'raw-refresh-token', undefined);
       expect(res.cookie).toHaveBeenCalled();
     });
 
     it('propagates AuthService rejection (e.g. expired/mismatched refresh token)', async () => {
       const accessToken = jwt.sign({ sub: 'user-1' }, JWT_SECRET, { expiresIn: '-1h' });
-      auth.verifyRefreshToken.mockRejectedValue(new UnauthorizedException('Invalid or expired refresh token'));
+      auth.rotateSession.mockRejectedValue(new UnauthorizedException('Invalid or expired refresh token'));
 
       await expect(
         controller.refresh(

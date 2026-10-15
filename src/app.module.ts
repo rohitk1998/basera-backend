@@ -70,8 +70,12 @@ import { AttractionsModule } from './attractions/attractions.module';
         // endpoint on whatever unlucky request needed a fresh connection.
         extra: {
           max: config.get<number>('DB_POOL_MAX') ?? 10,
-          idleTimeoutMillis: 30_000,
-          connectionTimeoutMillis: 8_000,
+          // Recycle idle sockets before the pooler / NAT drops them (the source
+          // of "Connection terminated unexpectedly" on the first query after a lull).
+          idleTimeoutMillis: 10_000,
+          // 5s, not 8s: listings searches retry once on a transient connect
+          // failure, so 8s x 2 would outlast the proxy in front of us.
+          connectionTimeoutMillis: 5_000,
           // Notice a pooler that has dropped an idle connection instead of
           // handing the dead socket to the next request.
           keepAlive: true,

@@ -4,6 +4,7 @@ import {
   Controller,
   Get,
   Param,
+  ParseUUIDPipe,
   Post,
   Query,
   UploadedFiles,
@@ -11,6 +12,7 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
+import { Throttle } from '@nestjs/throttler';
 import { AuthGuard } from '../auth/auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/types';
@@ -52,8 +54,13 @@ export class BookingsController {
     });
   }
 
+  // A non-UUID id (e.g. the unknown path /api/bookings/mine) can't be a booking:
+  // 404 here instead of letting Postgres reject the cast as a 500.
   @Get(':id')
-  getById(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+  getById(
+    @CurrentUser() user: AuthUser,
+    @Param('id', new ParseUUIDPipe({ errorHttpStatusCode: 404 })) id: string,
+  ) {
     return this.bookingsService.getById(user.userId, id);
   }
 
@@ -82,6 +89,7 @@ export class BookingsController {
   }
 
   @ResponseMessage('Check-in confirmed.')
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
   @Post(':id/checkin')
   checkin(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CheckinBookingDto) {
     return this.bookingsService.checkin(user.userId, id, dto.code);

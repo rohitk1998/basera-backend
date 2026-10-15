@@ -159,6 +159,7 @@ export class PaymentsService {
         'payment.id AS id',
         'payment.amount AS amount',
         'payment.status AS status',
+        'payment.split_amount_to_guest AS "splitAmountToGuest"',
         'payment.cashfree_order_id AS "cashfreeOrderId"',
         'payment.cashfree_payout_id AS "cashfreePayoutId"',
         'payment.created_at AS "createdAt"',
@@ -166,6 +167,7 @@ export class PaymentsService {
         'booking.id AS "bookingId"',
         'booking.move_in AS "moveIn"',
         'booking.move_out AS "moveOut"',
+        'booking.actual_move_out AS "actualMoveOut"',
         "listing.draft_data->'property_details'->>'title' AS \"listingTitle\"",
       ]);
 
@@ -187,6 +189,9 @@ export class PaymentsService {
         id: row.id,
         amount: row.amount,
         status: row.status,
+        // Only for `split`: what the guest got back, and what the host was paid.
+        refundedAmount: row.status === 'split' ? row.splitAmountToGuest : null,
+        hostAmount: row.status === 'split' ? row.amount - row.splitAmountToGuest : null,
         cashfreeOrderId: row.cashfreeOrderId,
         cashfreePayoutId: row.cashfreePayoutId,
         createdAt: row.createdAt,
@@ -194,6 +199,7 @@ export class PaymentsService {
         bookingId: row.bookingId,
         moveIn: row.moveIn,
         moveOut: row.moveOut,
+        actualMoveOut: row.actualMoveOut,
         listingTitle: row.listingTitle || 'Listing',
       })),
     };

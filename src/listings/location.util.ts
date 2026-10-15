@@ -57,17 +57,42 @@ export function upgradeLegacyLocation<T>(body: T): T {
  * Pradesh. The pin is what the walkthrough video's GPS is checked against, so
  * it must be a real spot in the state.
  */
-export function assertLocationIsValid(d: { district: string; tehsil: string; lat: number; lng: number }): void {
+export function assertLocationIsValid(
+  d: { district: string; tehsil: string; lat: number; lng: number },
+  opts: { skipPinRegion?: boolean } = {},
+): void {
   if (!(HP_DISTRICTS as readonly string[]).includes(d.district)) {
     throw new BadRequestException('Choose a district in Himachal Pradesh.');
   }
   if (!isTehsilOf(d.district, d.tehsil)) {
     throw new BadRequestException(`Choose a tehsil that belongs to ${d.district} district.`);
   }
-  if (!isInsideHimachal(d.lat, d.lng)) {
+  // TEST ONLY (CAPTURE_LOCATION_BYPASS): lets a pin outside the state through.
+  if (!opts.skipPinRegion && !isInsideHimachal(d.lat, d.lng)) {
     throw new BadRequestException(
       'The pin is outside Himachal Pradesh. Move it onto the property, or use "Find on map".',
     );
+  }
+}
+
+/**
+ * The chosen district and PIN must agree with what the pin reverse-geocodes
+ * to. Advisory data: when the geocoder has nothing, or is missing a field, that
+ * part is not checked (fails open). Skipped entirely under the test bypass.
+ */
+export async function assertLocationAgrees(
+  d: { district: string; pincode: string; lat: number; lng: number },
+  reverseCheck: (lat: number, lng: number) => Promise<{ district?: string; pincode?: string } | null>,
+  opts: { skip?: boolean } = {},
+): Promise<void> {
+  if (opts.skip) return;
+  const found = await reverseCheck(d.lat, d.lng);
+  if (!found) return;
+  if (found.district && found.district !== d.district) {
+    throw new BadRequestException(`The pin is in ${found.district} district, but you chose ${d.district}. Move the pin or change the district.`);
+  }
+  if (found.pincode && found.pincode !== d.pincode) {
+    throw new BadRequestException(`The pin is in PIN code area ${found.pincode}, but you entered ${d.pincode}. Check the PIN code.`);
   }
 }
 

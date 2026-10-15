@@ -2,6 +2,8 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -10,15 +12,17 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, LessThanOrEqual, Repository } from 'typeorm';
-import { randomInt, randomUUID } from 'crypto';
+import { DataSource, EntityManager, In, LessThanOrEqual, Repository } from 'typeorm';
+import { randomInt, randomUUID, timingSafeEqual } from 'crypto';
 import {
   BookingEntity,
   BookingEventEntity,
   ListingEntity,
+  PaymentEntity,
   UserEntity,
 } from '../entities';
 import { agreeTerms } from '../common/domain';
+import { calendarDayNumber, calendarDayToISO, todayDayNumber, todayDayNumberIST } from '../common/calendar-date.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SupabaseProvider } from '../auth/supabase.provider';
@@ -26,6 +30,12 @@ import { assertKycVerified } from '../user/verification-gate.util';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { DisputeBookingDto } from './dto/dispute-booking.dto';
 import { ReviewEntity, DisputeCaseEntity, DisputeEventEntity, VerificationRequestEntity } from '../entities';
+
+/** How a resolved dispute's payment was divided; null until a dispute settles. */
+function splitResolution(payment: PaymentEntity | undefined | null) {
+  if (!payment || payment.status !== 'split' || payment.split_amount_to_guest == null) return null;
+  return { amountToGuest: payment.split_amount_to_guest, amountToHost: payment.amount - payment.split_amount_to_guest };
+}
 
 type UploadedMulterFile = { buffer: Buffer; mimetype: string; size: number };
 
@@ -40,15 +50,24 @@ const EVIDENCE_MAX_BYTES = 5 * 1024 * 1024;
  *  a hard, small cap rather than an open-ended round count, so no separate
  *  timer/scheduler is needed just to bound how long negotiation can run. */
 const NEGOTIATION_ROUNDS_CAP = 3;
-/** A negotiating case with no reply in this long auto-escalates to admin —
- *  piggybacks on the existing release-scheduler's cron tick rather than
- *  standing up a second scheduler for one query. */
+/** A case with no reply in this long auto-escalates to admin — covers both a
+ *  negotiating case gone quiet and an `open` one the host never answered
+ *  (this is also the host's response deadline). Piggybacks on the existing
+ *  release-scheduler's cron tick rather than standing up a second
+ *  scheduler for one query. */
 const NEGOTIATION_STALE_HOURS = 48;
 /** No human actor for an auto-escalated dispute_events row — actor_id has
  *  no FK (unlike booking_events.actor, which does, to profiles), but a
  *  real-looking-but-fake uuid would be misleading in the data; the
  *  all-zeros nil UUID reads unambiguously as "not a real user" instead. */
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+
+/** A 4-digit code has only 10,000 values, so wrong guesses are capped per
+ *  booking: after this many misses the booking is locked for the lockout
+ *  window. In-memory (per process) — enough to stop online brute force from
+ *  one instance; move to Redis if the API is ever scaled out. */
+const CHECKIN_MAX_FAILED_ATTEMPTS = 5;
+const CHECKIN_LOCKOUT_MS = 15 * 60 * 1000;
 
 const ESCROW_HOLD_HOURS = 5 / 60; // 5 minutes for testing
 
@@ -64,9 +83,18 @@ function generateCheckinCode(): string {
   return String(randomInt(0, 10000)).padStart(4, '0');
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** "2026-11-01" -> "1 Nov 2026", straight from the string so no timezone can shift it. */
+function formatCalendarDate(iso: string): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  return `${d} ${MONTHS[m - 1]} ${y}`;
+}
+
 @Injectable()
 export class BookingsService {
   private readonly logger = new Logger(BookingsService.name);
+  private readonly checkinFailures = new Map<string, { count: number; lockedUntil: number }>();
 
   constructor(
     @InjectRepository(BookingEntity)
@@ -100,7 +128,7 @@ export class BookingsService {
     bookingId: string,
     fromStatus: string | null,
     toStatus: string,
-    actor: string,
+    actor: string | null,
     manager?: EntityManager,
   ): Promise<void> {
     const repo = manager ? manager.getRepository(BookingEventEntity) : this.bookingEventsRepo;
@@ -153,27 +181,26 @@ export class BookingsService {
     // host-listings.service.ts submitFull().
     assertKycVerified(requestingProfile, { identity: { status: latestIdentity?.status ?? 'not_started' } });
 
-    const moveInDate = new Date(dto.moveIn);
-    const moveOutDate = new Date(dto.moveOut);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Calendar dates, compared as day numbers — no timezone conversion.
+    const moveInDay = calendarDayNumber(dto.moveIn);
+    const moveOutDay = calendarDayNumber(dto.moveOut);
 
-    if (isNaN(moveInDate.getTime()) || isNaN(moveOutDate.getTime())) {
+    if (isNaN(moveInDay) || isNaN(moveOutDay)) {
       throw new BadRequestException('Invalid date format.');
     }
-    if (moveInDate < today) {
+    if (moveInDay < todayDayNumber()) {
       throw new BadRequestException('Move-in date cannot be in the past.');
     }
-    if (moveOutDate <= moveInDate) {
+    if (moveOutDay <= moveInDay) {
       throw new BadRequestException('Move-out date must be after move-in date.');
     }
 
     const overlapping = await this.bookingsRepo
       .createQueryBuilder('b')
       .where('b.listing_id = :listingId', { listingId: dto.listingId })
-      .andWhere('b.status IN (:...statuses)', { statuses: ['confirmed', 'approved', 'checked_in', 'completed', 'checked_out'] })
+      .andWhere('b.status IN (:...statuses)', { statuses: ['confirmed', 'approved', 'checked_in', 'disputed', 'completed', 'checked_out'] })
       .andWhere('b.move_in < :moveOut', { moveOut: dto.moveOut })
-      .andWhere('b.move_out > :moveIn', { moveIn: dto.moveIn })
+      .andWhere('COALESCE(b.actual_move_out, b.move_out) > :moveIn', { moveIn: dto.moveIn })
       .getOne();
 
     if (overlapping) {
@@ -291,7 +318,7 @@ export class BookingsService {
       moveIn: dto.moveIn,
       pushTitle: `New booking request for ${listingTitle}`,
       pushBody: `${guestProfile?.full_name ?? 'A guest'} wants to stay from ${dto.moveIn}`,
-      link: '/host/bookings',
+      link: '/host?tab=bookings',
     });
 
     return { success: true, id: bookingId, status: 'requested' as const };
@@ -351,6 +378,8 @@ export class BookingsService {
       status: row.status,
       moveIn: row.move_in,
       moveOut: row.move_out,
+      actualMoveOut: row.actual_move_out,
+      resolution: splitResolution(paymentsByBookingId.get(row.id)),
       days: row.months,
       adults: row.adults,
       children: row.children,
@@ -363,7 +392,8 @@ export class BookingsService {
       grossBookingAmount: row.gross_booking_amount,
       platformCommission: row.platform_commission,
       hostPayoutAmount: row.host_payout_amount,
-      checkinCode: row.checkin_code,
+      // Host-only: the guest proves presence by entering it, so must never read it.
+      checkinCode: role === 'host' ? row.checkin_code : null,
       checkinTime: row.checkin_time,
       escrowReleaseTime: row.escrow_release_time,
       rejectionReason: row.rejection_reason,
@@ -404,6 +434,8 @@ export class BookingsService {
       status: row.status,
       moveIn: row.move_in,
       moveOut: row.move_out,
+      actualMoveOut: row.actual_move_out,
+      resolution: splitResolution(payment),
       days: row.months,
       adults: row.adults,
       children: row.children,
@@ -417,7 +449,8 @@ export class BookingsService {
       platformCommission: row.platform_commission,
       hostPayoutAmount: row.host_payout_amount,
       rejectionReason: row.rejection_reason,
-      checkinCode: row.checkin_code,
+      // Host-only, see list().
+      checkinCode: row.host_id === userId ? row.checkin_code : null,
       checkinTime: row.checkin_time,
       escrowReleaseTime: row.escrow_release_time,
       paymentStatus: payment?.status ?? null,
@@ -432,15 +465,13 @@ export class BookingsService {
    * `approved` state open for, so a single host action is both the approval
    * and the confirmation.
    *
-   * Also generates the check-in OTP here, for the HOST — this is the
-   * physical-presence check: the guest can only learn the code by actually
-   * showing up and getting it from the host in person, and it's the guest
-   * who submits it back (see checkin()) to prove they reached the property.
+   * No check-in OTP exists yet: it is generated in pay(), once payment is
+   * held, so an unpaid booking never has a code.
    */
   async approve(userId: string, id: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, host_id: true, guest_id: true, listing_id: true, move_in: true, checkin_code: true },
+      select: { status: true, host_id: true, guest_id: true, listing_id: true, move_in: true },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -452,11 +483,9 @@ export class BookingsService {
       throw new ConflictException(`Cannot approve a booking in status "${booking.status}"`);
     }
 
-    const checkinCode = booking.checkin_code ?? generateCheckinCode();
-
     const updateRes = await this.bookingsRepo.update(
       { id, status: 'requested' },
-      { status: 'confirmed', checkin_code: checkinCode, updated_at: new Date() },
+      { status: 'confirmed', updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
@@ -475,21 +504,12 @@ export class BookingsService {
       listingTitle,
       hostName,
       moveIn: booking.move_in,
-      pushTitle: 'Booking confirmed',
-      pushBody: `${hostName} confirmed your stay at ${listingTitle}`,
-      link: '/messages',
+      pushTitle: 'Booking approved',
+      pushBody: `${hostName} approved your request for ${listingTitle} — complete payment to secure it`,
+      link: '/stays',
     });
 
-    // Host-only notification carrying the OTP — never sent to the guest.
-    this.notifications.notify('booking.checkin_code_ready', booking.host_id, {
-      listingTitle,
-      checkinCode,
-      pushTitle: 'Check-in code ready',
-      pushBody: `Your guest's check-in code for ${listingTitle} is ${checkinCode} — give it to them in person on arrival`,
-      link: '/host/bookings',
-    });
-
-    return { success: true, status: 'confirmed' as const, checkinCode };
+    return { success: true, status: 'confirmed' as const };
   }
 
   /** Host declines a request. Only valid while it is still `requested`. */
@@ -567,7 +587,7 @@ export class BookingsService {
       listingTitle,
       pushTitle: 'Booking cancelled',
       pushBody: `The booking for ${listingTitle} has been cancelled`,
-      link: userId === booking.guest_id ? '/host/bookings' : '/stays',
+      link: userId === booking.guest_id ? '/host?tab=bookings' : '/stays',
     });
 
     return { success: true, status: 'cancelled' as const };
@@ -590,6 +610,8 @@ export class BookingsService {
         host_id: true,
         listing_id: true,
         due_at_move_in: true,
+        move_in: true,
+        move_out: true,
         host_payout_amount: true,
         platform_commission: true,
       },
@@ -626,6 +648,14 @@ export class BookingsService {
       platformCommission: booking.platform_commission,
     });
 
+    // Generated only now that payment is held, and readable by the HOST only
+    // (list()/getById() withhold it from the guest). The guest learns it by
+    // meeting the host, and submits it back in checkin().
+    await this.bookingsRepo.update(
+      { id, status: 'confirmed' },
+      { checkin_code: generateCheckinCode(), updated_at: new Date() },
+    );
+
     const listing = await this.listingsRepo.findOne({
       where: { id: booking.listing_id },
       select: { draft_data: true },
@@ -636,7 +666,28 @@ export class BookingsService {
       listingTitle,
       pushTitle: 'Payment received and held',
       pushBody: `Payment for ${listingTitle} is held — your guest is on their way`,
-      link: '/host/bookings',
+      link: '/host?tab=bookings',
+    });
+
+    // Guest receipt. Deliberately carries no check-in code — the code is
+    // host-only and this payload is persisted in notification_log.
+    this.notifications.notify('booking.payment_receipt', booking.guest_id, {
+      listingTitle,
+      moveIn: booking.move_in,
+      moveOut: booking.move_out,
+      amount: booking.due_at_move_in,
+      pushTitle: 'Payment received',
+      pushBody: `Your payment for ${listingTitle} is held by Basera until 24 hours after check-in`,
+      link: '/settings?tab=bookings',
+    });
+
+    // Tells the host the code is ready; the code itself is not in the payload
+    // (it would land in notification_log) — the host reads it on /host/bookings.
+    this.notifications.notify('booking.checkin_code_ready', booking.host_id, {
+      listingTitle,
+      pushTitle: 'Check-in code ready',
+      pushBody: `Your guest's check-in code for ${listingTitle} is ready — give it to them in person on arrival`,
+      link: '/host?tab=bookings',
     });
 
     return { success: true, status: 'confirmed' as const };
@@ -653,7 +704,7 @@ export class BookingsService {
   async checkin(userId: string, id: string, code: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, checkin_code: true },
+      select: { status: true, guest_id: true, host_id: true, listing_id: true, checkin_code: true, move_in: true, move_out: true },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -668,9 +719,39 @@ export class BookingsService {
     if (!payment || payment.status !== 'held') {
       throw new ConflictException('Payment must be completed before check-in.');
     }
-    if (!booking.checkin_code || booking.checkin_code !== code) {
+    // Calendar-day window in India time. Rejected before the code is even
+    // looked at, so an early attempt never counts toward the lockout.
+    const today = todayDayNumberIST();
+    if (today < calendarDayNumber(booking.move_in)) {
+      throw new BadRequestException(`Check-in opens on ${formatCalendarDate(booking.move_in)}.`);
+    }
+    if (today > calendarDayNumber(booking.move_out)) {
+      throw new BadRequestException(`Check-in is closed — this stay ended on ${formatCalendarDate(booking.move_out)}.`);
+    }
+    const failure = this.checkinFailures.get(id);
+    if (failure && failure.lockedUntil > Date.now()) {
+      const retryAfterSeconds = Math.ceil((failure.lockedUntil - Date.now()) / 1000);
+      const minutes = Math.ceil(retryAfterSeconds / 60);
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          message: `Too many attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+          retryAfterSeconds,
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    const expected = booking.checkin_code ? Buffer.from(booking.checkin_code) : null;
+    const given = Buffer.from(code);
+    if (!expected || expected.length !== given.length || !timingSafeEqual(expected, given)) {
+      const count = (failure && failure.count < CHECKIN_MAX_FAILED_ATTEMPTS ? failure.count : 0) + 1;
+      this.checkinFailures.set(id, {
+        count,
+        lockedUntil: count >= CHECKIN_MAX_FAILED_ATTEMPTS ? Date.now() + CHECKIN_LOCKOUT_MS : 0,
+      });
       throw new BadRequestException('That check-in code is incorrect.');
     }
+    this.checkinFailures.delete(id);
 
     const now = new Date();
     const escrowReleaseTime = new Date(now.getTime() + ESCROW_HOLD_HOURS * 60 * 60 * 1000);
@@ -696,7 +777,16 @@ export class BookingsService {
       guestName,
       pushTitle: 'Guest checked in',
       pushBody: `${guestName} checked in at ${listingTitle} — payout in 24h unless disputed`,
-      link: '/host/bookings',
+      link: '/host?tab=bookings',
+    });
+
+    this.notifications.notify('booking.checkin_confirmed', booking.guest_id, {
+      listingTitle,
+      checkinTime: now.toISOString(),
+      escrowReleaseTime: escrowReleaseTime.toISOString(),
+      pushTitle: 'Check-in confirmed',
+      pushBody: `You are checked in at ${listingTitle}`,
+      link: '/settings?tab=bookings',
     });
 
     return { success: true, status: 'checked_in' as const, escrowReleaseTime };
@@ -710,7 +800,7 @@ export class BookingsService {
   async dispute(userId: string, id: string, dto: DisputeBookingDto) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, escrow_release_time: true },
+      select: { status: true, guest_id: true, host_id: true, listing_id: true, escrow_release_time: true, move_out: true },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -721,12 +811,26 @@ export class BookingsService {
     if (booking.status !== 'checked_in') {
       throw new ConflictException(`Cannot dispute a booking in status "${booking.status}"`);
     }
+    if (dto.category === 'early_departure') {
+      const leavingDay = calendarDayNumber(dto.leavingOn ?? '');
+      if (isNaN(leavingDay)) {
+        throw new BadRequestException('Choose the date you are leaving.');
+      }
+      if (leavingDay < todayDayNumberIST()) {
+        throw new BadRequestException('Leaving date cannot be in the past.');
+      }
+      if (leavingDay >= calendarDayNumber(booking.move_out)) {
+        throw new BadRequestException('Leaving date must be before the move-out date.');
+      }
+    }
     if (booking.escrow_release_time && booking.escrow_release_time.getTime() <= Date.now()) {
       throw new ConflictException('The dispute window for this booking has closed.');
     }
 
     const payment = await this.payments.getForBooking(id);
-    if (payment && dto.requestedAmount > payment.amount) {
+    // Optional only for early_departure (no amount requested = 0 on the case).
+    const requestedAmount = dto.requestedAmount ?? 0;
+    if (payment && requestedAmount > payment.amount) {
       throw new BadRequestException('Requested amount cannot exceed the amount paid.');
     }
 
@@ -752,7 +856,8 @@ export class BookingsService {
           booking_id: id,
           category: dto.category,
           description: dto.description,
-          requested_amount: dto.requestedAmount,
+          requested_amount: requestedAmount,
+          leaving_on: dto.category === 'early_departure' ? dto.leavingOn : null,
           evidence_urls: [],
           case_status: 'open',
         }),
@@ -762,7 +867,7 @@ export class BookingsService {
         actor_id: userId,
         actor_role: 'guest',
         event_type: 'claim_raised',
-        offer_amount: dto.requestedAmount,
+        offer_amount: dto.requestedAmount ?? null,
         message: dto.description,
       });
 
@@ -781,7 +886,11 @@ export class BookingsService {
       guestName,
       pushTitle: 'Dispute raised',
       pushBody: `${guestName} raised a dispute for ${listingTitle} — Basera is reviewing`,
-      link: '/host/bookings',
+      link: '/host?tab=bookings',
+    });
+    this.notifications.notify('dispute.raised_confirmation', booking.guest_id, {
+      listingTitle,
+      link: '/settings?tab=bookings',
     });
 
     return { success: true, status: 'disputed' as const, disputeCaseId: disputeCase.id };
@@ -792,7 +901,7 @@ export class BookingsService {
   private async requireDisputeCase(userId: string, bookingId: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id: bookingId },
-      select: { guest_id: true, host_id: true, listing_id: true },
+      select: { guest_id: true, host_id: true, listing_id: true, move_in: true, move_out: true },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -811,11 +920,37 @@ export class BookingsService {
    *  evidence, and the whole negotiation/decision timeline. */
   async getDisputeCase(userId: string, bookingId: string) {
     const { disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
+    return { success: true, viewerRole, ...(await this.loadDisputeTimeline(disputeCase)) };
+  }
+
+  /** Same payload for an admin, who is neither guest nor host of the booking
+   *  (requireDisputeCase would 403 them) — the caller must already be
+   *  admin-guarded. */
+  async getDisputeCaseForAdmin(bookingId: string) {
+    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    if (!disputeCase) {
+      throw new NotFoundException('No dispute found for this booking');
+    }
+    return { success: true, viewerRole: 'admin' as const, ...(await this.loadDisputeTimeline(disputeCase)) };
+  }
+
+  private async loadDisputeTimeline(disputeCase: DisputeCaseEntity) {
     const events = await this.disputeEventsRepo.find({
       where: { dispute_case_id: disputeCase.id },
       order: { created_at: 'ASC' },
     });
-    return { success: true, viewerRole, case: disputeCase, events };
+    // The clock the scheduler escalates on: an unanswered `open` case runs
+    // from when it was raised, a negotiating one from its last activity.
+    const clockStart =
+      disputeCase.case_status === 'open'
+        ? disputeCase.created_at
+        : disputeCase.case_status === 'negotiating'
+          ? disputeCase.updated_at
+          : null;
+    const responseDeadline = clockStart
+      ? new Date(new Date(clockStart).getTime() + NEGOTIATION_STALE_HOURS * 60 * 60 * 1000).toISOString()
+      : null;
+    return { case: disputeCase, events, responseDeadline };
   }
 
   /** Either party may attach more evidence to an already-open case — this
@@ -894,6 +1029,10 @@ export class BookingsService {
     if (lastOfferRole === viewerRole) {
       throw new ConflictException('Waiting on the other party — not your turn to offer.');
     }
+    // The host always makes the first offer; a guest can only counter one.
+    if (viewerRole === 'guest' && lastOfferRole === null) {
+      throw new ForbiddenException('Only the host can make the first offer.');
+    }
 
     const eventType = viewerRole === 'host' ? (lastOfferRole === null ? 'host_offer' : 'host_counter') : 'guest_counter';
 
@@ -915,7 +1054,8 @@ export class BookingsService {
     const recipient = viewerRole === 'host' ? booking.guest_id : booking.host_id;
     this.notifications.notify('dispute.offer_received', recipient, {
       listingTitle,
-      link: viewerRole === 'host' ? '/account/transactions' : '/host/bookings',
+      offerAmount: amountToGuest,
+      link: viewerRole === 'host' ? '/settings?tab=bookings' : '/host?tab=bookings',
     });
 
     return { success: true, caseStatus: 'negotiating' as const };
@@ -944,7 +1084,10 @@ export class BookingsService {
       }
 
       await this.payments.splitRelease(bookingId, lastOffer.offer_amount);
-      await this.bookingsRepo.update({ id: bookingId, status: 'disputed' }, { status: 'completed', updated_at: new Date() });
+      await this.bookingsRepo.update(
+        { id: bookingId, status: 'disputed' },
+        { status: 'completed', actual_move_out: this.resolvedStayEnd(booking.move_in, booking.move_out, disputeCase), updated_at: new Date() },
+      );
       await this.recordEvent(bookingId, 'disputed', 'completed', userId);
       await this.disputeEventsRepo.insert({
         dispute_case_id: disputeCase.id,
@@ -966,11 +1109,19 @@ export class BookingsService {
       const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
       const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
       const otherParty = viewerRole === 'guest' ? booking.host_id : booking.guest_id;
-      this.notifications.notify('booking.completed', otherParty, {
+      const amounts = await this.disputeAmounts(bookingId, lastOffer.offer_amount);
+      const linkFor = (role: 'guest' | 'host') => (role === 'host' ? '/host?tab=bookings' : '/settings?tab=bookings');
+      this.notifications.notify('dispute.offer_accepted', otherParty, {
         listingTitle,
-        pushTitle: 'Dispute resolved',
-        pushBody: `The dispute for ${listingTitle} was settled directly between you and the other party`,
-        link: viewerRole === 'guest' ? '/host/bookings' : `/stays/${booking.listing_id}`,
+        ...amounts,
+        decidedBy: 'negotiation',
+        link: linkFor(viewerRole === 'guest' ? 'host' : 'guest'),
+      });
+      this.notifications.notify('dispute.resolved', userId, {
+        listingTitle,
+        ...amounts,
+        decidedBy: 'negotiation',
+        link: linkFor(viewerRole),
       });
 
       return { success: true, caseStatus: 'resolved' as const };
@@ -987,33 +1138,69 @@ export class BookingsService {
 
     const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
     const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
-    this.notifications.notify('dispute.escalated', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
-      listingTitle,
-      link: '/host/bookings',
-    });
+    if (action === 'reject') {
+      this.notifications.notify('dispute.offer_rejected', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
+        listingTitle,
+        link: viewerRole === 'guest' ? '/host?tab=bookings' : '/settings?tab=bookings',
+      });
+    }
+    this.notifyDisputeEscalated(booking, listingTitle);
 
     return { success: true, caseStatus: 'escalated' as const };
   }
 
-  /** A negotiating case with no activity in NEGOTIATION_STALE_HOURS forces
-   *  to admin — called from the same cron tick as releaseExpiredHolds
-   *  rather than a second scheduler for one query. */
+  /** Escalation email + inbox entry to both sides, each with their own link. */
+  private notifyDisputeEscalated(booking: { guest_id: string; host_id: string }, listingTitle: string): void {
+    this.notifications.notify('dispute.escalated', booking.guest_id, { listingTitle, link: '/settings?tab=bookings' });
+    this.notifications.notify('dispute.escalated', booking.host_id, { listingTitle, link: '/host?tab=bookings' });
+  }
+
+  /** Refund/payout split for a resolution email. Read-only: the paid amount is
+   *  the same `payment.amount` splitRelease validates `amountToGuest` against. */
+  private async disputeAmounts(bookingId: string, amountToGuest: number) {
+    // Best effort: the resolution is already committed, so a failed lookup
+    // only drops the host amount from the email rather than failing the call.
+    let payment: Awaited<ReturnType<PaymentsService['getForBooking']>> = null;
+    try {
+      payment = await this.payments.getForBooking(bookingId);
+    } catch (err) {
+      this.logger.warn(`[disputeAmounts] payment lookup failed for booking ${bookingId}: ${String(err)}`);
+    }
+    return {
+      amountToGuest,
+      amountToHost: payment ? Math.max(0, payment.amount - amountToGuest) : undefined,
+    };
+  }
+
+  /** A case with no activity in NEGOTIATION_STALE_HOURS forces to admin —
+   *  negotiating ones from their last activity, `open` ones (host never
+   *  replied) from when they were raised. Called from the same cron tick as
+   *  releaseExpiredHolds rather than a second scheduler for one query. */
   async escalateStaleNegotiations(): Promise<number> {
     const staleBefore = new Date(Date.now() - NEGOTIATION_STALE_HOURS * 60 * 60 * 1000);
     const stale = await this.disputeCasesRepo.find({
-      where: { case_status: 'negotiating' },
-      select: { id: true, updated_at: true },
+      where: [{ case_status: 'negotiating' }, { case_status: 'open' }],
+      select: { id: true, booking_id: true, case_status: true, created_at: true, updated_at: true },
     });
-    const due = stale.filter((c) => c.updated_at <= staleBefore);
+    const due = stale.filter((c) => (c.case_status === 'open' ? c.created_at : c.updated_at) <= staleBefore);
     for (const c of due) {
       await this.disputeEventsRepo.insert({
         dispute_case_id: c.id,
         actor_id: NIL_UUID,
         actor_role: 'system',
         event_type: 'escalated',
-        message: 'Auto-escalated after no activity',
+        message:
+          c.case_status === 'open' ? 'Auto-escalated: the host did not respond in time' : 'Auto-escalated after no activity',
       });
       await this.disputeCasesRepo.update({ id: c.id }, { case_status: 'escalated', updated_at: new Date() });
+      const staleBooking = await this.bookingsRepo.findOne({
+        where: { id: c.booking_id },
+        select: { guest_id: true, host_id: true, listing_id: true },
+      });
+      if (staleBooking) {
+        const staleListing = await this.listingsRepo.findOne({ where: { id: staleBooking.listing_id }, select: { draft_data: true } });
+        this.notifyDisputeEscalated(staleBooking, (staleListing?.draft_data as any)?.property_details?.title ?? 'the listing');
+      }
     }
     if (due.length > 0) {
       this.logger.log(`[escalateStaleNegotiations] escalated ${due.length} stale negotiation(s)`);
@@ -1048,7 +1235,7 @@ export class BookingsService {
     const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     this.notifications.notify('dispute.appeal_raised', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
       listingTitle,
-      link: '/host/bookings',
+      link: viewerRole === 'guest' ? '/host?tab=bookings' : '/settings?tab=bookings',
     });
 
     return { success: true, caseStatus: 'appealed' as const };
@@ -1065,21 +1252,24 @@ export class BookingsService {
       where: { id },
       select: { status: true, guest_id: true, host_id: true, listing_id: true },
     });
-    if (!booking || booking.status !== 'checked_in') {
+    // `checked_out` too: a guest (or host) who checks out inside the hold window
+    // still has an unreleased payment, paid out at the same escrow_release_time.
+    if (!booking || (booking.status !== 'checked_in' && booking.status !== 'checked_out')) {
       return;
     }
+    const fromStatus = booking.status;
 
     await this.payments.release(id);
 
     const updateRes = await this.bookingsRepo.update(
-      { id, status: 'checked_in' },
+      { id, status: fromStatus },
       { status: 'completed', updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
       this.logger.warn(`[releaseHold] booking ${id} status changed during release`);
       return;
     }
-    await this.recordEvent(id, 'checked_in', 'completed', 'system');
+    await this.recordEvent(id, fromStatus, 'completed', null);
 
     const listing = await this.listingsRepo.findOne({
       where: { id: booking.listing_id },
@@ -1098,16 +1288,33 @@ export class BookingsService {
   /** Batch entry point for the scheduler — finds every booking past its hold window and releases each. */
   async releaseExpiredHolds(): Promise<number> {
     const due = await this.bookingsRepo.find({
-      where: { status: 'checked_in', escrow_release_time: LessThanOrEqual(new Date()) },
+      where: { status: In(['checked_in', 'checked_out']), escrow_release_time: LessThanOrEqual(new Date()) },
       select: { id: true },
     });
     for (const row of due) {
-      await this.releaseHold(row.id);
+      // One failing booking must not stop the rest of the batch.
+      try {
+        await this.releaseHold(row.id);
+      } catch (err) {
+        this.logger.error(`[releaseExpiredHolds] booking ${row.id} failed`, err as Error);
+      }
     }
     if (due.length > 0) {
       this.logger.log(`[releaseExpiredHolds] released ${due.length} booking(s)`);
     }
     return due.length;
+  }
+
+  /**
+   * The day a disputed stay really ends once it resolves. An early-departure
+   * case uses the guest's chosen leaving date; any other dispute ends the
+   * stay today (IST). Always clamped into [move_in, move_out] so a stay is
+   * never extended and never ends before it began.
+   */
+  private resolvedStayEnd(moveIn: string, moveOut: string, disputeCase: DisputeCaseEntity): string {
+    const wanted = disputeCase.leaving_on ? calendarDayNumber(disputeCase.leaving_on) : todayDayNumberIST();
+    const end = Math.min(calendarDayNumber(moveOut), Math.max(calendarDayNumber(moveIn), isNaN(wanted) ? todayDayNumberIST() : wanted));
+    return calendarDayToISO(end);
   }
 
   /**
@@ -1121,7 +1328,7 @@ export class BookingsService {
   async resolveDispute(adminUserId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
     const booking = await this.bookingsRepo.findOne({
       where: { id: bookingId },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true },
+      select: { status: true, guest_id: true, host_id: true, listing_id: true, move_in: true, move_out: true },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -1138,7 +1345,7 @@ export class BookingsService {
 
     const updateRes = await this.bookingsRepo.update(
       { id: bookingId, status: 'disputed' },
-      { status: 'completed', updated_at: new Date() },
+      { status: 'completed', actual_move_out: this.resolvedStayEnd(booking.move_in, booking.move_out, disputeCase), updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
@@ -1163,17 +1370,20 @@ export class BookingsService {
     });
     const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
 
-    this.notifications.notify('booking.completed', booking.guest_id, {
+    const amounts = await this.disputeAmounts(bookingId, amountToGuest);
+    this.notifications.notify('dispute.resolved', booking.guest_id, {
       listingTitle,
-      pushTitle: 'Dispute resolved',
-      pushBody: `Basera has resolved your dispute for ${listingTitle}`,
-      link: `/stays/${booking.listing_id}`,
+      ...amounts,
+      decidedBy: 'admin',
+      appealable: true,
+      link: '/settings?tab=bookings',
     });
-    this.notifications.notify('booking.completed', booking.host_id, {
+    this.notifications.notify('dispute.resolved', booking.host_id, {
       listingTitle,
-      pushTitle: 'Dispute resolved',
-      pushBody: `Basera has resolved the dispute for ${listingTitle}`,
-      link: '/host/bookings',
+      ...amounts,
+      decidedBy: 'admin',
+      appealable: true,
+      link: '/host?tab=bookings',
     });
 
     return { success: true, status: 'completed' as const, amountToGuest };
@@ -1215,17 +1425,18 @@ export class BookingsService {
 
     const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
     const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
-    this.notifications.notify('booking.completed', booking.guest_id, {
+    const amounts = await this.disputeAmounts(bookingId, amountToGuest);
+    this.notifications.notify('dispute.resolved', booking.guest_id, {
       listingTitle,
-      pushTitle: 'Appeal decided',
-      pushBody: `Basera has made a final decision on the appeal for ${listingTitle}`,
-      link: `/stays/${booking.listing_id}`,
+      ...amounts,
+      decidedBy: 'appeal',
+      link: '/settings?tab=bookings',
     });
-    this.notifications.notify('booking.completed', booking.host_id, {
+    this.notifications.notify('dispute.resolved', booking.host_id, {
       listingTitle,
-      pushTitle: 'Appeal decided',
-      pushBody: `Basera has made a final decision on the appeal for ${listingTitle}`,
-      link: '/host/bookings',
+      ...amounts,
+      decidedBy: 'appeal',
+      link: '/host?tab=bookings',
     });
 
     return { success: true, status: 'resolved' as const, amountToGuest };
@@ -1233,7 +1444,9 @@ export class BookingsService {
 
   /**
    * Manual checkout by guest or host.
-   * Guest can checkout anytime on their move_out date.
+   * Guest can checkout on or after the move_out date (India calendar day). Before
+   * that there is no instant early checkout: leaving early goes through dispute()
+   * (category early_departure), which keeps the payout hold until resolved.
    * Host can checkout strictly after the listing's checkOut time on the move_out date.
    */
   async checkout(userId: string, id: string) {
@@ -1247,7 +1460,7 @@ export class BookingsService {
     if (booking.guest_id !== userId && booking.host_id !== userId) {
       throw new ForbiddenException('Forbidden');
     }
-    if (booking.status !== 'checked_in' && booking.status !== 'completed') {
+    if (booking.status !== 'checked_in') {
       throw new ConflictException(`Cannot checkout a booking in status "${booking.status}"`);
     }
 
@@ -1261,24 +1474,31 @@ export class BookingsService {
     const checkoutTimeStr = houseRules?.check_out ?? houseRules?.checkOut ?? '11:00 AM';
 
     const now = new Date();
-    const moveOutDate = new Date(booking.move_out);
-    moveOutDate.setHours(0, 0, 0, 0);
-
-    const todayDate = new Date(now);
-    todayDate.setHours(0, 0, 0, 0);
+    const moveOutDate = calendarDayNumber(booking.move_out);
+    const todayDate = todayDayNumber(now);
 
     const isGuest = booking.guest_id === userId;
 
-    if (isGuest) {
-      if (todayDate < moveOutDate) {
-        throw new ConflictException('You can only check out on or after your official move-out date.');
+    // TEST ONLY (CHECKOUT_DATE_BYPASS): skips the move-out date and checkout-time rules.
+    const dateBypass = ['true', '1'].includes(String(this.config.get('CHECKOUT_DATE_BYPASS')));
+    if (dateBypass) {
+      this.logger.warn(`[checkout] date check bypassed for booking ${id} (CHECKOUT_DATE_BYPASS)`);
+    }
+
+    if (dateBypass) {
+      // no date rules
+    } else if (isGuest) {
+      if (todayDayNumberIST(now) < moveOutDate) {
+        throw new ConflictException(
+          'You cannot check out before your move-out date. If you need to leave early or something is wrong with the stay, report it instead (choose "Leaving early" under Report a problem). There is no automatic refund for unused nights, and the payout stays on hold until the case is resolved.',
+        );
       }
     } else {
       if (todayDate < moveOutDate) {
         throw new ConflictException('You cannot check out a guest before their move-out date.');
       }
 
-      if (todayDate.getTime() === moveOutDate.getTime()) {
+      if (todayDate === moveOutDate) {
         const match = checkoutTimeStr.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
         let hours = 11;
         let minutes = 0;
@@ -1310,15 +1530,18 @@ export class BookingsService {
     await this.recordEvent(id, fromStatus, 'checked_out', userId);
 
     const otherParty = isGuest ? booking.host_id : booking.guest_id;
-    const pushBody = isGuest
-      ? `Your guest has checked out of ${listingTitle}`
-      : `Your host has marked your stay at ${listingTitle} as completed`;
+    const leftEarly = isGuest && todayDate < moveOutDate;
+    const pushBody = leftEarly
+      ? `Your guest has checked out early from ${listingTitle}`
+      : isGuest
+        ? `Your guest has checked out of ${listingTitle}`
+        : `Your host has marked your stay at ${listingTitle} as completed`;
 
-    this.notifications.notify('booking.checked_out', otherParty, {
+    this.notifications.notify(leftEarly ? 'booking.checked_out_early' : 'booking.checked_out', otherParty, {
       listingTitle,
-      pushTitle: 'Stay completed',
+      pushTitle: leftEarly ? 'Guest checked out early' : 'Stay completed',
       pushBody,
-      link: isGuest ? '/host/bookings' : `/stays/${booking.listing_id}`,
+      link: isGuest ? '/host?tab=bookings' : `/stays/${booking.listing_id}`,
     });
 
     return { success: true, status: 'checked_out' as const };

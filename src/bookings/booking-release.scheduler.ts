@@ -3,9 +3,9 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { BookingsService } from './bookings.service';
 
 /**
- * Polls every 5 minutes for bookings past their `escrow_release_time` and
+ * Polls every minute for bookings past their `escrow_release_time` and
  * releases them. This is the only path a booking takes to `completed` in
- * the new model (see BookingsService.releaseHold) — a 5-minute poll against
+ * the new model (see BookingsService.releaseHold) — a 1-minute poll against
  * an indexed timestamp column is an imperceptible timing slop against a 24h
  * hold window, and is trivially testable by calling releaseExpiredHolds()
  * directly, unlike a lazier "release on read" approach or a full queue.
@@ -16,7 +16,7 @@ export class BookingReleaseScheduler {
 
   constructor(private readonly bookingsService: BookingsService) {}
 
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  @Cron(CronExpression.EVERY_MINUTE)
   async handleExpiredHolds(): Promise<void> {
     try {
       await this.bookingsService.releaseExpiredHolds();
