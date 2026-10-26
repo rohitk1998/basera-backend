@@ -18,8 +18,6 @@ import { HostListingsService } from '../src/listings/host-listings.service';
 import { RedisService } from '../src/redis/redis.service';
 import { VerificationService } from '../src/verification/verification.service';
 
-/** CAPTURE_LOCATION_BYPASS (test-only): HTTP behaviour with the flag on and off. */
-
 const PIN = { lat: 32.219, lng: 76.3234 };
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'capture-bypass-e2e-'));
 const ffmpeg = (args: string[]) => execFileSync('ffmpeg', ['-loglevel', 'error', '-y', ...args]);

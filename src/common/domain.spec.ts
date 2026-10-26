@@ -1,7 +1,6 @@
 import { agreeTerms } from './domain';
 
 describe('agreeTerms', () => {
-  // ₹2,600/day with 30% off monthly → ₹54,600 a month.
   const rate = 2600;
 
   it('charges a 61-day stay as 2 whole months, not 61/30 of one', () => {

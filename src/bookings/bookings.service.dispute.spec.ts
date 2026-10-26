@@ -41,6 +41,7 @@ function makeService(opts: { cases?: Record<string, unknown>[]; lastEvent?: Reco
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
   );
   return { service, disputeCasesRepo, disputeEventsRepo };
 }

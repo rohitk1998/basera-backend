@@ -1,71 +1,43 @@
-import { ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHmac } from 'crypto';
 import { CashfreeService } from './cashfree.service';
 
 function build(env: Record<string, string | undefined>) {
   return new CashfreeService({ get: (k: string) => env[k] } as unknown as ConfigService);
 }
 
-function mockFetch(status: number, body: unknown) {
-  const fn = jest.fn().mockResolvedValue({ ok: status >= 200 && status < 300, status, json: async () => body });
-  (global as any).fetch = fn;
-  return fn;
-}
+describe('CashfreeService.verifyWebhookSignature', () => {
+  const secret = 'pg-secret';
+  const ts = '1700000000000';
+  const body = '{"data":{"order":{"order_id":"bk_1_1"}}}';
+  const hmac = (data: string, key = secret) => createHmac('sha256', key).update(data).digest('base64');
+  const svc = build({ CASHFREE_PG_CLIENT_SECRET: secret });
 
-const configured = { CASHFREE_CLIENT_ID: 'id', CASHFREE_CLIENT_SECRET: 'secret' };
-
-describe('CashfreeService verification', () => {
-  const realFetch = (global as any).fetch;
-  afterEach(() => {
-    (global as any).fetch = realFetch;
+  it('accepts timestamp+body (no separator)', () => {
+    expect(svc.verifyWebhookSignature(Buffer.from(body), hmac(ts + body), ts)).toBe(true);
   });
 
-  it('answers 503 instead of faking success when credentials are missing', async () => {
-    await expect(build({}).verifyPan({ pan: 'ABCPV1234D', name: 'A B' })).rejects.toBeInstanceOf(
-      ServiceUnavailableException,
-    );
+  it('accepts timestamp.body (dot separator) and a string body', () => {
+    expect(svc.verifyWebhookSignature(body, hmac(`${ts}.${body}`), ts)).toBe(true);
   });
 
-  it('verifies a valid PAN with a matching name against the sandbox', async () => {
-    const fetchFn = mockFetch(200, { valid: true, pan_status: 'VALID', name_match_result: 'DIRECT_MATCH', reference_id: 7 });
-    const out = await build(configured).verifyPan({ pan: 'ABCPV1234D', name: 'Asha Rao' });
-    expect(out).toMatchObject({ verified: true, referenceId: '7' });
-    expect(fetchFn.mock.calls[0][0]).toBe('https://sandbox.cashfree.com/verification/pan');
-    expect(fetchFn.mock.calls[0][1].headers['x-client-id']).toBe('id');
+  it('rejects a signature made with the wrong secret', () => {
+    expect(svc.verifyWebhookSignature(Buffer.from(body), hmac(ts + body, 'other'), ts)).toBe(false);
   });
 
-  it('rejects a PAN whose name does not match', async () => {
-    mockFetch(200, { valid: true, name_match_result: 'NO_MATCH' });
-    const out = await build(configured).verifyPan({ pan: 'ABCPV1234D', name: 'Someone Else' });
-    expect(out.verified).toBe(false);
+  it('rejects when the signature or timestamp header is missing', () => {
+    expect(svc.verifyWebhookSignature(Buffer.from(body), undefined, ts)).toBe(false);
+    expect(svc.verifyWebhookSignature(Buffer.from(body), hmac(ts + body), undefined)).toBe(false);
   });
 
-  it('turns a Cashfree 422 about the input into a rejection, not an error', async () => {
-    mockFetch(422, { code: 'ifsc_value_invalid', message: 'Invalid IFSC' });
-    const out = await build(configured).verifyBankAccount({ accountNumber: '123456', ifsc: 'BAD', name: 'X Y' });
-    expect(out).toEqual({ verified: false, reason: 'Invalid IFSC' });
+  it('rejects a tampered body, a different timestamp, and a wrong-length signature', () => {
+    const sig = hmac(ts + body);
+    expect(svc.verifyWebhookSignature(Buffer.from(body.replace('bk_1_1', 'bk_2_1')), sig, ts)).toBe(false);
+    expect(svc.verifyWebhookSignature(Buffer.from(body), sig, '1700000000001')).toBe(false);
+    expect(svc.verifyWebhookSignature(Buffer.from(body), 'short', ts)).toBe(false);
   });
 
-  it('surfaces auth failures as 503, not as a user rejection', async () => {
-    mockFetch(401, { code: 'authentication_failed', message: 'bad creds' });
-    await expect(build(configured).verifyBankAccount({ accountNumber: '123456', ifsc: 'HDFC0000001', name: 'X Y' })).rejects.toBeInstanceOf(
-      ServiceUnavailableException,
-    );
-  });
-
-  it('accepts a bank account only when valid and the name matches', async () => {
-    mockFetch(200, { account_status: 'VALID', name_at_bank: 'ASHA RAO', bank_name: 'HDFC', name_match_result: 'GOOD_PARTIAL_MATCH', reference_id: 9 });
-    const out = await build(configured).verifyBankAccount({ accountNumber: '123456', ifsc: 'HDFC0000001', name: 'Asha Rao' });
-    expect(out).toMatchObject({ verified: true, bankName: 'HDFC', nameAtBank: 'ASHA RAO' });
-  });
-
-  it('sends UPI penny-drop with consent and the api version header', async () => {
-    const fetchFn = mockFetch(200, { status: 'VALID', name_at_bank: 'ASHA RAO', reference_id: 3 });
-    const out = await build(configured).verifyUpi({ vpa: 'asha@okhdfc', name: 'Asha Rao', verificationId: 'upi-1' });
-    expect(out.verified).toBe(true);
-    const [url, init] = fetchFn.mock.calls[0];
-    expect(url).toBe('https://sandbox.cashfree.com/verification/upi/penny-drop');
-    expect(init.headers['x-api-version']).toBe('2024-12-01');
-    expect(JSON.parse(init.body).user_consent).toMatchObject({ obtained: true, type: 'EXPLICIT' });
+  it('rejects everything when the PG secret is not configured', () => {
+    expect(build({}).verifyWebhookSignature(Buffer.from(body), hmac(ts + body, ''), ts)).toBe(false);
   });
 });

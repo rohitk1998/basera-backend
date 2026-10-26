@@ -6,40 +6,19 @@ import {
   WALKTHROUGH_GPS_TOLERANCE_METRES,
 } from './walkthrough-gps.util';
 
-/*
- * In-app camera capture evidence.
- *
- * Listing photos and the walkthrough video can only be supplied by capturing
- * them with the camera inside the app. At the moment of capture the browser
- * reads the device's location and sends it with the file. Everything in this
- * module is a plausibility check on those numbers, and every number is
- * DEVICE-REPORTED: the client says where it was. A modified client (or a
- * mock-location app on the phone) can claim any position, so nothing here
- * proves a host stood at the property and nothing may be described as
- * "verified by Basera". It raises the cost of faking a listing from "upload
- * stock photos" to "defeat the camera and the location API", and gives the
- * reviewer a map to look at.
- */
-
-/** A fix worse than this is a guess (cell tower / IP), not a position. The
- *  client refuses to capture above it; the server holds the same line. */
 export const CAPTURE_MAX_ACCURACY_METRES = 100;
 
-/** How stale a capture may be when the server receives it. A photo is sent the
- *  moment it is taken, so this is short; a walkthrough is a large file on a
- *  mobile connection, so its clock includes the upload. */
 export const CAPTURE_MAX_AGE_MS: Record<CaptureKind, number> = {
   photo: 5 * 60 * 1000,
   video: 15 * 60 * 1000,
+
+  wifi: 5 * 60 * 1000,
 };
 
-/** How far ahead of the server clock a capture timestamp may be before it is a
- *  wrong clock rather than ordinary skew. */
 export const CAPTURE_FUTURE_SKEW_MS = 60 * 1000;
 
-export type CaptureKind = 'photo' | 'video';
+export type CaptureKind = 'photo' | 'video' | 'wifi';
 
-/** What the client sent with a file. */
 export type CaptureClaim = {
   lat: number;
   lng: number;
@@ -47,22 +26,20 @@ export type CaptureClaim = {
   capturedAtMs: number;
 };
 
-/** What is stored with the listing for the reviewer. */
 export type CaptureRecord = {
   kind: CaptureKind;
   lat: number;
   lng: number;
   accuracyM: number;
-  /** When the device says it captured the file (ISO). */
+
   capturedAt: string;
-  /** When the server received it (ISO). */
+
   receivedAt: string;
-  /** Distance from the listing pin, metres. Recomputed against the final pin at submit. */
+
   distanceFromPinM: number;
-  /** Always `device_reported`: see the note at the top of this file. */
+
   source: 'device_reported';
-  /** TEST ONLY: set when CAPTURE_LOCATION_BYPASS was on. The location checks
-   *  were skipped, so lat/lng/accuracy here are NOT a device reading. */
+
   bypassed?: true;
 };
 
@@ -70,7 +47,6 @@ export type CaptureAssessment = { ok: true; record: CaptureRecord } | { ok: fals
 
 const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
-/** Reads the loosely-typed object the client sent. Numbers may arrive as strings from multipart. */
 export function parseCaptureClaim(raw: unknown): { ok: true; claim: CaptureClaim } | { ok: false; reason: string } {
   const missing = {
     ok: false as const,
@@ -93,10 +69,6 @@ export function parseCaptureClaim(raw: unknown): { ok: true; claim: CaptureClaim
   return { ok: true, claim: { lat, lng, accuracyM: accuracy, capturedAtMs } };
 }
 
-/**
- * Checks one capture claim against the listing pin. Order matters only for the
- * message the host sees: the most fixable problem is reported first.
- */
 export function assessCapture(
   claim: CaptureClaim,
   pin: { lat: number; lng: number },
@@ -158,8 +130,6 @@ function formatAccuracy(m: number): string {
   return Number.isFinite(m) && m > 0 ? `${Math.round(m)} m` : 'an unknown distance';
 }
 
-/** True when a stored record is shaped like one this module wrote. Stored JSON
- *  is read back in several places, so it is checked before it is trusted. */
 export function isCaptureRecord(v: unknown): v is CaptureRecord {
   if (!v || typeof v !== 'object') return false;
   const r = v as Record<string, unknown>;
@@ -173,7 +143,6 @@ export function isCaptureRecord(v: unknown): v is CaptureRecord {
   );
 }
 
-/** Re-measures a stored capture against the pin as it stands now. */
 export function withDistanceFrom(record: CaptureRecord, pin: { lat: number; lng: number }): CaptureRecord {
   if (record.bypassed === true) return record;
   return { ...record, distanceFromPinM: Math.round(distanceMetres(pin, record)) };
@@ -183,12 +152,8 @@ export function isWithinTolerance(record: CaptureRecord): boolean {
   return record.bypassed === true || record.distanceFromPinM <= WALKTHROUGH_GPS_TOLERANCE_METRES;
 }
 
-/** Used only when CAPTURE_LOCATION_BYPASS is on (test use). Used when there is
- *  no pin and no usable claimed position: Shimla. */
 export const BYPASS_FALLBACK_POINT = { lat: 31.1048, lng: 77.1734 };
 
-/** Builds the record stored for a capture whose location checks were skipped:
- *  at the pin, else at the claimed position if usable, else the fallback point. */
 export function bypassedCaptureRecord(
   kind: CaptureKind,
   pin: { lat: number; lng: number } | undefined,

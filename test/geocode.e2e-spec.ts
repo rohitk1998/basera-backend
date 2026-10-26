@@ -11,7 +11,6 @@ import { ResponseMessageInterceptor } from '../src/common/interceptors/response-
 import { GeocodeController } from '../src/listings/geocode.controller';
 import { GeocodeService } from '../src/listings/geocode.service';
 
-/** A stand-in for OpenStreetMap's Nominatim that records every request it gets. */
 function startNominatim(reply: (q: string, n: number, headers: http.IncomingHttpHeaders) => { status: number; body: unknown }) {
   const calls: { q: string; at: number; headers: http.IncomingHttpHeaders; path: string }[] = [];
   const server = http.createServer((req, res) => {
@@ -74,7 +73,6 @@ describe('GET /api/geocode', () => {
     const res = await locate({ district: 'Kullu', tehsil: 'Manali', q: 'Vashisht village' }).expect(200);
     expect(res.body).toMatchObject({ success: true, lat: 32.2701, lng: 77.1755, precision: 'exact' });
     expect(res.body.message).toMatch(/Found it/);
-    // The lookup sent the host's words together with the tehsil, district and state.
     expect(osm.calls[0].q).toBe('Vashisht village, Manali, Kullu, Himachal Pradesh, India');
     expect(osm.calls[0].path).toContain('countrycodes=in');
   });
@@ -127,20 +125,18 @@ describe('GET /api/geocode', () => {
     await osm.close();
     const b = await locate({ district: 'Mandi', tehsil: 'Karsog', q: 'y' }).expect(200);
     expect(b.body.precision).toBe('district');
-    osm = await startNominatim(() => ({ status: 200, body: [] })); // so afterEach can close cleanly
+    osm = await startNominatim(() => ({ status: 200, body: [] }));
   });
 
   it('ignores a same-named place in another state', async () => {
     await boot();
-    // A "Manali" near Chandigarh-sized latitude, outside Himachal Pradesh.
     handler = (q) => (q.includes('Kullu') ? { status: 200, body: [hit(30.7333, 76.7794), hit(32.2701, 77.1755)] } : { status: 200, body: [] });
     const res = await locate({ district: 'Kullu', tehsil: 'Manali', q: 'Vashisht' }).expect(200);
-    expect(res.body).toMatchObject({ lat: 32.2701, lng: 77.1755 }); // skipped the first, took the second
+    expect(res.body).toMatchObject({ lat: 32.2701, lng: 77.1755 });
   });
 
   it('ignores a same-named place in a different district of the state', async () => {
     await boot();
-    // Inside HP, but 80+ km... far beyond the district: Kangra's centre vs Shimla.
     handler = () => ({ status: 200, body: [hit(31.1048, 77.1734)] });
     const res = await locate({ district: 'Chamba', tehsil: 'Dalhousie', q: 'x' }).expect(200);
     expect(res.body.precision).toBe('district');

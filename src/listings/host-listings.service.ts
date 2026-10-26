@@ -43,22 +43,36 @@ import {
   withDistanceFrom,
   type CaptureRecord,
 } from './capture.util';
+import {
+  applyWifiAmenity,
+  buildWifiResult,
+  cappedMbps,
+  isWifiResult,
+  isWifiTokenValue,
+  parseSamples,
+  serverMbps,
+  speedtestKey,
+  speedtestSamplesKey,
+  wifiTestTokenKey,
+  workCategoryAllowed,
+  SPEEDTEST_MAX_STREAMS,
+  SPEEDTEST_TTL_SECONDS,
+  WIFI_TEST_TOKEN_TTL_SECONDS,
+  WORK_CATEGORY,
+  WORK_CATEGORY_MESSAGE,
+  WORK_READY_MBPS,
+  type StreamSample,
+  type WifiAnswer,
+  type WifiResult,
+  type WifiTokenValue,
+} from './wifi-test.util';
 
-/** TTL for a walkthrough-check token (see verifyWalkthroughVideo /
- *  readWalkthroughToken below) — long enough to cover filling in the rest
- *  of the one-page form after checking the video, short enough that a token
- *  can't be banked and reused across unrelated sessions/listings. */
 const WALKTHROUGH_TOKEN_TTL_SECONDS = 60 * 60;
 
 function walkthroughTokenKey(userId: string, token: string): string {
   return `walkthrough-token:${userId}:${token}`;
 }
 
-/** How long a photo's capture receipt (see uploadPhotos) stays redeemable at
- *  submit / save-draft. Long enough to finish a long form, and for a failed
- *  submit to be retried the same day. Once a listing is saved the receipt's
- *  contents live in `draft_data.captures`, so this only bounds the time between
- *  taking a photo and first saving it with a listing. */
 const CAPTURE_RECEIPT_TTL_SECONDS = 24 * 60 * 60;
 
 function captureReceiptKey(userId: string, url: string): string {
@@ -77,15 +91,23 @@ import {
 } from './listing-schema';
 import { z } from 'zod';
 
-/** A draft is allowed to hold fewer than the 5 photos a submit needs: photos
- *  are uploaded the moment they are captured, so a host who saves and exits
- *  after the first one or two has a short list. The minimum applies at submit. */
 const draftPropertySchema = listingSchema.partial().extend({ photos: z.array(photoSchema).optional() });
 const draftSchema = fullOnboardingSchema.partial().extend({ photos: z.array(photoSchema).optional() });
 
-/** Where the host was in the listing wizard (chapter keys, not indexes), kept in
- *  `draft_data.wizard` so a reload or another device reopens at the same place.
- *  Not listing data: it is dropped on submit and never read by a public path. */
+const wifiTestBodySchema = z.object({
+  testId: z.string().uuid('Start the Wi-Fi test again.'),
+  downMbps: z.number().nonnegative().max(100_000),
+  upMbps: z.number().nonnegative().max(100_000),
+  pingMs: z.number().nonnegative().max(60_000),
+  jitterMs: z.number().nonnegative().max(60_000).optional(),
+  connectionType: z.string().max(32).optional(),
+  lat: z.number().optional(),
+  lng: z.number().optional(),
+  capture: z.unknown().optional(),
+});
+
+type DraftWifi = { answer?: WifiAnswer } & Partial<WifiResult>;
+
 const wizardProgressSchema = z.object({
   currentStep: z.string().regex(/^[a-z]{2,12}$/),
   visitedSteps: z.array(z.string().regex(/^[a-z]{2,12}$/)).max(20),
@@ -99,9 +121,6 @@ type UploadedMulterFile = {
   size: number;
 };
 
-/** Listing photos are only accepted as JPEG: that is what the in-app camera
- *  produces (canvas -> JPEG), and it is the one format whose metadata we
- *  strip with certainty on the way in. */
 const PHOTO_ALLOWED_TYPES: Record<string, string> = {
   'image/jpeg': 'jpg',
 };
@@ -113,25 +132,14 @@ const VIDEO_ALLOWED_TYPES: Record<string, string> = {
   'video/quicktime': 'mov',
 };
 
-/** MediaRecorder reports types like `video/webm;codecs=vp9,opus`. */
 const baseMimeType = (mimetype: string) => mimetype.split(';')[0].trim().toLowerCase();
 
-/** A recording longer than this is not a walkthrough, whatever the client says. */
 const MAX_CLIENT_DURATION_SECONDS = 60 * 60;
 
 const CAPTURE_REQUIRED_MESSAGE =
   'Photos and the walkthrough video must be taken with the in-app camera. Remove this one and capture it again.';
 const VIDEO_MAX_BYTES = 150 * 1024 * 1024;
 
-/** Statuses a host may resubmit from. `live` is included: editing a public
- *  listing pulls it from search immediately (resubmit sets status to
- *  in_review, and every public query filters on status = 'live' — see
- *  listings.service.ts findLive), same as a brand-new submission, so a
- *  guest never sees a listing whose data the host is mid-changing. `paused`
- *  is a host-initiated "off the market" state with its own separate flow
- *  (not yet built) — a host has to un-pause deliberately, not by editing.
- *  `in_review` is excluded on purpose: a listing already queued for review
- *  must not be edited out from under the reviewer looking at it. */
 const EDITABLE_STATUSES = ['draft', 'changes_needed', 'rejected', 'live'];
 
 export type HostListingSummary = {
@@ -157,20 +165,10 @@ export type HostListingSummary = {
   reviewReasonCategory: string | null;
 };
 
-/**
- * Host-facing listing management. Ported from web/app/api/host/listings/
- * route.ts, .../[id]/route.ts and .../submit-full/route.ts.
- */
 @Injectable()
 export class HostListingsService implements OnModuleDestroy {
   private readonly logger = new Logger(HostListingsService.name);
 
-  /** Reads the walkthrough file's metadata. Its own instance, with tight
-   *  limits, rather than the library's shared one: the defaults wait 30s for a
-   *  read, retry it once, and wait another 30s to start a process — a stuck
-   *  ExifTool then holds the host's request for a minute or more with no
-   *  answer. Timezone inference is switched off because it loads a
-   *  geographic dataset for a value nothing here uses. */
   private readonly exif = new ExifTool({
     maxProcs: 2,
     taskTimeoutMillis: 15_000,
@@ -195,23 +193,16 @@ export class HostListingsService implements OnModuleDestroy {
     private readonly verification: VerificationService,
     @InjectDataSource()
     private readonly dataSource: DataSource,
-    // Optional so a context without it (older specs) behaves as bypass OFF.
+
     @Optional() private readonly captureConfig?: CaptureConfigService,
-    // Optional for the same reason: without it the pin-vs-district check is not run.
+
     @Optional() private readonly geocode?: GeocodeService,
   ) {}
 
-  /** TEST ONLY switch (CAPTURE_LOCATION_BYPASS); server-side, never from a client. */
   get locationBypass(): boolean {
     return this.captureConfig?.locationBypass === true;
   }
 
-  /** The caller's own listings, scoped by the session's user id — a host can
-   *  never read someone else's rows through this method. Rows are flattened
-   *  into a stable shape rather than handing back raw `draft_data`: every
-   *  consumer digging into that JSON itself is what left the dashboard
-   *  reading `draft.property` after the key became `property_details`,
-   *  silently falling back to sample data. */
   async findMine(userId: string): Promise<HostListingSummary[]> {
     const rows = await this.listings.find({
       where: { host_id: userId },
@@ -220,8 +211,7 @@ export class HostListingsService implements OnModuleDestroy {
 
     return rows.map((row) => {
       const draft = (row.draft_data as Record<string, any>) ?? {};
-      // `property_details` is the current key; `property`/`basics` are read
-      // as a fallback for rows written by the superseded per-step funnel.
+
       const prop =
         draft.property_details ?? draft.property ?? draft.basics ?? {};
       return {
@@ -237,9 +227,7 @@ export class HostListingsService implements OnModuleDestroy {
             : (row.updated_at as unknown as string)
           : null,
         title: prop.title ?? '',
-        // `town` is the tehsil on every form-submitted listing; the fallbacks
-        // cover rows written before that, so a live listing is not shown as
-        // "Location not set" while its address is on file.
+
         town: prop.town || prop.tehsil || prop.city || '',
         fullAddress: prop.streetAddress
           ? toFullAddress(prop)
@@ -258,39 +246,13 @@ export class HostListingsService implements OnModuleDestroy {
         propertyType: prop.propertyType ?? '',
         photoCount: prop.photoCount ?? (Array.isArray(prop.photos) ? prop.photos.length : 0),
         coverPhotoUrl: prop.photos?.[0]?.url ?? null,
-        // Only meaningful for changes_needed/rejected — what the host would
-        // otherwise have no way to learn.
+
         reviewNotes: row.review_notes ?? null,
         reviewReasonCategory: row.review_reason_category ?? null,
       };
     });
   }
 
-  /**
-   * Listing photos. Keyed off the host only, not a listing — the wizard is a
-   * one-page form with no listing row until final submit (see submitFull), so
-   * photos upload to the host's own storage folder first and the returned URLs
-   * ride along in the submit-full/resubmit body afterward, same shape as every
-   * other wizard field. Room tags come from the host, paired atomically with
-   * each URL rather than a parallel array, so there is no index-drift risk
-   * between a photo and its tag.
-   *
-   * Every photo must have been captured with the in-app camera: each file comes
-   * with the device-reported location and time of capture (`captures`, parallel
-   * to `files`), checked here against the listing pin (capture.util.ts). All
-   * captures are validated before anything is uploaded, so one bad photo does
-   * not leave the others orphaned in storage.
-   *
-   * Two things are written for each stored photo:
-   *   - the file itself, with ALL embedded metadata (EXIF / GPS / XMP / IPTC)
-   *     removed — photos are public, and an in-app capture has no use for
-   *     them. Done with ExifTool (already a dependency, used for the
-   *     walkthrough check);
-   *   - a short-lived "capture receipt" in Redis keyed by (host, URL). The
-   *     submit later redeems it to learn that THIS URL was captured, and where
-   *     — the form only carries URLs, and a URL the client types in is not
-   *     evidence of anything (see resolvePhotoCaptures).
-   */
   async uploadPhotos(
     userId: string,
     files: UploadedMulterFile[],
@@ -337,7 +299,7 @@ export class HostListingsService implements OnModuleDestroy {
           'Photo upload expected an in-memory file.',
         );
       }
-      // A JPEG starts FF D8 FF. The declared type is the client's word only.
+
       if (!(file.buffer[0] === 0xff && file.buffer[1] === 0xd8 && file.buffer[2] === 0xff)) {
         throw new BadRequestException(label(i) + 'This file is not a JPEG photo. Take the photo with the in-app camera.');
       }
@@ -364,9 +326,6 @@ export class HostListingsService implements OnModuleDestroy {
         .from('listing-media')
         .getPublicUrl(storagePath);
 
-      // Same retry-once as the walkthrough token: a first failure is usually a
-      // stale cache connection. Without the receipt this photo could never be
-      // submitted, so do not report success for it.
       const receiptKey = captureReceiptKey(userId, publicUrl);
       const receipt = JSON.stringify(records[i]);
       const saved =
@@ -385,11 +344,6 @@ export class HostListingsService implements OnModuleDestroy {
     return photos;
   }
 
-  /** Removes every embedded metadata block (EXIF incl. GPS, XMP, IPTC,
-   *  comments) from a JPEG. An in-app capture has none, so for the intended
-   *  client this is a no-op; it exists so a hand-made request cannot publish a
-   *  photo carrying the host's coordinates or device details. Fails closed:
-   *  if the file cannot be cleaned it is not stored. */
   private async stripImageMetadata(buffer: Buffer): Promise<Buffer> {
     let dir: string | undefined;
     try {
@@ -406,35 +360,6 @@ export class HostListingsService implements OnModuleDestroy {
     }
   }
 
-  /**
-   * The walkthrough ("telemetry") check. The video must have been recorded with
-   * the in-app camera: it arrives with the device-reported location and time at
-   * the end of the recording (`captureRaw`), which is checked against the
-   * pinned lat/lng (capture.util.ts) — in Himachal Pradesh, accurate to
-   * 100 m or better, fresh, and within the walkthrough tolerance of the pin.
-   * The file itself is then given the same cheap sanity checks as before
-   * (it has a video picture, a plausible length and was not made by editing
-   * software). A GPS tag inside the file is no longer read or required: the
-   * browser's MediaRecorder writes none.
-   *
-   * What a pass means, and does not: the DEVICE says it was near the pin when
-   * the recording ended. A modified client or a mock-location app can say
-   * that about anywhere, and nothing here looks at the footage. So a pass is
-   * "recorded in-app, device-reported location near the pin, needs a person
-   * to watch it" (`needsVisualReview`), never "verified", and the outcome
-   * travels with the listing (see walkthroughTelemetry) so the reviewer sees
-   * exactly that.
-   *
-   * If the analyser itself is unavailable (timeout, cannot start) the host is
-   * not blocked for our fault: the capture location is still checked, and the
-   * check passes as `unanalysed`, with no claim about the file, and goes to the
-   * reviewer the same way.
-   *
-   * Length: a MediaRecorder WebM carries no duration in its header (Chrome
-   * and Firefox write it as a live stream), so when the container has none the
-   * length the browser measured is used instead and the record says so
-   * (`durationSource`). Mp4 from Safari carries its own.
-   */
   async verifyWalkthroughVideo(
     userId: string,
     file: UploadedMulterFile,
@@ -471,17 +396,11 @@ export class HostListingsService implements OnModuleDestroy {
       );
     }
 
-    // Once a passed check hands the temp file to the background upload, that
-    // upload deletes it; every other path deletes it here.
     let tempFileHandedOff = false;
     try {
-      // The capture is checked before the file is opened: it is the cheaper
-      // test and the one the host can most often fix by themselves.
       const bypass = this.locationBypass;
       let capture: CaptureRecord;
       if (bypass) {
-        // Camera path still required: the client must send a capture object
-        // (it may carry no location). Only the location checks are skipped.
         if (!captureRaw || typeof captureRaw !== 'object' || Array.isArray(captureRaw)) {
           return {
             passed: false,
@@ -506,8 +425,6 @@ export class HostListingsService implements OnModuleDestroy {
       try {
         tags = await this.exif.read(file.path);
       } catch (err) {
-        // A file that is not a video comes back as empty tags (handled below);
-        // a throw means the analyser itself failed or timed out.
         this.logger.warn(`walkthrough analysis unavailable: ${(err as Error).message}`);
       }
 
@@ -573,29 +490,15 @@ export class HostListingsService implements OnModuleDestroy {
         };
       }
 
-      // The video's own storage location is known before it is uploaded (the
-      // upload finishes in the background below), and goes in the receipt so
-      // the submit saves the URL the SERVER issued, not one the client typed.
       const storagePath = `${userId}/walkthrough/${randomUUID()}.${ext}`;
       const walkthroughVideoUrl = this.supabase.client.storage
         .from('listing-media')
         .getPublicUrl(storagePath).data.publicUrl;
 
-      // Issue a one-time token naming exactly this (userId, pin) pair, so
-      // submitFull/resubmit can later refuse to trust a bare
-      // `walkthroughPassed: true` unless it's accompanied by proof the check
-      // was actually run against the SAME coordinates being submitted now.
-      // Stored in Redis (not draft_data) because at check time there may be
-      // no listing row yet — this only needs to survive until the submit
-      // that follows in the same session. The outcome rides along so the
-      // submit can save it with the listing.
       const walkthroughToken = randomUUID();
       const tokenKey = walkthroughTokenKey(userId, walkthroughToken);
       const tokenValue = JSON.stringify({ lat: pin.lat, lng: pin.lng, check, videoUrl: walkthroughVideoUrl });
-      // A first failure usually means the cache connection had just gone
-      // stale and has been replaced, so one more try normally succeeds. If it
-      // still cannot be saved the check must not report success: the submit
-      // that follows would refuse a token that was never stored.
+
       const tokenSaved =
         (await this.redis.set(tokenKey, tokenValue, WALKTHROUGH_TOKEN_TTL_SECONDS)) ||
         (await this.redis.set(tokenKey, tokenValue, WALKTHROUGH_TOKEN_TTL_SECONDS));
@@ -608,13 +511,6 @@ export class HostListingsService implements OnModuleDestroy {
         };
       }
 
-      // Only a PASSED check's video is kept, so the pin re-check at submit
-      // time (readWalkthroughToken) can enforce the video matches the
-      // listing, and so the reviewer has the footage to watch. The upload to
-      // storage can take a long time for a big video and the proxy in front
-      // of this route gives up after a while, so the check answers now and
-      // the upload finishes in the background, which also becomes
-      // responsible for deleting the temp file.
       this.storeWalkthroughVideoInBackground(file.path, mimetype, storagePath, tokenKey);
       tempFileHandedOff = true;
 
@@ -638,16 +534,6 @@ export class HostListingsService implements OnModuleDestroy {
     }
   }
 
-  /**
-   * Uploads a passed walkthrough video to storage AFTER the check has already
-   * answered, then deletes the temp file. It must never take the process down:
-   * the read stream's own errors and any upload failure are logged and
-   * swallowed, and the stream is never left
-   * unread while its file is deleted, which would surface as an unhandled
-   * ENOENT error event. A stalled upload is abandoned after 10 minutes. A
-   * failed upload withdraws the walkthrough receipt (the reviewer needs the
-   * footage, so the check must not stay passed without it).
-   */
   private storeWalkthroughVideoInBackground(
     filePath: string,
     mimetype: string,
@@ -670,8 +556,7 @@ export class HostListingsService implements OnModuleDestroy {
         if (error) throw new Error(error.message);
       } catch (err) {
         this.logger.warn(`walkthrough video upload failed: ${(err as Error).message}`);
-        // The reviewer would get a link to nothing, so the receipt is withdrawn:
-        // the host is told to record again instead of submitting a dead link.
+
         await this.redis.del(tokenKey).catch(() => {});
       } finally {
         if (timer) clearTimeout(timer);
@@ -681,20 +566,240 @@ export class HostListingsService implements OnModuleDestroy {
     })();
   }
 
-  /** The pin must sit in the chosen district and PIN area; skipped under the test bypass, fails open. */
+  async startSpeedtest(userId: string): Promise<{ testId: string }> {
+    const testId = randomUUID();
+    const value = JSON.stringify({ startedAt: Date.now(), download: [], upload: [] });
+    const key = speedtestKey(userId, testId);
+
+    const stored =
+      (await this.redis.set(key, value, SPEEDTEST_TTL_SECONDS)) ||
+      (await this.redis.set(key, value, SPEEDTEST_TTL_SECONDS));
+    if (!stored) {
+      throw new InternalServerErrorException('The Wi-Fi test could not be started. Try again in a moment.');
+    }
+    return { testId };
+  }
+
+  async assertSpeedtest(userId: string, testId: unknown, direction?: 'download' | 'upload'): Promise<string> {
+    if (typeof testId !== 'string' || !z.string().uuid().safeParse(testId).success) {
+      throw new BadRequestException('Start the Wi-Fi test again.');
+    }
+    if (!(await this.redis.get(speedtestKey(userId, testId)))) {
+      throw new BadRequestException('This Wi-Fi test has expired. Run the test again.');
+    }
+    if (direction) {
+      const streams = await this.redis.getList(speedtestSamplesKey(userId, testId, direction));
+      if (streams.length >= SPEEDTEST_MAX_STREAMS) {
+        throw new BadRequestException('This Wi-Fi test has already finished. Run the test again.');
+      }
+    }
+    return testId;
+  }
+
+  async recordSpeedtestSample(
+    userId: string,
+    testId: string,
+    direction: 'download' | 'upload',
+    sample: StreamSample,
+  ): Promise<void> {
+    if (sample.bytes <= 0) return;
+    await this.redis.pushToList(
+      speedtestSamplesKey(userId, testId, direction),
+      JSON.stringify(sample),
+      SPEEDTEST_TTL_SECONDS,
+    );
+  }
+
+  async recordWifiTest(
+    userId: string,
+    body: unknown,
+  ): Promise<
+    | { passed: true; result: WifiResult; wifiTestToken: string; workReady: boolean }
+    | { passed: false; reason: string }
+  > {
+    const parsed = wifiTestBodySchema.safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException(parsed.error.issues[0]?.message ?? 'The Wi-Fi test result is incomplete.');
+    }
+    const d = parsed.data;
+    const testId = await this.assertSpeedtest(userId, d.testId);
+    const pinIn =
+      typeof d.lat === 'number' && typeof d.lng === 'number' ? { lat: d.lat, lng: d.lng } : undefined;
+
+    let record: CaptureRecord;
+    if (this.locationBypass) {
+      if (!d.capture || typeof d.capture !== 'object' || Array.isArray(d.capture)) {
+        return { passed: false, reason: 'This Wi-Fi test has no location details. Run it again in the app.' };
+      }
+      record = bypassedCaptureRecord('wifi', pinIn, d.capture);
+    } else {
+      if (!pinIn) return { passed: false, reason: 'Drop the pin on the map before running the Wi-Fi test.' };
+      const claim = parseCaptureClaim(d.capture);
+      if (!claim.ok) {
+        return {
+          passed: false,
+          reason: 'Your phone did not report its location with the test. Allow location access and run the test again.',
+        };
+      }
+      const assessed = assessCapture(claim.claim, pinIn, 'wifi');
+      if (!assessed.ok) {
+        const distance = distanceMetres(pinIn, { lat: claim.claim.lat, lng: claim.claim.lng });
+        return {
+          passed: false,
+          reason:
+
+            assessed.reason.includes('from the pin you dropped')
+              ? `Your phone reported a location ${formatDistance(distance)} from the pin you dropped (the limit is ${WALKTHROUGH_GPS_TOLERANCE_METRES} m). Run the Wi-Fi test at the property, or move the pin onto the property.`
+              : assessed.reason,
+        };
+      }
+      record = assessed.record;
+    }
+    const pin = pinIn ?? { lat: record.lat, lng: record.lng };
+
+    const [down, up] = await Promise.all([
+      this.redis.getList(speedtestSamplesKey(userId, testId, 'download')).then(parseSamples),
+      this.redis.getList(speedtestSamplesKey(userId, testId, 'upload')).then(parseSamples),
+    ]);
+    const serverDown = serverMbps(down);
+    if (serverDown === null) {
+      return {
+        passed: false,
+        reason: 'The Wi-Fi test did not reach our server. Check the connection and run the test again.',
+      };
+    }
+
+    const result = buildWifiResult({
+      downMbps: cappedMbps(d.downMbps, serverDown),
+      upMbps: cappedMbps(d.upMbps, serverMbps(up)),
+      pingMs: d.pingMs,
+      jitterMs: d.jitterMs,
+      connectionType: d.connectionType,
+      capture: record,
+    });
+
+    const wifiTestToken = randomUUID();
+    const tokenKey = wifiTestTokenKey(userId, wifiTestToken);
+    const tokenValue = JSON.stringify({ lat: pin.lat, lng: pin.lng, record, result } satisfies WifiTokenValue);
+    const stored =
+      (await this.redis.set(tokenKey, tokenValue, WIFI_TEST_TOKEN_TTL_SECONDS)) ||
+      (await this.redis.set(tokenKey, tokenValue, WIFI_TEST_TOKEN_TTL_SECONDS));
+    if (!stored) {
+      throw new InternalServerErrorException('The Wi-Fi test result could not be saved. Run the test again in a moment.');
+    }
+
+    await this.redis.del(speedtestKey(userId, testId));
+
+    return { passed: true, result, wifiTestToken, workReady: result.downMbps > WORK_READY_MBPS };
+  }
+
+  private async readWifiTestToken(
+    userId: string,
+    token: string,
+    pin: { lat: number; lng: number } | undefined,
+  ): Promise<{ result: WifiResult; record: CaptureRecord } | null> {
+    const raw = await this.redis.get(wifiTestTokenKey(userId, token));
+    if (!raw) return null;
+    let stored: unknown;
+    try {
+      stored = JSON.parse(raw);
+    } catch {
+      stored = null;
+    }
+    if (!isWifiTokenValue(stored)) {
+      throw new BadRequestException('Your Wi-Fi test result is invalid. Run the Wi-Fi test again before submitting.');
+    }
+    let { record, result } = stored;
+    if (pin && !this.locationBypass) {
+      if (distanceMetres(pin, stored) > WALKTHROUGH_GPS_TOLERANCE_METRES) {
+        throw new BadRequestException(
+          'The pin has moved since you ran the Wi-Fi test. Run the Wi-Fi test again at the current pin before submitting.',
+        );
+      }
+      record = withDistanceFrom(record, pin);
+      if (!isWithinTolerance(record)) {
+        throw new BadRequestException(
+          `Your phone reported the Wi-Fi test ${formatDistance(record.distanceFromPinM)} from the pin you have now (the limit is ${WALKTHROUGH_GPS_TOLERANCE_METRES} m). Run it again at the property, or move the pin back.`,
+        );
+      }
+      result = { ...result, capture: { ...result.capture, distanceFromPinM: record.distanceFromPinM } };
+    }
+    return { result, record };
+  }
+
+  private async resolveWifi(
+    userId: string,
+    input: { answer?: WifiAnswer; token?: string },
+    pin: { lat: number; lng: number } | undefined,
+    existing: ListingEntity | null,
+    strict: boolean,
+  ): Promise<{ wifi: DraftWifi | undefined; record: CaptureRecord | undefined; spend: () => Promise<void> }> {
+    const prior = (existing?.draft_data as Record<string, any> | null) ?? {};
+    const priorWifi = (prior.wifi as DraftWifi | undefined) ?? undefined;
+    const answer = input.answer ?? priorWifi?.answer;
+    const noop = async () => {};
+
+    if (input.token) {
+      try {
+        const fresh = await this.readWifiTestToken(userId, input.token, pin);
+        if (fresh) {
+          const key = wifiTestTokenKey(userId, input.token);
+          return {
+            wifi: { answer, ...fresh.result },
+            record: fresh.record,
+            spend: async () => this.redis.del(key),
+          };
+        }
+        if (strict && answer === 'yes' && !isWifiResult(priorWifi)) {
+          throw new BadRequestException(
+            'Your Wi-Fi test result has expired or was already used. Run the Wi-Fi test again before submitting.',
+          );
+        }
+      } catch (err) {
+        if (strict) throw err;
+      }
+    }
+
+    const priorRecord = prior.captures?.wifi;
+    if (isWifiResult(priorWifi)) {
+      let record: CaptureRecord | undefined = isCaptureRecord(priorRecord) ? priorRecord : undefined;
+      let result: WifiResult = priorWifi;
+      if (pin && record) {
+        record = withDistanceFrom(record, pin);
+        if (!this.locationBypass && !isWithinTolerance(record)) {
+          if (strict && answer === 'yes') {
+            throw new BadRequestException(
+              `The Wi-Fi test was run ${formatDistance(record.distanceFromPinM)} from the pin you have now (the limit is ${WALKTHROUGH_GPS_TOLERANCE_METRES} m). Run it again at the property, or move the pin back.`,
+            );
+          }
+          return { wifi: answer ? { answer } : undefined, record: undefined, spend: noop };
+        }
+        result = { ...priorWifi, capture: { ...priorWifi.capture, distanceFromPinM: record.distanceFromPinM } };
+      }
+      const { answer: _a, ...measured } = result as DraftWifi;
+      return { wifi: { answer, ...measured }, record, spend: noop };
+    }
+    return { wifi: answer ? { answer } : undefined, record: undefined, spend: noop };
+  }
+
+  private applyWifiRules(property: Record<string, any>, wifi: DraftWifi | undefined, enforceWork: boolean) {
+    if (Array.isArray(property.amenities)) {
+      property.amenities = applyWifiAmenity(property.amenities, wifi);
+    }
+    if (enforceWork && Array.isArray(property.categories) && property.categories.includes(WORK_CATEGORY)) {
+      if (!workCategoryAllowed(wifi)) throw new BadRequestException(WORK_CATEGORY_MESSAGE);
+    }
+  }
+
   private async assertPinAgrees(p: { district: string; pincode: string; lat: number; lng: number }) {
     if (!this.geocode) return;
     await assertLocationAgrees(p, (lat, lng) => this.geocode!.reverseCheck(lat, lng), { skip: this.locationBypass });
   }
 
-  /** The full property schema, plus the location rules a schema cannot hold. */
   private parseProperty(
     d: Parameters<typeof listingSchema.parse>[0],
     opts: { clampPastDate?: boolean } = {},
   ) {
-    // Editing a listing that was already submitted: a date that has since passed
-    // becomes today (and is stored so) rather than blocking every edit.
-    // Hosts are in India; compare the date-only value against today there.
     const property = listingSchema.parse(
       opts.clampPastDate ? clampPastAvailableFrom(d as { availableFrom?: string }, 'Asia/Kolkata') : d,
     );
@@ -704,26 +809,6 @@ export class HostListingsService implements OnModuleDestroy {
     return property;
   }
 
-  /**
-   * Reads a walkthrough receipt (see verifyWalkthroughVideo) and re-checks it
-   * against the pin of THIS submission. A host who records at one pin, then
-   * moves the pin before submitting, fails here even though
-   * `walkthroughPassed` in the body still reads `true` — that boolean is never
-   * trusted on its own.
-   *
-   * Two distances are re-measured: the pin the check ran against vs the pin
-   * now, and the device-reported capture point vs the pin now (the second is
-   * what the reviewer sees, so it must be true of the final pin).
-   *
-   * `consume` makes it single-use: the token is deleted once it has passed, so
-   * a captured token can't be replayed against a second, different submission.
-   * A refused check leaves it in place (it is re-checked on every use and
-   * expires on its own), so the host's retry does not need a new recording. Save-draft reads without consuming
-   * (the host is not done yet).
-   *
-   * Returns null when there is no such receipt (never issued, expired,
-   * consumed, or issued to another user).
-   */
   private async readWalkthroughToken(
     userId: string,
     token: string,
@@ -765,24 +850,17 @@ export class HostListingsService implements OnModuleDestroy {
         check = { ...check, capture: measured };
       }
     }
-    // The video is stored in the background after the check answers, so the
-    // reviewer's copy may not exist (still uploading, or the upload failed).
-    // Do not send a listing to review with a link to nothing.
+
     if (consume && stored.videoUrl && (await this.walkthroughVideoMissing(stored.videoUrl))) {
       throw new BadRequestException(
         'Your walkthrough video has not finished uploading, or the upload failed. Wait a moment and submit again; if it keeps failing, record the walkthrough again.',
       );
     }
-    // Spent only once it has passed every check above: a submit refused for
-    // another reason (or a pin that is moved back) must not cost the host the
-    // recording. Callers also run this last, right before the save.
+
     if (consume) await this.redis.del(key);
     return { check, videoUrl: stored.videoUrl };
   }
 
-  /** True only when storage answers and the video is definitely not there. An
-   *  unreachable or unexpected answer is not treated as missing, so a storage
-   *  hiccup cannot block a submit on its own. */
   private async walkthroughVideoMissing(videoUrl: string): Promise<boolean> {
     try {
       const marker = '/listing-media/';
@@ -803,12 +881,6 @@ export class HostListingsService implements OnModuleDestroy {
     }
   }
 
-  /** What is saved as the listing's `telemetry`. `status` is deliberately
-   *  never `passed`: the capture location is reported by the device and the
-   *  automatic check cannot tell footage of this property from anything else,
-   *  so the listing reaches the reviewer as `needs_review` until a person has
-   *  watched the video. `walkthroughCheck` carries what the check did find.
-   *  The one-time token is not stored: it is spent. */
   private walkthroughTelemetry(w: { check: WalkthroughCheckRecord; videoUrl?: string }) {
     return {
       walkthroughPassed: true as const,
@@ -818,24 +890,6 @@ export class HostListingsService implements OnModuleDestroy {
     };
   }
 
-  /**
-   * The walkthrough part of a submit (submitFull / resubmit).
-   *
-   * 1. A fresh receipt from a recording made in this session wins: it is
-   *    redeemed (single-use) and re-checked against the final pin.
-   * 2. Otherwise — the host edited something unrelated and did not record
-   *    again — the walkthrough already stored on the listing is kept, so editing
-   *    a price does not force a re-recording. It is still re-measured against
-   *    the final pin: moving the pin away from where it was recorded needs a new
-   *    recording.
-   *      - A stored camera capture is re-measured against the pin.
-   *      - A walkthrough from before camera capture existed (no capture data)
-   *        is kept as it is, but only on a listing that has already been
-   *        submitted (status other than `draft`, where it passed the old
-   *        token gate), and only while the pin has not moved from the pin the
-   *        listing had. The reviewer sees it labelled as having no capture data.
-   *    Never taken from the request body.
-   */
   private async resolveWalkthrough(
     userId: string,
     token: string | undefined,
@@ -880,20 +934,6 @@ export class HostListingsService implements OnModuleDestroy {
     );
   }
 
-  /**
-   * Works out the capture evidence for the photo list being saved.
-   *
-   * The form carries only URLs, and a URL the client types is not evidence of
-   * anything, so each photo must be one of:
-   *   - a photo already on this listing (its stored capture is kept; or, if it
-   *     has none, it is a pre-capture upload and stays labelled as such — so
-   *     editing an unrelated field never forces a re-capture), or
-   *   - a photo with a live capture receipt for this host, i.e. taken with
-   *     the in-app camera and uploaded through uploadPhotos.
-   * Anything else is refused. Entries for photos no longer in the list are
-   * dropped. When `pin` is given (submit) every capture is re-measured
-   * against it and an out-of-range one is refused by name.
-   */
   private async resolvePhotoCaptures(
     userId: string,
     photos: { url: string }[] | undefined,
@@ -922,7 +962,6 @@ export class HostListingsService implements OnModuleDestroy {
             const parsed = JSON.parse(raw);
             if (isCaptureRecord(parsed)) record = parsed;
           } catch {
-            /* treated as no receipt */
           }
         }
       }
@@ -952,9 +991,6 @@ export class HostListingsService implements OnModuleDestroy {
     return { captures, legacy };
   }
 
-  /** The optional property video can no longer be uploaded (see the
-   *  media/video route). A value that is already on the listing is kept
-   *  as it was; anything new is refused. */
   private assertVideoUrlUnchanged(videoUrl: unknown, existing: ListingEntity | null) {
     if (typeof videoUrl !== 'string' || videoUrl === '') return;
     const prior = (existing?.draft_data as Record<string, any> | null)?.media?.videoUrl;
@@ -965,8 +1001,6 @@ export class HostListingsService implements OnModuleDestroy {
     }
   }
 
-  /** A single listing the caller owns, flattened the same way findMine is,
-   *  for prefilling the edit form. */
   async findMineById(userId: string, id: string) {
     const row = await this.listings.findOne({ where: { id, host_id: userId } });
     if (!row) {
@@ -983,28 +1017,13 @@ export class HostListingsService implements OnModuleDestroy {
       draft: {
         ...(draft.property_details ?? draft.property ?? draft.basics ?? {}),
         ...(draft.telemetry ?? {}),
-        ...(draft.banking ?? {}),
         ...(draft.media ?? {}),
+        ...(draft.wifi?.answer ? { wifiAnswer: draft.wifi.answer } : {}),
       },
+      wifi: draft.wifi ?? null,
     };
   }
 
-  /**
-   * Lets a host fix a `draft`/`changes_needed`/`rejected` listing, or edit an
-   * already-`live` one, and send it for review. Overwrites
-   * `property_details`/telemetry/banking the same way submitFull
-   * builds them, then moves the row to `in_review` and clears the old
-   * review note — a stale "changes needed" reason must not linger once the
-   * host has acted on it. For a `live` row this is the entire edit
-   * mechanism: the listing drops out of public search the instant this
-   * runs (every public query filters on status = 'live'), so a guest is
-   * never shown data the host is mid-changing, and it only returns to
-   * `live` once an admin approves the edit through the same review queue a
-   * first-time submission goes through.
-   *
-   * Identity/host-type still come from the verified profile, never the
-   * request body, for the same reason submitFull does that.
-   */
   async resubmit(userId: string, id: string, body: unknown) {
     const existing = await this.listings.findOne({
       where: { id, host_id: userId },
@@ -1017,9 +1036,6 @@ export class HostListingsService implements OnModuleDestroy {
       throw new ConflictException('This listing cannot be edited right now.');
     }
 
-    // Same account-level gate submitFull applies: an edit is just as capable
-    // of putting a listing in front of the reviewer, so it must not be a way
-    // around a verification that has since been revoked.
     const profile = await this.profiles.findOne({ where: { id: userId } });
     if (!profile) {
       throw new NotFoundException('Profile not found');
@@ -1034,28 +1050,32 @@ export class HostListingsService implements OnModuleDestroy {
     }
     const d = parsed.data;
 
-    // Same server-side re-verification submitFull does — a resubmit/edit is
-    // just as capable of swapping the pin after the walkthrough was recorded
-    // as the original submit is. A host who did not record again keeps the
-    // walkthrough already on the listing (resolveWalkthrough).
     const pin = { lat: d.lat, lng: d.lng };
-    // A draft going out for the first time keeps the "today or later" rule.
+
     const property = this.parseProperty(d, { clampPastDate: existing.status !== 'draft' });
     await this.assertPinAgrees(property);
     const { captures } = await this.resolvePhotoCaptures(userId, property.photos, existing, pin);
     this.assertVideoUrlUnchanged(d.videoUrl, existing);
-    // Last of the checks: it spends the one-time walkthrough receipt, so
-    // nothing that can still refuse the submit may run after it.
+    const wifi = await this.resolveWifi(userId, { answer: d.wifiAnswer, token: d.wifiTestToken }, pin, existing, true);
+    this.applyWifiRules(property, wifi.wifi, true);
+
     const telemetry = await this.resolveWalkthrough(userId, d.walkthroughToken, pin, existing);
+    await wifi.spend();
 
     const priorDraft = (existing.draft_data as Record<string, any>) ?? {};
-    const { banking: _droppedBanking, wizard: _droppedWizard, ...priorDraftWithoutBanking } = priorDraft;
+    const {
+      banking: _droppedBanking,
+      wizard: _droppedWizard,
+      wifi: _replacedWifi,
+      ...priorDraftWithoutBanking
+    } = priorDraft;
     const draft_data = {
       ...priorDraftWithoutBanking,
       property_details: property,
       telemetry,
+      ...(wifi.wifi ? { wifi: wifi.wifi } : {}),
       media: mediaSchema.parse(d),
-      captures: { photos: captures },
+      captures: { photos: captures, ...(wifi.record ? { wifi: wifi.record } : {}) },
     };
 
     const wasLive = existing.status === 'live';
@@ -1068,11 +1088,6 @@ export class HostListingsService implements OnModuleDestroy {
 
     const saved = await this.listings.save(existing);
 
-    // This is the one HostListingsService write that can change what
-    // public search/town-summary results return: a live listing dropping
-    // to in_review must stop showing in cached results promptly, not just
-    // after the cache's own short TTL. draft/changes_needed/rejected rows
-    // were never in `live` and so were never in the cache to begin with.
     if (wasLive) {
       await this.redis.incrementVersion(SEARCH_CACHE_VERSION_KEY);
     }
@@ -1080,23 +1095,6 @@ export class HostListingsService implements OnModuleDestroy {
     return { listingId: saved.id, status: 'in_review' as const };
   }
 
-  /**
-   * "Save & exit" — persists whatever the host has filled in so far as a
-   * `draft`-status row, with no schema-completeness requirement (unlike
-   * submitFull/resubmit, which both gate on fullOnboardingSchema). Called
-   * repeatedly across a session: the first call creates the row, every call
-   * after reuses `existingListingId` so the host's one in-progress draft
-   * doesn't fork into several rows. Leaves `status` alone once it's past
-   * `draft` — a host mid-fixing a `changes_needed` row who exits again must
-   * not silently lose the fact that ops already reviewed it once — with one
-   * exception: a `live` row is pulled back to `in_review`, since it's
-   * publicly visible right now and an edit sitting in `draft_data` must not
-   * go out to guests without another review pass (same as resubmit()).
-   *
-   * Identity/host-type are stamped from the verified profile the same
-   * way submitFull does, so a draft row looks the same shape as a submitted
-   * one once `findMineById`/the edit page read it back.
-   */
   async saveDraft(userId: string, body: unknown, existingListingId?: string) {
     const profile = await this.profiles.findOne({ where: { id: userId } });
     if (!profile) {
@@ -1116,9 +1114,7 @@ export class HostListingsService implements OnModuleDestroy {
           'This listing cannot be saved as a draft right now.',
         );
       }
-      // A live listing is what guests see, and a half-filled save cannot be
-      // put in front of the reviewer in its place. Its edit is only ever sent
-      // whole, through resubmit(), which validates it first.
+
       if (existing.status === 'live') {
         throw new ConflictException(
           'A live listing cannot be saved as a draft. Submit your changes for review, or leave without saving.',
@@ -1130,25 +1126,9 @@ export class HostListingsService implements OnModuleDestroy {
     const priorFlat: Record<string, unknown> = {
       ...(priorDraft.property_details ?? {}),
       ...(priorDraft.telemetry ?? {}),
-      ...(priorDraft.banking ?? {}),
       ...(priorDraft.media ?? {}),
     };
 
-    // RHF's controlled inputs need a defined default, so the client sends
-    // untouched fields as '' / [] rather than omitting them — but zod's
-    // `.partial()` only relaxes *absent* keys, not ones present-but-empty,
-    // so e.g. streetAddress: '' still fails its own min(3) even though the
-    // host hasn't reached that field yet. Stripping those out is what makes
-    // an in-progress draft "partial" enough to validate — but only for a
-    // field with no prior saved value. A field the host had already filled
-    // in on an earlier save, then deliberately cleared back to '', must
-    // still go through as '' (an explicit clear), or the stale saved value
-    // would linger in draft_data forever with no way for the host to remove
-    // it (previously: any '' silently kept whatever was saved from before).
-    // A text field cleared back to '' can't go through the partial schema (it
-    // still carries min-length rules), so it is taken out of the body and the
-    // saved value dropped after the merge below. An emptied list ([]) is a valid
-    // value and goes through, which is how removing every photo is saved.
     const clearedText = new Set<string>();
     const stripUntouchedEmpty = (obj: unknown): unknown => {
       if (typeof obj !== 'object' || obj === null || Array.isArray(obj))
@@ -1184,41 +1164,33 @@ export class HostListingsService implements OnModuleDestroy {
         ? { lat: property.lat, lng: property.lng }
         : undefined;
 
-    // Photos: same rule as submit (a photo must be one already on this listing
-    // or a camera capture), so a draft cannot be used to smuggle in a URL that
-    // the submit would later treat as "already on the listing". The pin is not
-    // enforced here — the draft may be half-filled — only at submit.
     const { captures } = await this.resolvePhotoCaptures(userId, property.photos, existing, undefined);
     this.assertVideoUrlUnchanged(d.videoUrl, existing);
 
-    // Telemetry is never copied from the request body here: a client-supplied
-    // `walkthroughPassed: true` saved onto a draft would otherwise read as a
-    // walkthrough that was checked. It is either what the server already
-    // stored, or a still-valid receipt from a recording made just now (read
-    // without spending it — the host has not submitted yet).
     let telemetry: Record<string, unknown> = priorDraft.telemetry ?? {};
     if (d.walkthroughToken) {
       try {
         const fresh = await this.readWalkthroughToken(userId, d.walkthroughToken, pin, false);
         if (fresh) telemetry = this.walkthroughTelemetry(fresh);
       } catch {
-        /* an out-of-range or unreadable receipt is reported at submit; keep what was stored */
       }
     }
 
-    // Not in the draft schema (which drops unknown keys), so read on its own;
-    // an unreadable value keeps whatever was saved before.
+    const wifi = await this.resolveWifi(userId, { answer: d.wifiAnswer, token: d.wifiTestToken }, pin, existing, false);
+    this.applyWifiRules(property, wifi.wifi, false);
+
     const wizard = wizardProgressSchema.safeParse((body as { wizard?: unknown } | null)?.wizard);
 
     const draft_data = {
       ...priorDraft,
       ...(wizard.success ? { wizard: wizard.data } : {}),
       kind: { host_kind: profile.host_kind },
-      identity: { pan: profile.pan, gst: profile.gst ?? '' },
+      identity: { gst: profile.gst ?? '' },
       property_details: property,
       telemetry,
+      ...(wifi.wifi ? { wifi: wifi.wifi } : {}),
       media: { ...(priorDraft.media ?? {}), ...mediaSchema.partial().parse(d) },
-      captures: { photos: captures },
+      captures: { photos: captures, ...(wifi.record ? { wifi: wifi.record } : {}) },
     };
 
     const row = existing
@@ -1229,23 +1201,7 @@ export class HostListingsService implements OnModuleDestroy {
     return { listingId: saved.id, status: saved.status };
   }
 
-  /**
-   * The caller's most recent `draft`-status row, if any — lets the wizard
-   * offer to resume it on a fresh device/browser instead of only the
-   * same-device localStorage autosave. Not `changes_needed`/`rejected`:
-   * those already have a dedicated resume path (the "fix and resubmit" link
-   * from HostListings), and surfacing them here too would let a host
-   * "continue" a review-bounced listing without ever seeing why it bounced.
-   */
   async findLatestDraft(userId: string, targetListingId?: string) {
-    // A forced resume names the exact draft it saved — that row must be the
-    // one returned, not whatever "most recent" resolves to. Multiple
-    // concurrent drafts for the same host are a real case (the host started
-    // a second listing), and "most recent by updated_at" is not even well-defined when
-    // updated_at is null, which every draft row currently is regardless —
-    // saveDraft sets it, but nothing backfills it for a row inserted
-    // outside that path. Filtering by id when the caller has one sidesteps
-    // that ordering question entirely instead of depending on it.
     const row = targetListingId
       ? await this.listings.findOne({
           where: { id: targetListingId, host_id: userId, status: 'draft' },
@@ -1270,26 +1226,16 @@ export class HostListingsService implements OnModuleDestroy {
         draft: {
           ...(draft.property_details ?? {}),
           ...(draft.telemetry ?? {}),
-          ...(draft.banking ?? {}),
-            ...(draft.media ?? {}),
+          ...(draft.media ?? {}),
+          ...(draft.wifi?.answer ? { wifiAnswer: draft.wifi.answer } : {}),
         },
         wizard: draft.wizard ?? null,
+
+        wifi: draft.wifi ?? null,
       },
     };
   }
 
-  /**
-   * The single write for the one-page listing form. Identity/host-type
-   * are NOT read from the request body — they are account-level facts on
-   * `profiles`, verified once from Account & Profile. Taking them from the
-   * row rather than the client is what stops a caller claiming a PAN or
-   * registration number that was never verified.
-   *
-   * `draft_data` keeps the shape the old per-step PATCHes built up, because
-   * the read paths (listings.service.ts, admin properties, public listings)
-   * key off draft.property_details / draft.kind / etc. and must not need to
-   * change.
-   */
   async submitFull(userId: string, body: unknown, existingListingId?: string) {
     const profile = await this.profiles.findOne({ where: { id: userId } });
     if (!profile) {
@@ -1307,57 +1253,44 @@ export class HostListingsService implements OnModuleDestroy {
     }
     const d = parsed.data;
 
-    // A "Save & exit" earlier in this same session may have already created
-    // a `draft` row — promote that row to `in_review` instead of creating a
-    // second one for what the host experiences as a single listing attempt.
     let existing: ListingEntity | null = null;
     if (existingListingId) {
       existing = await this.listings.findOne({
         where: { id: existingListingId, host_id: userId },
       });
       if (existing && existing.status !== 'draft') {
-        // Already submitted (a double click, a second tab): say so rather than
-        // quietly creating a second listing for the same attempt.
         throw new ConflictException('This listing has already been submitted.');
       }
     }
 
-    // Re-verify server-side that the walkthrough was recorded for THIS pin —
-    // never trust the client-supplied walkthroughPassed boolean alone (see
-    // readWalkthroughToken / resolveWalkthrough). Throws if there is no
-    // usable recording, or it was made for a different pin. Every photo must
-    // likewise be a camera capture near this pin (resolvePhotoCaptures).
     const pin = { lat: d.lat, lng: d.lng };
     const property = this.parseProperty(d);
     await this.assertPinAgrees(property);
     const { captures } = await this.resolvePhotoCaptures(userId, property.photos, existing, pin);
     this.assertVideoUrlUnchanged(d.videoUrl, existing);
-    // Last of the checks: it spends the one-time walkthrough receipt, so
-    // nothing that can still refuse the submit may run after it.
+
+    const wifi = await this.resolveWifi(userId, { answer: d.wifiAnswer, token: d.wifiTestToken }, pin, existing, true);
+    this.applyWifiRules(property, wifi.wifi, true);
+
     const telemetry = await this.resolveWalkthrough(userId, d.walkthroughToken, pin, existing);
+    await wifi.spend();
 
     const draft_data = {
-      // From the verified profile, never from the request body.
       kind: { host_kind: profile.host_kind },
-      identity: { pan: profile.pan, gst: profile.gst ?? '' },
-      // From this submission.
+      identity: { gst: profile.gst ?? '' },
+
       property_details: property,
       telemetry,
-      // Not a form field — payout details live on the verified account
-      // (users.bank_account_number/bank_ifsc/bank_account_holder_name,
-      // gated through assertKycVerified above), never re-collected per listing.
+
+      ...(wifi.wifi ? { wifi: wifi.wifi } : {}),
       media: mediaSchema.parse(d),
-      // Where, per the device, each photo was captured. Kept out of
-      // property_details because that block is public (listing-mapper.ts) and
-      // the capture coordinates are the property's exact location.
-      captures: { photos: captures },
+
+      captures: { photos: captures, ...(wifi.record ? { wifi: wifi.record } : {}) },
     };
 
     return await this.dataSource.transaction(async (manager) => {
       const listings = manager.getRepository(ListingEntity);
       if (existing) {
-        // Locked and re-read so two simultaneous submits of one draft cannot
-        // both promote it (or one promote it while the other forks a row).
         const locked = await listings.findOne({
           where: { id: existing.id, host_id: userId },
           lock: { mode: 'pessimistic_write' },

@@ -14,8 +14,6 @@ import { UserModule } from '../user/user.module';
   imports: [
     TypeOrmModule.forFeature([UserEntity, EmailOtpEntity]),
     forwardRef(() => NotificationsModule),
-    // AuthService.completeSignup validates/uploads a picked avatar via
-    // UserService — see UserModule's forwardRef(() => AuthModule) import.
     forwardRef(() => UserModule),
   ],
   controllers: [AuthController],

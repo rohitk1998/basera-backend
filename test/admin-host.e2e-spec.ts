@@ -36,19 +36,9 @@ import { RedisService } from '../src/redis/redis.service';
 import { StorageService } from '../src/storage/storage.service';
 import { VerificationService } from '../src/verification/verification.service';
 
-/**
- * HTTP-level e2e for every non-media endpoint of AdminController and
- * HostListingsController. Real controllers, real services, real AuthGuard
- * (signed JWT in the session cookie) and real AdminGuard, real
- * ValidationPipe / ApiExceptionFilter / ResponseMessageInterceptor. Only the
- * database, Redis, storage, notifications and the booking engine are faked.
- */
-
 const JWT_SECRET = 'test-secret';
 const token = (sub: string, opts: jwt.SignOptions = {}) => jwt.sign({ sub }, JWT_SECRET, opts);
 const as = (sub: string) => `${SESSION_COOKIE}=${token(sub)}`;
-
-/* ── tiny in-memory repository ─────────────────────────────────────────── */
 
 type Row = Record<string, any>;
 const matches = (r: Row, where: any): boolean =>
@@ -83,9 +73,9 @@ function makeRepo(rows: Row[]) {
 
 const USERS = {
   admin: { id: 'admin1', role: 'admin', full_name: 'Ops Admin', isHost: false },
-  host: { id: 'host1', role: 'host', full_name: 'Hema Host', phone: '+911', email: 'h@x.in', isHost: true, selfie_uploaded_at: new Date(), bank_verified_at: new Date(), host_kind: 'individual', pan: 'ABCDE1234F', gst: null },
+  host: { id: 'host1', role: 'host', full_name: 'Hema Host', phone: '+911', email: 'h@x.in', isHost: true, selfie_uploaded_at: new Date(), host_kind: 'individual', gst: null },
   guest: { id: 'guest1', role: 'guest', full_name: 'Gita Guest', email: 'g@x.in', isHost: false },
-  other: { id: 'host2', role: 'host', full_name: 'Other Host', isHost: true, selfie_uploaded_at: new Date(), bank_verified_at: new Date(), host_kind: 'individual', pan: 'ABCDE1234F', gst: null },
+  other: { id: 'host2', role: 'host', full_name: 'Other Host', isHost: true, selfie_uploaded_at: new Date(), host_kind: 'individual', gst: null },
 };
 
 const expectError = (res: request.Response, status: number, message?: string | RegExp) => {
@@ -95,10 +85,6 @@ const expectError = (res: request.Response, status: number, message?: string | R
   if (typeof message === 'string') expect(res.body.message).toBe(message);
   else if (message) expect(res.body.message).toMatch(message);
 };
-
-/* ══════════════════════════════════════════════════════════════════════════
- *  ADMIN
- * ══════════════════════════════════════════════════════════════════════ */
 
 describe('Admin API (/api/admin)', () => {
   let app: INestApplication;
@@ -114,7 +100,6 @@ describe('Admin API (/api/admin)', () => {
   let bookingCalls: any[];
   let bookingFail: Error | null;
 
-  /** A listing whose camera-capture evidence passes (so the approval gate only waits on banking). */
   const goodDraft = () => {
     const rec = (kind: string) => ({ kind, lat: 32.2, lng: 77.1, accuracyM: 10, capturedAt: new Date().toISOString(), receivedAt: new Date().toISOString(), distanceFromPinM: 5, source: 'device_reported' });
     return {
@@ -137,12 +122,10 @@ describe('Admin API (/api/admin)', () => {
       { id: 'B2', status: 'confirmed', listing_id: 'L2', guest_id: 'guest1', host_id: 'host2', updated_at: new Date() },
     ];
     vreqs = [
-      { id: 'V1', user_id: 'host1', verification_type: 'bank', status: 'pending', document_path: 'host1/bank/a.jpg', document_path_back: null, bank_account_holder_name: 'Hema Host', bank_ifsc: 'HDFC0001', bank_account_number: '123', bank_name: 'HDFC', submitted_at: new Date('2026-02-02'), reviewed_by: null },
-      { id: 'V0', user_id: 'host1', verification_type: 'bank', status: 'rejected', rejection_reason: 'blurry', submitted_at: new Date('2026-02-01'), reviewed_by: 'admin1', document_path: null },
+      { id: 'V1', user_id: 'host1', verification_type: 'identity', status: 'pending', document_path: 'host1/id/a.jpg', document_path_back: null, submitted_at: new Date('2026-02-05'), reviewed_by: null },
+      { id: 'V0', user_id: 'host1', verification_type: 'identity', status: 'rejected', rejection_reason: 'blurry', submitted_at: new Date('2026-02-01'), reviewed_by: 'admin1', document_path: null },
       { id: 'V2', user_id: 'host1', verification_type: 'selfie', status: 'pending', document_path: 'host1/selfie/s.jpg', submitted_at: new Date('2026-02-03'), reviewed_by: null },
-      { id: 'V3', user_id: 'host1', verification_type: 'pan', status: 'pending', document_path: null, submitted_at: new Date('2026-02-04'), reviewed_by: null },
-      { id: 'V4', user_id: 'host1', verification_type: 'identity', status: 'pending', document_path: 'host1/id/a.jpg', submitted_at: new Date('2026-02-05'), reviewed_by: null },
-      { id: 'V5', user_id: 'host1', verification_type: 'pan', status: 'verified', document_path: 'p', submitted_at: new Date('2026-01-01'), reviewed_by: 'admin1' },
+      { id: 'V3', user_id: 'host1', verification_type: 'selfie', status: 'rejected', rejection_reason: 'dark', document_path: null, submitted_at: new Date('2026-01-15'), reviewed_by: null },
     ];
     vaudit = [];
     notifLog = [];
@@ -300,8 +283,6 @@ describe('Admin API (/api/admin)', () => {
   const api = () => request(app.getHttpServer());
   const adm = (m: 'get' | 'post' | 'patch', url: string) => api()[m](url).set('Cookie', as('admin1'));
 
-  /* ── auth: every route ─────────────────────────────────────────────── */
-
   const ROUTES: [string, string, string, any][] = [
     ['get', 'GET', '/api/admin/audits', {}],
     ['get', 'GET', '/api/admin/properties', {}],
@@ -317,7 +298,6 @@ describe('Admin API (/api/admin)', () => {
     ['patch', 'PATCH', '/api/admin/disputes/B1/appeal', { amountToGuest: 1 }],
     ['get', 'GET', '/api/admin/users/host1/verification', {}],
     ['get', 'GET', '/api/admin/verification/V1', {}],
-    ['post', 'POST', '/api/admin/verification/V1/review', { decision: 'approve' }],
     ['get', 'GET', '/api/admin/verification/V1/document-url', {}],
   ];
 
@@ -338,7 +318,6 @@ describe('Admin API (/api/admin)', () => {
         const res = await (api() as any)[m](url).set('Cookie', as(who)).send(body);
         expectError(res, 403, 'Admin role required');
       }
-      // and nothing was mutated
       expect(vaudit).toHaveLength(0);
       expect(profiles.find((p) => p.id === 'guest1')!.isHost).toBe(false);
     });
@@ -354,25 +333,21 @@ describe('Admin API (/api/admin)', () => {
     });
   });
 
-  /* ── audits ──────────────────────────────────────────────────────── */
-
   describe('GET /audits', () => {
     it('maps notification-log rows to audit events', async () => {
-      notifLog = [{ id: 'n1', event: 'banking_passed', payload: { notes: 'all good', actor: 'Ops' }, sent_at: new Date() }];
+      notifLog = [{ id: 'n1', event: 'telemetry_passed', payload: { notes: 'all good', actor: 'Ops' }, sent_at: new Date() }];
       const res = await adm('get', '/api/admin/audits').expect(200);
       expect(res.body.total).toBe(1);
-      expect(res.body.audits[0]).toMatchObject({ id: 'n1', kind: 'banking', title: 'Banking Verification — Passed ✓', desc: 'all good', actor: 'Ops' });
+      expect(res.body.audits[0]).toMatchObject({ id: 'n1', kind: 'telemetry', title: 'Telemetry Verification — Passed ✓', desc: 'all good', actor: 'Ops' });
     });
 
     it('falls back to events synthesised from listings when the log is empty', async () => {
       listings[0].draft_data = { telemetry: { status: 'passed' }, banking: { status: 'failed' } };
       const res = await adm('get', '/api/admin/audits').expect(200);
-      expect(res.body.audits.map((a: any) => a.id).sort()).toEqual(['banking-L1', 'telemetry-L1']);
-      expect(res.body.total).toBe(2);
+      expect(res.body.audits.map((a: any) => a.id)).toEqual(['telemetry-L1']);
+      expect(res.body.total).toBe(1);
     });
   });
-
-  /* ── properties list ───────────────────────────────────────────────── */
 
   describe('GET /properties', () => {
     it('lists listings with host, layers, verification and status counts', async () => {
@@ -381,14 +356,15 @@ describe('Admin API (/api/admin)', () => {
       const l1 = res.body.properties.find((p: any) => p.id === 'L1');
       expect(l1).toMatchObject({ title: 'Pine Cabin', town: 'Manali', hostName: 'Hema Host', status: 'in_review', price: expect.any(Number) });
       expect(l1.layers.telemetry.status).toBe('passed');
-      expect(l1.layers.banking.status).toBe('submitted'); // newest bank request is still pending
-      expect(l1.verification.bank).toMatchObject({ requestId: 'V1', hasDocument: true });
+      expect(l1.layers).not.toHaveProperty('banking');
+      expect(Object.keys(l1.verification)).toEqual(['identity', 'selfie']);
+      expect(l1.verification.identity).toMatchObject({ requestId: 'V1', hasDocument: true });
     });
 
     it('filters by status', async () => {
       const res = await adm('get', '/api/admin/properties?status=live').expect(200);
       expect(res.body.properties.map((p: any) => p.id)).toEqual(['L2']);
-      expect(res.body.counts.all).toBe(3); // counts ignore the filter
+      expect(res.body.counts.all).toBe(3);
     });
 
     it('searches title / town / host name case-insensitively', async () => {
@@ -403,16 +379,12 @@ describe('Admin API (/api/admin)', () => {
       expect([junk.page, junk.pageSize]).toEqual([1, 20]);
     });
 
-    // BUG: a negative page/pageSize is passed through (parseInt('-5') is truthy), which
-    // becomes a negative OFFSET/LIMIT in SQL. Should be clamped to >= 1.
     it.failing('BUG: clamps a negative page / pageSize to a sane value', async () => {
       const res = await adm('get', '/api/admin/properties?page=-5&pageSize=-5').expect(200);
       expect(res.body.page).toBeGreaterThanOrEqual(1);
       expect(res.body.pageSize).toBeGreaterThanOrEqual(1);
     });
   });
-
-  /* ── walkthrough url ────────────────────────────────────────────────── */
 
   describe('GET /properties/:id/walkthrough-url', () => {
     it('returns a signed URL for a video in the listing-media bucket', async () => {
@@ -434,8 +406,6 @@ describe('Admin API (/api/admin)', () => {
       expectError(await adm('get', '/api/admin/properties/L1/walkthrough-url'), 404, /not found in storage/);
     });
   });
-
-  /* ── review decision ────────────────────────────────────────────────── */
 
   describe('PATCH /properties/:id', () => {
     const patch = (id: string, body: any) => adm('patch', `/api/admin/properties/${id}`).send(body);
@@ -465,21 +435,12 @@ describe('Admin API (/api/admin)', () => {
       expectError(await patch('zzz', { status: 'paused' }), 404, 'Listing not found');
     });
 
-    it('409 when going live while banking has not passed; nothing changes', async () => {
-      profiles.find((p) => p.id === 'host1')!.bank_verified_at = null;
-      const res = await patch('L1', { status: 'live' });
-      expectError(res, 409, /Cannot approve yet: Banking is submitted/);
-      expect(listings[0].status).toBe('in_review');
-      expect(notified).toHaveLength(0);
-    });
-
     it('409 when camera capture has not passed (legacy listing)', async () => {
       const res = await patch('L2', { status: 'live', overrideChecks: false });
       expectError(res, 409, /Camera capture is not started/);
     });
 
     it('approves a clear listing: live, notifies the host, bumps the search cache, hides draft_data', async () => {
-      vreqs.find((r) => r.id === 'V1')!.status = 'verified';
       const res = await patch('L1', { status: 'live' }).expect(200);
       expect(res.body).toMatchObject({ success: true, message: 'Listing approved and published.', listing: { id: 'L1', status: 'live', reviewed_by: 'admin1' } });
       expect(res.body.listing.draft_data).toBeUndefined();
@@ -517,8 +478,6 @@ describe('Admin API (/api/admin)', () => {
     });
   });
 
-  /* ── stats ───────────────────────────────────────────────────────── */
-
   it('GET /stats returns the dashboard figures', async () => {
     const res = await adm('get', '/api/admin/stats').expect(200);
     expect(res.body.stats).toEqual({
@@ -529,22 +488,17 @@ describe('Admin API (/api/admin)', () => {
       draftProperties: 1,
       totalUsers: 4,
       geoLock: { passed: 1, total: 2 },
-      bankVerified: { verified: 1, total: 2 },
     });
   });
 
-  /* ── users ───────────────────────────────────────────────────────── */
-
   describe('GET /users', () => {
     it('lists users with flags, listing counts, kyc status and counts', async () => {
-      // kyc 'verified' = approved identity + selfie (the shared gate), not bank/PAN.
       vreqs.push({ id: 'V6', user_id: 'host1', verification_type: 'identity', status: 'verified', submitted_at: new Date('2026-03-01'), reviewed_by: 'admin1' });
       const res = await adm('get', '/api/admin/users').expect(200);
       expect(res.body).toMatchObject({ total: 4, page: 1, pageSize: 20, counts: { all: 4, hosts: 2, admins: 1, guests: 1 } });
       const host = res.body.users.find((u: any) => u.id === 'host1');
       expect(host).toMatchObject({ name: 'Hema Host', isHost: true, isAdmin: false, propertiesCount: 2, kycStatus: 'verified' });
       expect(res.body.users.find((u: any) => u.id === 'admin1').isAdmin).toBe(true);
-      // host2 has a selfie and bank but no verified identity -> not KYC-verified.
       expect(res.body.users.find((u: any) => u.id === 'host2').kycStatus).toBe('not_submitted');
     });
     it('kycStatus follows the NEWEST identity request, not an older verified one', async () => {
@@ -587,8 +541,6 @@ describe('Admin API (/api/admin)', () => {
     });
   });
 
-  /* ── payments ────────────────────────────────────────────────────── */
-
   describe('GET /payments', () => {
     it('lists the ledger joined with booking status', async () => {
       const res = await adm('get', '/api/admin/payments').expect(200);
@@ -600,8 +552,6 @@ describe('Admin API (/api/admin)', () => {
       expect((await adm('get', '/api/admin/payments?status=weird').expect(200)).body).toEqual({ payments: [], total: 0 });
     });
   });
-
-  /* ── disputes ────────────────────────────────────────────────────── */
 
   describe('disputes', () => {
     it('GET /disputes lists disputed bookings only', async () => {
@@ -645,16 +595,14 @@ describe('Admin API (/api/admin)', () => {
     });
   });
 
-  /* ── verification ───────────────────────────────────────────────── */
-
   describe('GET /users/:id/verification', () => {
     it('groups requests by type with the newest as current and the rest as history', async () => {
       const res = await adm('get', '/api/admin/users/host1/verification').expect(200);
       expect(res.body.userId).toBe('host1');
-      expect(res.body.types.map((t: any) => t.type)).toEqual(['identity', 'pan', 'bank', 'selfie']);
-      const bank = res.body.types.find((t: any) => t.type === 'bank');
-      expect(bank.current.id).toBe('V1');
-      expect(bank.previousAttempts).toMatchObject([{ id: 'V0', status: 'rejected', rejectionReason: 'blurry', reviewedBy: 'Ops Admin' }]);
+      expect(res.body.types.map((t: any) => t.type)).toEqual(['identity', 'selfie']);
+      const identity = res.body.types.find((t: any) => t.type === 'identity');
+      expect(identity.current.id).toBe('V1');
+      expect(identity.previousAttempts).toMatchObject([{ id: 'V0', status: 'rejected', rejectionReason: 'blurry', reviewedBy: 'Ops Admin' }]);
     });
     it('returns empty slots for a user with no requests', async () => {
       const res = await adm('get', '/api/admin/users/guest1/verification').expect(200);
@@ -663,23 +611,22 @@ describe('Admin API (/api/admin)', () => {
   });
 
   describe('GET /verification/:id', () => {
-    it('returns detail with signed URLs, bank block, history and audit log', async () => {
+    it('returns detail with signed URLs, history and audit log', async () => {
       vaudit.push({ id: 'a0', admin_id: 'admin1', action: 'rejected', previous_status: 'pending', new_status: 'rejected', created_at: new Date() });
       const res = await adm('get', '/api/admin/verification/V1').expect(200);
       expect(res.body).toMatchObject({
         id: 'V1',
         userName: 'Hema Host',
-        verificationType: 'bank',
+        verificationType: 'identity',
         status: 'pending',
-        documentUrl: 'https://signed.test/verification-documents/host1/bank/a.jpg',
+        documentUrl: 'https://signed.test/verification-documents/host1/id/a.jpg',
         documentBackUrl: null,
-        bank: { ifsc: 'HDFC0001', accountHolderName: 'Hema Host' },
         previousAttempts: [{ id: 'V0', status: 'rejected' }],
         auditLog: [{ adminName: 'Ops Admin', newStatus: 'rejected' }],
       });
     });
-    it('omits the bank block for non-bank types', async () => {
-      expect((await adm('get', '/api/admin/verification/V2').expect(200)).body.bank).toBeUndefined();
+    it('has no bank block', async () => {
+      expect((await adm('get', '/api/admin/verification/V1').expect(200)).body).not.toHaveProperty('bank');
     });
     it('404 for an unknown request', async () => {
       expectError(await adm('get', '/api/admin/verification/zzz'), 404, 'Verification request not found');
@@ -696,76 +643,11 @@ describe('Admin API (/api/admin)', () => {
     });
   });
 
-  describe('POST /verification/:id/review', () => {
-    const review = (id: string, body: any) => adm('post', `/api/admin/verification/${id}/review`).send(body);
-
-    it('approves a bank request: verified, profile bank gate flipped, audit row, host notified', async () => {
-      profiles.find((p) => p.id === 'host1')!.bank_verified_at = null;
-      const res = await review('V1', { decision: 'approve' }).expect(201);
-      expect(res.body).toMatchObject({ success: true, message: 'Verification approved.', request: { id: 'V1', status: 'verified', reviewed_by: 'admin1', rejection_reason: null } });
-      const host = profiles.find((p) => p.id === 'host1')!;
-      expect(host.bank_verified_at).toBeInstanceOf(Date);
-      expect(host.bank_account_name).toBe('Hema Host');
-      expect(vaudit).toHaveLength(1);
-      expect(vaudit[0]).toMatchObject({ verification_request_id: 'V1', action: 'approved', previous_status: 'pending', new_status: 'verified' });
-      expect(notified[0].slice(0, 2)).toEqual(['verification.layer_passed', 'host1']);
-    });
-
-    it('approves a selfie request and sets selfie_uploaded_at', async () => {
-      profiles.find((p) => p.id === 'host1')!.selfie_uploaded_at = null;
-      await review('V2', { decision: 'approve' }).expect(201);
-      expect(profiles.find((p) => p.id === 'host1')!.selfie_uploaded_at).toBeInstanceOf(Date);
-    });
-
-    it('rejects with a reason (trimmed), logs it, and does not touch the profile gate', async () => {
-      const before = profiles.find((p) => p.id === 'host1')!.bank_verified_at;
-      const res = await review('V1', { decision: 'reject', rejectionReason: '  Account name mismatch ' }).expect(201);
-      expect(res.body).toMatchObject({ message: 'Verification rejected.', request: { status: 'rejected', rejection_reason: 'Account name mismatch' } });
-      expect(vaudit[0]).toMatchObject({ action: 'rejected', new_status: 'rejected', rejection_reason: 'Account name mismatch' });
-      expect(profiles.find((p) => p.id === 'host1')!.bank_verified_at).toBe(before);
-      expect(notified[0][0]).toBe('verification.layer_failed');
-    });
-
-    it('400 for a missing/invalid decision, or a reject without a reason', async () => {
-      expectError(await review('V1', {}), 400);
-      expectError(await review('V1', { decision: 'maybe' }), 400);
-      expectError(await review('V1', { decision: 'reject' }), 400, 'A rejection reason is required to reject a verification request.');
-      expectError(await review('V1', { decision: 'reject', rejectionReason: '   ' }), 400, /rejection reason is required/);
-      expectError(await review('V1', { decision: 'reject', rejectionReason: 'x'.repeat(2001) }), 400);
-      expect(vreqs.find((r) => r.id === 'V1')!.status).toBe('pending');
-    });
-
-    it('404 for an unknown request', async () => {
-      expectError(await review('zzz', { decision: 'approve' }), 404, 'Verification request not found');
-    });
-
-    // Regression: in AADHAAR_VERIFICATION_MODE=admin an Aadhaar upload is a pending
-    // 'identity' row, and the shared KYC gate needs it approved — an admin must be
-    // able to approve or reject it (it used to 409, leaving every user stuck).
-    it('approves a pending identity (Aadhaar) request: verified, audit row', async () => {
-      const res = await review('V4', { decision: 'approve' }).expect(201);
-      expect(vreqs.find((r) => r.id === 'V4')).toMatchObject({ status: 'verified', reviewed_by: 'admin1' });
-      expect(vaudit).toHaveLength(1);
-      expect(res.body.success).toBe(true);
-    });
-
-    it('rejects a pending identity request with a reason, and requires the reason', async () => {
-      expectError(await review('V4', { decision: 'reject' }), 400);
-      await review('V4', { decision: 'reject', rejectionReason: 'Back side is blurry' }).expect(201);
-      expect(vreqs.find((r) => r.id === 'V4')).toMatchObject({ status: 'rejected', rejection_reason: 'Back side is blurry' });
-    });
-
-    it('409 when the request was already reviewed (state machine is one-way)', async () => {
-      await review('V1', { decision: 'approve' }).expect(201);
-      expectError(await review('V1', { decision: 'reject', rejectionReason: 'changed my mind' }), 409, /already been reviewed \(status: verified\)/);
-      expect(vaudit).toHaveLength(1);
-    });
+  it('POST /verification/:id/review no longer exists', async () => {
+    await adm('post', '/api/admin/verification/V1/review').send({ decision: 'approve' }).expect(404);
+    expect(vreqs.find((r) => r.id === 'V1')).toMatchObject({ status: 'pending', reviewed_by: null });
   });
 });
-
-/* ══════════════════════════════════════════════════════════════════════════
- *  HOST LISTINGS
- * ══════════════════════════════════════════════════════════════════════ */
 
 describe('Host listings API (/api/host/listings)', () => {
   let app: INestApplication;
@@ -773,10 +655,10 @@ describe('Host listings API (/api/host/listings)', () => {
   let profiles: Row[];
   let redisStore: Map<string, string>;
   let versionBumps: number;
-  let verificationStatus: { identity: { status: string }; pan: { status: string }; bank: { status: string } };
+  let verificationStatus: { identity: { status: string } };
   let captureConfig: { locationBypass: boolean };
 
-  const PIN = { lat: 32.2701, lng: 77.1755 }; // Manali
+  const PIN = { lat: 32.2701, lng: 77.1755 };
   const TOKEN = '3b2d1623-b9fd-42f0-984e-97ef53a95a9f';
   const photoUrls = Array.from({ length: 5 }, (_, i) => `https://storage.test/host1/p${i}.jpg`);
   const hash = (u: string) => createHash('sha256').update(u).digest('hex');
@@ -821,7 +703,6 @@ describe('Host listings API (/api/host/listings)', () => {
     ...over,
   });
 
-  /** A listing row already saved by the host, with a stored walkthrough and legacy photos. */
   const stored = (over: Row = {}): Row => ({
     id: 'H1',
     host_id: 'host1',
@@ -843,7 +724,7 @@ describe('Host listings API (/api/host/listings)', () => {
     profiles = [{ ...USERS.host }, { ...USERS.other }, { ...USERS.guest }];
     redisStore = new Map();
     versionBumps = 0;
-    verificationStatus = { identity: { status: 'verified' }, pan: { status: 'verified' }, bank: { status: 'verified' } };
+    verificationStatus = { identity: { status: 'verified' } };
     captureConfig = { locationBypass: false };
 
     const listingsRepo = makeRepo(listings);
@@ -887,8 +768,6 @@ describe('Host listings API (/api/host/listings)', () => {
   const host = (m: 'get' | 'post' | 'patch', url: string, who = 'host1') => api()[m](url).set('Cookie', as(who));
   const U = '/api/host/listings';
 
-  /* ── auth on every route ─────────────────────────────────────────── */
-
   describe('authentication', () => {
     const routes: [string, string, string][] = [
       ['get', 'GET', U],
@@ -906,8 +785,6 @@ describe('Host listings API (/api/host/listings)', () => {
     });
   });
 
-  /* ── GET / ───────────────────────────────────────────────────────── */
-
   describe('GET /', () => {
     it('returns an empty list for a new host', async () => {
       expect((await host('get', U).expect(200)).body).toEqual({ success: true, listings: [] });
@@ -921,11 +798,9 @@ describe('Host listings API (/api/host/listings)', () => {
     });
   });
 
-  /* ── GET /draft ──────────────────────────────────────────────────── */
-
   describe('GET /draft', () => {
     it('returns null listing when there is no draft', async () => {
-      listings.push(stored()); // changes_needed is not a resumable draft
+      listings.push(stored());
       expect((await host('get', `${U}/draft`).expect(200)).body).toEqual({ success: true, listing: null });
     });
     it('returns the most recent draft, flattened', async () => {
@@ -940,8 +815,6 @@ describe('Host listings API (/api/host/listings)', () => {
       expect((await host('get', `${U}/draft?listingId=nope`).expect(200)).body.listing).toBeNull();
     });
   });
-
-  /* ── GET /:id ───────────────────────────────────────────────────── */
 
   describe('GET /:id', () => {
     it('returns the caller\'s listing with a merged draft for prefilling', async () => {
@@ -959,15 +832,11 @@ describe('Host listings API (/api/host/listings)', () => {
     });
   });
 
-  /* ── POST /media/video ─────────────────────────────────────────── */
-
   describe('POST /media/video', () => {
     it('always 400s with the "no longer supported" message', async () => {
       expectError(await host('post', `${U}/media/video`), 400, /Property videos can no longer be uploaded/);
     });
   });
-
-  /* ── POST /save-draft ───────────────────────────────────────────── */
 
   describe('POST /save-draft', () => {
     it('creates a draft from a partial body, with no completeness requirement', async () => {
@@ -977,7 +846,7 @@ describe('Host listings API (/api/host/listings)', () => {
       expect(listings[0]).toMatchObject({ host_id: 'host1', status: 'draft' });
       expect(listings[0].draft_data.property_details).toMatchObject({ title: 'Half done', dailyBaseRate: 1200 });
       expect(listings[0].draft_data.property_details.streetAddress).toBeUndefined();
-      expect(listings[0].draft_data.identity).toEqual({ pan: 'ABCDE1234F', gst: '' });
+      expect(listings[0].draft_data.identity).toEqual({ gst: '' });
     });
 
     it('accepts an empty body and creates a blank draft', async () => {
@@ -1051,19 +920,17 @@ describe('Host listings API (/api/host/listings)', () => {
     });
   });
 
-  /* ── POST /submit-full ──────────────────────────────────────────── */
-
   describe('POST /submit-full', () => {
     const ready = () => (seedWalkthrough(), seedPhotos());
 
     it('creates an in_review listing, spends the walkthrough token, and stamps identity from the profile', async () => {
       ready();
-      const res = await host('post', `${U}/submit-full`).send(body({ pan: 'ZZZZZ9999Z' })).expect(201);
+      const res = await host('post', `${U}/submit-full`).send(body({ gst: '22AAAAA0000A1Z5' })).expect(201);
       expect(res.body).toMatchObject({ success: true, message: 'Listing submitted for review.', status: 'in_review', listingId: expect.any(String) });
       expect(listings).toHaveLength(1);
       const row = listings[0];
       expect(row).toMatchObject({ host_id: 'host1', status: 'in_review' });
-      expect(row.draft_data.identity.pan).toBe('ABCDE1234F');
+      expect(row.draft_data.identity).toEqual({ gst: '' });
       expect(row.draft_data.property_details).toMatchObject({ title: 'Deodar Nest Homestay', town: 'Manali', dailyBaseRate: 1500 });
       expect(row.draft_data.telemetry).toMatchObject({ walkthroughPassed: true, walkthroughVideoUrl: 'https://storage.test/host1/w.mp4', status: 'needs_review' });
       expect(Object.keys(row.draft_data.captures.photos)).toHaveLength(5);
@@ -1162,15 +1029,7 @@ describe('Host listings API (/api/host/listings)', () => {
       profiles[0].selfie_uploaded_at = null;
       expectError(await host('post', `${U}/submit-full`).send(body()), 403, /live selfie/);
       expect(listings).toHaveLength(0);
-      expect(redisStore.has(`walkthrough-token:host1:${TOKEN}`)).toBe(true); // gate runs before the token is spent
-    });
-
-    it('bank and PAN are NOT part of the gate: identity + selfie alone are enough to submit', async () => {
-      ready();
-      verificationStatus.pan.status = 'rejected';
-      verificationStatus.bank.status = 'not_started';
-      await host('post', `${U}/submit-full`).send(body()).expect(201);
-      expect(listings).toHaveLength(1);
+      expect(redisStore.has(`walkthrough-token:host1:${TOKEN}`)).toBe(true);
     });
 
     describe('pin outside Himachal (Mohali), CAPTURE_LOCATION_BYPASS', () => {
@@ -1205,8 +1064,6 @@ describe('Host listings API (/api/host/listings)', () => {
       expectError(await host('post', `${U}/submit-full`, 'ghost').send(body()), 404, 'Profile not found');
     });
   });
-
-  /* ── PATCH /:id (resubmit) ───────────────────────────────────────── */
 
   describe('PATCH /:id', () => {
     const edit = (id: string, b: Row, who = 'host1') => host('patch', `${U}/${id}`, who).send(b);

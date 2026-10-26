@@ -15,18 +15,6 @@ import { ListingsController } from '../src/listings/listings.controller';
 import { ListingsService } from '../src/listings/listings.service';
 import { RedisService } from '../src/redis/redis.service';
 
-/**
- * GET /api/listings against REAL Postgres SQL (jsonb paths, ILIKE, escaping,
- * GROUP BY facets, NULLS LAST), through the real controller, service and
- * global interceptor/filter. Only Redis (in-memory), translation and the auth
- * guard are faked.
- *
- * It runs in a throwaway schema (`listing_search_e2e`) on the LOCAL test
- * Postgres only — `search_path` puts it ahead of `public`, so the service's
- * unqualified `listings` / `bookings` resolve to the scratch copies, no other
- * row is touched, and the schema is dropped afterwards. It refuses to run
- * against any non-local host.
- */
 const SCHEMA = 'listing_search_e2e';
 const host = process.env.SUPABASE_DB_HOST ?? '';
 const isLocal = ['127.0.0.1', 'localhost', '::1'].includes(host);
@@ -76,7 +64,6 @@ const FIXTURES: Fixture[] = [
     },
   },
   {
-    // No categories stored at all.
     key: 'spiti',
     created: '2026-09-05T10:00:00Z',
     pd: {
@@ -85,7 +72,6 @@ const FIXTURES: Fixture[] = [
     },
   },
   {
-    // Legacy listing: no district or tehsil, only a town.
     key: 'orphan',
     created: '2026-09-06T10:00:00Z',
     pd: { title: 'Orphan Nook', town: 'Somewhere', categories: ['work'], dailyBaseRate: 500 },
@@ -102,7 +88,6 @@ const FIXTURES: Fixture[] = [
     pd: { title: '100% Real_Deal', town: 'Karsog', tehsil: 'Karsog', district: 'Mandi', categories: ['long'], dailyBaseRate: 600 },
   },
   {
-    // Same place as `pine`, stored with different capitalisation.
     key: 'case',
     created: '2026-09-09T10:00:00Z',
     pd: {
@@ -200,7 +185,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
   });
 
   const get = (qs: string) => request(app.getHttpServer()).get(`/api/listings${qs}`);
-  /** The fixture keys of the listings returned, in order. */
   const keys = (body: { listings: { id: string }[] }) => body.listings.map((l) => idToKey[l.id]);
   const sorted = (a: string[]) => [...a].sort((x, y) => x.localeCompare(y));
 
@@ -242,7 +226,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
     });
 
     it('expands a tourist name through the alias map: Kasol also finds the Bhuntar tehsil, Kullu district', async () => {
-      // `pine` has town Kasol; `case` is in Bhuntar/Kullu but never mentions Kasol.
       expect(sorted(keys((await get('?q=Kasol')).body))).toEqual(['case', 'pine']);
       expect(sorted(keys((await get('?q=kasol%20cottage')).body))).toEqual(['pine']);
     });
@@ -265,7 +248,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
     });
 
     it('treats %, _ and backslash as literal characters', async () => {
-      // Unescaped, "%" and "_" would match every listing.
       expect((await get('?q=%25')).body.listings).toEqual([]);
       expect((await get('?q=_')).body.listings).toEqual([]);
       expect((await get('?q=%5C')).body.listings).toEqual([]);
@@ -303,7 +285,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
 
     it('filters district exactly and case-insensitively (not by substring)', async () => {
       expect(sorted(keys((await get('?district=kullu')).body))).toEqual(['case', 'pine', 'river']);
-      // "Kul" is not a district: ignored, so nothing is filtered.
       expect((await get('?district=Kul')).body.total).toBe(8);
       expect(keys((await get('?district=Lahaul%20and%20Spiti')).body)).toEqual(['spiti']);
     });
@@ -331,7 +312,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
 
     it('filters by guests', async () => {
       expect(sorted(keys((await get('?guests=3')).body))).toEqual(['pine']);
-      // maxGuests missing counts as 2, like the mapper shows.
       expect((await get('?guests=2')).body.total).toBe(8);
       expect((await get('?guests=abc')).body.total).toBe(8);
     });
@@ -389,7 +369,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
       const order = keys((await get('?sort=trust')).body);
       expect(order.slice(0, 2)).toEqual(['pine', 'river']);
       expect(order).toHaveLength(8);
-      // Unscored ones keep newest-first among themselves.
       expect(order.slice(2)).toEqual(['case', 'wild', 'orphan', 'spiti', 'bir', 'kabir']);
     });
   });
@@ -413,14 +392,11 @@ describeLocal('GET /api/listings (real SQL)', () => {
 
     it('list places with their district, count and cheapest monthly rent, biggest first', async () => {
       const { places } = (await get('?facets=1')).body.facets;
-      // pine: 1000/day at 40% off = 18000; case: 2000/day at 40% off = 36000.
       expect(places[0]).toEqual({ district: 'Kullu', tehsil: 'Bhuntar', count: 2, fromMonthlyRent: 18000 });
-      // Same count sorts by name: Baijnath, Dharamshala, Karsog, Kaza, Manali, Somewhere.
       expect(places.slice(1).map((p: any) => p.tehsil)).toEqual(['Baijnath', 'Dharamshala', 'Karsog', 'Kaza', 'Manali', 'Somewhere']);
       expect(places.find((p: any) => p.tehsil === 'Manali')).toEqual({
         district: 'Kullu', tehsil: 'Manali', count: 1, fromMonthlyRent: 36000,
       });
-      // A listing with no district is grouped under '' and falls back to its town; no rate => null? it has one.
       expect(places.find((p: any) => p.tehsil === 'Somewhere')).toEqual({
         district: '', tehsil: 'Somewhere', count: 1, fromMonthlyRent: 9000,
       });
@@ -430,7 +406,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
     it('the districts facet ignores district and tehsil but honours everything else', async () => {
       const res = await get('?facets=1&district=Kangra&tehsil=Baijnath&category=work').expect(200);
       expect(keys(res.body)).toEqual(['bir']);
-      // Kullu's `pine` and Kangra's two work listings are all still offered.
       expect(res.body.facets.districts).toEqual([
         { name: 'Kangra', count: 2 },
         { name: 'Kullu', count: 1 },
@@ -477,7 +452,6 @@ describeLocal('GET /api/listings (real SQL)', () => {
       expect(bhuntar.from).toBe(18000);
       expect(bhuntar.listings.map((l) => idToKey[l.id])).toEqual(['case', 'pine']);
 
-      // Same totals as the facets of the main endpoint.
       const { places } = (await get('?facets=1')).body.facets;
       expect(towns.map((t) => [t.name, t.total])).toEqual(places.map((p: any) => [p.tehsil, p.count]));
     });

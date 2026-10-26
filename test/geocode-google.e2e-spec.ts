@@ -14,7 +14,6 @@ import { GeocodeService } from '../src/listings/geocode.service';
 type Reply = { status: number; body: unknown };
 type Call = { params: URLSearchParams; path: string; at: number; ua?: string };
 
-/** A real HTTP stand-in that records every request (used for both Google and Nominatim). */
 function startServer(reply: (c: Call, n: number) => Reply) {
   const calls: Call[] = [];
   const server = http.createServer((req, res) => {
@@ -154,13 +153,13 @@ describe('GET /api/geocode with Google as the primary provider', () => {
       const a = await locate(VASHISHT).expect(200);
       expect(a.body).toMatchObject({ source: 'osm', precision: 'exact' });
       const after = google.calls.length;
-      expect(after).toBe(1); // the second (tehsil) step of the same request did not retry Google either
+      expect(after).toBe(1);
 
       const b = await locate({ district: 'Kullu', tehsil: 'Manali', q: 'Old Manali' }).expect(200);
       expect(b.body).toMatchObject({ source: 'osm' });
       const c = await locate({ district: 'Mandi', tehsil: 'Karsog', q: 'whatever' });
       expect(c.status).toBe(200);
-      expect(google.calls).toHaveLength(after); // breaker open: Google not called again
+      expect(google.calls).toHaveLength(after);
       expect(osm.calls.length).toBeGreaterThanOrEqual(2);
     },
   );
@@ -205,7 +204,7 @@ describe('GET /api/geocode with Google as the primary provider', () => {
     const res = await locate(VASHISHT).expect(200);
     expect(res.body).toMatchObject({ source: 'osm', precision: 'exact' });
     expect(logged.some((l) => /Google geocoding unavailable/.test(l))).toBe(true);
-    google = await startServer(() => zero); // so afterEach can close cleanly
+    google = await startServer(() => zero);
   });
 
   it('skips a Google result outside Himachal Pradesh and takes the next one', async () => {
@@ -217,7 +216,7 @@ describe('GET /api/geocode with Google as the primary provider', () => {
 
   it('skips a Google result in the state but far from the district, then uses Nominatim', async () => {
     await boot();
-    gReply = () => ok(gHit(31.1048, 77.1734, 'ROOFTOP', ['premise'])); // Shimla, for a Chamba lookup
+    gReply = () => ok(gHit(31.1048, 77.1734, 'ROOFTOP', ['premise']));
     oReply = () => ({ status: 200, body: [osmHit(32.5534, 76.1258)] });
     const res = await locate({ district: 'Chamba', tehsil: 'Dalhousie', q: 'x' }).expect(200);
     expect(res.body).toMatchObject({ source: 'osm', lat: 32.5534 });
@@ -234,7 +233,7 @@ describe('GET /api/geocode with Google as the primary provider', () => {
       'Nowhere Special, Manali, Kullu, Himachal Pradesh, India',
       'Manali, Kullu, Himachal Pradesh, India',
     ]);
-    expect(osm.calls.filter((c) => c.path === '/search')).toHaveLength(1); // only the exact-words step fell through to OSM
+    expect(osm.calls.filter((c) => c.path === '/search')).toHaveLength(1);
   });
 
   it('with no words typed, goes straight to the tehsil on Google', async () => {
@@ -253,7 +252,6 @@ describe('GET /api/geocode with Google as the primary provider', () => {
     expect(res.body).toMatchObject({ success: true, precision: 'district', source: 'fallback', lat: 31.5376, lng: 78.2718 });
     expect(res.body.message).toMatch(/centre of Kinnaur/);
 
-    // The fallback is not remembered: once a provider is back, the next try succeeds.
     gReply = () => ok(gHit(31.42, 78.26, 'ROOFTOP', ['premise']));
     const again = await locate({ district: 'Kinnaur', tehsil: 'Sangla', q: 'unknown' }).expect(200);
     expect(again.body.source).toBe('google');
@@ -261,7 +259,7 @@ describe('GET /api/geocode with Google as the primary provider', () => {
 
   it('never lets the key reach a log line or a response body', async () => {
     await boot();
-    gReply = () => gStatus('REQUEST_DENIED'); // Google even echoes the key in its error text
+    gReply = () => gStatus('REQUEST_DENIED');
     const a = await locate(VASHISHT).expect(200);
     await google.close();
     google = await startServer(() => ({ status: 500, body: {} }));
@@ -399,7 +397,7 @@ describe('GET /api/geocode with Google as the primary provider', () => {
       const a = await reverse({ lat: '32.2701', lng: '77.1755' }).expect(200);
       expect(a.body.address).toBe('Found now');
       const before = google.calls.length;
-      const b = await reverse({ lat: '32.270149', lng: '77.175501' }).expect(200); // rounds to the same 4 decimals
+      const b = await reverse({ lat: '32.270149', lng: '77.175501' }).expect(200);
       expect(b.body.address).toBe('Found now');
       expect(google.calls).toHaveLength(before);
     });

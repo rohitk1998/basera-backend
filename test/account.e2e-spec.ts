@@ -38,8 +38,6 @@ const firebaseUidToUserId = (uid: string) => {
   return `${md5.slice(0, 8)}-${md5.slice(8, 12)}-4${md5.slice(13, 16)}-a${md5.slice(17, 20)}-${md5.slice(20, 32)}`;
 };
 
-/* ── In-memory stand-ins ──────────────────────────────────────────────────── */
-
 function matches(row: any, where: any) {
   return Object.entries(where ?? {}).every(([k, v]) => row[k] === v);
 }
@@ -159,8 +157,6 @@ function makeAttractions() {
   const seed = (p: any) => repo.save(repo.create({ slug: p.name.toLowerCase().replace(/\W+/g, '-'), category: 'temple', district: 'Kullu', tehsil: null, lat: 32, lng: 77, summary: null, description: null, difficulty: null, duration: null, distance_km: null, best_season: null, youtube_ids: [], popularity: 50, source: 'manual', source_id: null, status: 'published', ...p }));
   return { rows, repo, seed };
 }
-
-/* ── Suite ────────────────────────────────────────────────────────────────── */
 
 describe('Account, user and attractions (HTTP, real controllers + services + guards, in-memory fakes)', () => {
   let app: INestApplication;
@@ -286,8 +282,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
   const user = (id = 'u1', extra: any = {}) => P.seed({ id, ...extra });
   const admin = (id = 'admin1') => P.seed({ id, role: 'admin', full_name: 'Root' });
 
-  /* ═════════════════════════════ AUTH ═══════════════════════════════════ */
-
   describe('GET /api/auth/realtime-token', () => {
     it('401 without a session cookie', async () => {
       const res = await http().get('/api/auth/realtime-token');
@@ -304,8 +298,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       failureShape(res, 401);
       expect(res.body.message).toBe('Session expired');
     });
-    // BUG: AuthGuard throws { code: 'session_expired' } so the client can tell "refresh me" from "log in",
-    // but ApiExceptionFilter only keeps `message`, so the code never reaches the response.
     it.failing('BUG: expired-session 401 should expose code "session_expired" to the client', async () => {
       const res = await http().get('/api/auth/realtime-token').set('Cookie', sessionCookie(token('u1', { expiresIn: -10 })));
       expect(res.body.code).toBe('session_expired');
@@ -368,7 +360,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       expect(cookieNamed(res, 'has_session')).not.toMatch(/HttpOnly/);
       const refresh = decodeURIComponent(cookieNamed(res, REFRESH_COOKIE)!.split(';')[0].split('=')[1]);
       expect(P.rows.get(id).refresh_token_hash).toBe(sha256(refresh));
-      // The issued session works against a guarded route.
       const sess = cookieNamed(res, SESSION_COOKIE)!.split(';')[0];
       await http().get('/api/user/profile').set('Cookie', sess).expect(200);
     });
@@ -454,7 +445,7 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       O.rows.get('a@x.in').last_sent_at = new Date(Date.now() - 61_000);
       await send('a@x.in').expect(200);
       expect(sentCodes).toHaveLength(3);
-      expect(O.rows.size).toBe(2); // one row per email
+      expect(O.rows.size).toBe(2);
     });
     it('500 with a clear message when SMTP fails, storing nothing so the user can retry at once', async () => {
       smtpFails = true;
@@ -516,7 +507,7 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       expect(jwt.verify(res.body.proofToken, JWT_SECRET)).toMatchObject({ purpose: 'profile-completion', email: 'new@x.in' });
       expect(P.rows.size).toBe(0);
       expect(cookiesOf(res)).toHaveLength(0);
-      failureShape(await verify('new@x.in', code), 401); // replay
+      failureShape(await verify('new@x.in', code), 401);
     });
     it('existing email: 200 signs in with cookies', async () => {
       user('u1', { email: 'me@x.in' });
@@ -623,7 +614,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       const t = proof({ phone: '+916666666666', firebaseUid: 'f-r2' });
       await submit(good({ proofToken: t })).expect(200);
       user('other', { email: 'taken@x.in' });
-      // The in-memory update does not enforce uniqueness itself, so simulate the DB constraint.
       P.repo.updateError = Object.assign(new Error('dup'), { code: '23505' });
       failureShape(await submit(good({ proofToken: t, email: 'taken@x.in' })), 409);
     });
@@ -666,7 +656,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       const newRt = decodeURIComponent(cookieNamed(res, REFRESH_COOKIE)!.split(';')[0].split('=')[1]);
       expect(newRt).not.toBe(rt);
       expect(P.rows.get('u1').refresh_token_hash).toBe(sha256(newRt));
-      // old refresh token is now dead
       failureShape(await refresh([`${REFRESH_COOKIE}=${rt}`, as('u1')]), 401);
     });
   });
@@ -690,8 +679,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
     });
   });
 
-  /* ═════════════════════════════ USER ═══════════════════════════════════ */
-
   describe('/api/user (auth required)', () => {
     const routes: Array<[string, string, any?]> = [
       ['get', '/api/user/profile', {}],
@@ -714,12 +701,10 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         const created = new Date(Date.now() - 3 * DAY);
         user('u1', { phone: '+91999', email: null, languages: null, avatar_url: null, isHost: true, created_at: created });
         const res = await http().get('/api/user/profile').set('Cookie', as('u1')).expect(200);
-        expect(res.body).toMatchObject({ success: true, profile: { id: 'u1', phone: '+91999', email: '', languages: [], isHost: true, isAdmin: false, avatar_url: '', pan: '', bank_upi: '' } });
+        expect(res.body).toMatchObject({ success: true, profile: { id: 'u1', phone: '+91999', email: '', languages: [], isHost: true, isAdmin: false, avatar_url: '' } });
         expect(res.body.editUnlocksAt).toBe(new Date(created.getTime() + 14 * DAY).toISOString());
         expect(res.body.profile.password_hash).toBeUndefined();
       });
-      // The browser's "identity verified" flag used to be re-derived (and lost)
-      // client-side; the profile now carries it, from the NEWEST identity row.
       it('identity_verified is false with no identity request, true once the newest one is verified', async () => {
         user('u1');
         const get = async () => (await http().get('/api/user/profile').set('Cookie', as('u1')).expect(200)).body.profile.identity_verified;
@@ -734,7 +719,7 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         V.rows.push({ user_id: 'u1', verification_type: 'identity', status: 'verified', submitted_at: new Date(1000) });
         V.rows.push({ user_id: 'u1', verification_type: 'identity', status: 'rejected', submitted_at: new Date(2000) });
         const get = async () => (await http().get('/api/user/profile').set('Cookie', as('u1')).expect(200)).body.profile.identity_verified;
-        expect(await get()).toBe(false); // an older verified row does not count after a newer rejection
+        expect(await get()).toBe(false);
         V.rows.length = 0;
         V.rows.push({ user_id: 'u1', verification_type: 'selfie', status: 'verified', submitted_at: new Date(1000) });
         V.rows.push({ user_id: 'someone-else', verification_type: 'identity', status: 'verified', submitted_at: new Date(1000) });
@@ -771,7 +756,7 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         expect(res.body.message).toMatch(msg);
       });
       it('first-time completion: 201, saved, notifies once as a host/guest-appropriate welcome', async () => {
-        user('u1', { full_name: null, created_at: new Date() }); // fresh row is NOT edit-locked until a name exists
+        user('u1', { full_name: null, created_at: new Date() });
         const res = await save(body({ isHost: true })).expect(201);
         expect(res.body).toMatchObject({ success: true, message: 'Profile saved.' });
         expect(P.rows.get('u1')).toMatchObject({ full_name: 'Asha Rao', email: 'asha@x.in', isHost: true });
@@ -791,8 +776,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         expect(res.body).toMatchObject({ success: false, statusCode: 403 });
         expect(P.rows.get('u1').full_name).toBe('Asha Rao');
       });
-      // BUG: UserService throws ForbiddenException({ error: 'Your profile can be edited again on ...', editUnlocksAt }),
-      // but the filter reads only `.message`, so the client gets the bare "Forbidden Exception" and no unlock date.
       it.failing('BUG: 403 edit-lock response should carry the "can be edited again on" text and editUnlocksAt', async () => {
         user('u1', { created_at: new Date(Date.now() - 2 * DAY) });
         const res = await save(body());
@@ -939,8 +922,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
     });
   });
 
-  /* ═══════════════════════ ATTRACTIONS (public) ═════════════════════════ */
-
   describe('GET /api/attractions (public)', () => {
     beforeEach(async () => {
       await A.seed({ name: 'Hadimba Temple', category: 'temple', district: 'Kullu', popularity: 90 });
@@ -956,7 +937,7 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       expect(res.body.attractions.map((a: any) => a.name)).toEqual(['Hadimba Temple', 'Jogini Falls']);
       expect(res.body.counts).toMatchObject({ all: 2, temple: 1, waterfall: 1, trek: 0 });
       expect(res.body.attractions[0]).toEqual(expect.objectContaining({ slug: 'hadimba-temple', imageUrl: null, youtubeIds: [] }));
-      expect(res.body.attractions[0].status).toBeUndefined(); // admin-only field
+      expect(res.body.attractions[0].status).toBeUndefined();
     });
     it('district is case-insensitive and resolved from tehsil or a known place name', async () => {
       expect((await http().get('/api/attractions').query({ district: 'kullu' })).body.district).toBe('Kullu');
@@ -978,14 +959,12 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
     it('serves repeat reads from cache until an admin change bumps the version', async () => {
       await http().get('/api/attractions').query({ district: 'Shimla' }).expect(200);
       await A.seed({ name: 'Late Addition', district: 'Shimla' });
-      expect((await http().get('/api/attractions').query({ district: 'Shimla' })).body.attractions).toHaveLength(1); // cached
+      expect((await http().get('/api/attractions').query({ district: 'Shimla' })).body.attractions).toHaveLength(1);
       admin();
       await http().post('/api/admin/attractions').set('Cookie', as('admin1')).send({ name: 'Brand New', category: 'lake', district: 'Shimla', lat: 31.1, lng: 77.1, status: 'published' }).expect(201);
       expect((await http().get('/api/attractions').query({ district: 'Shimla' })).body.attractions).toHaveLength(3);
     });
   });
-
-  /* ═══════════════════════ ATTRACTIONS (admin) ══════════════════════════ */
 
   describe('/api/admin/attractions', () => {
     const base = '/api/admin/attractions';
@@ -1063,7 +1042,7 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
       });
       it('POST import: an unknown/missing district means "all districts", not an error', async () => {
         await http().post(`${base}/import`).set('Cookie', adm()).send({ district: 'Atlantis' }).expect(201);
-        await http().post(`${base}/import`).set('Cookie', adm()).send({}).expect(409); // already running from the first
+        await http().post(`${base}/import`).set('Cookie', adm()).send({}).expect(409);
         expect(importer.started).toEqual([{ district: undefined }]);
       });
       it('POST import: 409 while a run is already in progress', async () => {
@@ -1116,7 +1095,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         expect(res.body).toMatchObject({ success: true, message: 'Place added.' });
         expect(res.body.attraction).toMatchObject({ slug: 'bijli-mahadev', status: 'draft', source: 'manual', popularity: 50, youtubeIds: ['dQw4w9WgXcQ'], lat: 31.86, summary: 'A famous temple. Reached by a steep walk.' });
         expect(A.rows).toHaveLength(1);
-        // A draft is not public.
         expect((await http().get('/api/attractions').query({ district: 'Kullu' })).body.attractions).toHaveLength(0);
       });
       it('de-duplicates slugs: name, then name-district, then name-N', async () => {

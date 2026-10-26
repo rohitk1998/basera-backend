@@ -23,14 +23,11 @@ import {
   type WikiPlace,
 } from './wikidata-source';
 
-/** Pause between Wikipedia/Commons lookups, polite to Wikimedia and still fast. */
 const LOOKUP_GAP_MS = 150;
-/** Pause between districts' Wikidata queries. */
 const QUERY_GAP_MS = 1500;
 const LOG_LINES = 80;
 
 export type ImportOptions = {
-  /** One district, or every district when omitted. */
   district?: HpDistrict;
 };
 
@@ -50,17 +47,6 @@ export type ImportStatus = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * Pulls notable places for each district from Wikidata (places that have an
- * English Wikipedia article), adds the article's summary and an openly
- * licensed Commons photo where one exists, and saves each as a DRAFT for an
- * admin to review. Safe to re-run: a place already in the table (by Wikidata
- * id) is skipped before any lookups, so admin edits and hidden rows are never
- * overwritten.
- *
- * One run at a time per server process. Progress is kept in memory for the
- * admin console; it resets on restart, the imported rows do not.
- */
 @Injectable()
 export class AttractionsImportService {
   private readonly logger = new Logger(AttractionsImportService.name);
@@ -90,12 +76,10 @@ export class AttractionsImportService {
     return { ...this.status, log: [...this.status.log] };
   }
 
-  /** Wikidata needs no key, so the import is always available. */
   isConfigured(): boolean {
     return true;
   }
 
-  /** Starts a run in the background and returns at once. */
   start(options: ImportOptions = {}): ImportStatus {
     if (this.status.running)
       throw new ConflictException('An import is already running.');
@@ -103,7 +87,6 @@ export class AttractionsImportService {
     return this.getStatus();
   }
 
-  /** Runs to completion (used by the CLI and the scheduler). */
   async runNow(options: ImportOptions = {}): Promise<ImportStatus> {
     if (this.status.running)
       throw new ConflictException('An import is already running.');
@@ -183,9 +166,6 @@ export class AttractionsImportService {
         for (const place of fresh) {
           known.add(place.qid);
           try {
-            // File the place under the district it actually lies in, which is not
-            // always the one whose circle found it (circles overlap, and a district
-            // centre is just its HQ town).
             const where = await this.locate(place);
             if (options.district && where.district !== options.district)
               continue;
@@ -215,7 +195,6 @@ export class AttractionsImportService {
     }
   }
 
-  /** The district (and tehsil) a point lies in, from the geocoder; the nearest district centre if it cannot say. */
   private async locate(
     place: WikiPlace,
   ): Promise<{ district: HpDistrict; tehsil: string | null }> {
@@ -224,7 +203,6 @@ export class AttractionsImportService {
       if (parts.district)
         return { district: parts.district, tehsil: parts.tehsil ?? null };
     } catch {
-      /* fall through to the nearest centre */
     }
     return { district: nearestDistrict(place.lat, place.lng), tehsil: null };
   }
@@ -238,11 +216,8 @@ export class AttractionsImportService {
     const slug = uniqueSlug(place.name, district, slugs);
     slugs.add(slug);
 
-    // Description: the place's English Wikipedia article.
     const wiki = await summaryByTitle(place.articleTitle).catch(() => null);
 
-    // Photo: the item's own Commons image, else the article's lead image when
-    // it is hosted on Commons (only those carry license data we can check).
     let image: { url: string; credit: string } | null = null;
     if (place.commonsImage)
       image = await this.images.copyFromCommons(place.commonsImage, slug);

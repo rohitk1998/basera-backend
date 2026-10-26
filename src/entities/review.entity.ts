@@ -18,10 +18,10 @@ export class ReviewEntity {
   listing_id: string | null;
 
   @Column()
-  role: string; // 'guest' (reviewing host/listing) | 'host' (reviewing guest)
+  role: string;
 
   @Column('int')
-  rating: number; // 1-5
+  rating: number;
 
   @Column('text')
   content: string;

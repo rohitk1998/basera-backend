@@ -36,6 +36,7 @@ function makeService(disputeCase: Record<string, unknown> = {}) {
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
   );
   return { service, bookingsRepo, disputeCasesRepo, payments };
 }

@@ -13,9 +13,6 @@ import { MarkReadDto } from './dto/mark-read.dto';
 
 const PAGE_SIZE = 10;
 
-/** Guest-facing request outcomes go out over the Gmail SMTP transport: Resend's
- *  shared sender only delivers to Resend-owned test addresses, so a real
- *  guest's inbox never received these. */
 const SMTP_EMAIL_EVENTS = new Set([
   'user.welcome',
   'booking.confirmed',
@@ -53,13 +50,6 @@ interface DispatchResult {
   error?: string;
 }
 
-/**
- * Ported from supabase/functions/notification-dispatcher/index.ts plus the
- * three app/api/notifications/* inbox routes. notify() used to fire-and-
- * forget an invocation of that Edge Function; here the same dispatch work
- * runs in-process (no edge function, no HTTP hop to ourselves) but stays
- * fire-and-forget from the caller's point of view — see notify() below.
- */
 @Injectable()
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
@@ -78,23 +68,9 @@ export class NotificationsService {
     private readonly config: ConfigService,
   ) {
     this.appUrl = this.config.get<string>('APP_URL') ?? 'https://basera.in';
-    // Public URL, not a data URI — Gmail (and most webmail clients) refuses
-    // to render inline data:-URI images inside an email body; it only
-    // displays images fetched from a real https:// URL, which it proxies
-    // itself for privacy. Uploaded once to the `brand-assets` public bucket;
-    // regenerate/re-upload if the source logo changes.
     this.logoIconUrl = `${this.config.get<string>('NEXT_PUBLIC_SUPABASE_URL')}/storage/v1/object/public/brand-assets/email-icon.png`;
   }
 
-  // ── In-app inbox (app/api/notifications/*) ───────────────────────────────
-
-  /**
-   * Cursor-paginated (not offset-based): offsets would skip or repeat rows
-   * if a new notification lands between page fetches while the user is
-   * scrolling. The cursor is (sentAt, id) — sentAt alone isn't unique,
-   * since email+push from the same notify() call share a timestamp; id as
-   * a tiebreaker keeps the page boundary stable across those ties.
-   */
   async listForUser(
     userId: string,
     before?: string,
@@ -107,10 +83,9 @@ export class NotificationsService {
       .andWhere("n.channel = 'push'")
       .orderBy('n.sent_at', 'DESC')
       .addOrderBy('n.id', 'DESC')
-      .limit(PAGE_SIZE + 1); // fetch one extra to know if there's a next page
+      .limit(PAGE_SIZE + 1);
 
     if (before && beforeId) {
-      // (sent_at, id) < (before, beforeId) in descending order.
       qb.andWhere('(n.sent_at < :before OR (n.sent_at = :before AND n.id < :beforeId))', {
         before,
         beforeId,
@@ -170,21 +145,11 @@ export class NotificationsService {
     return this.notificationLog.count({ where: { user_id: userId, read_at: IsNull(), channel: 'push' } });
   }
 
-  /**
-   * Every notify() caller sends a relative path ("/host/bookings") — the
-   * right choice for push (webpush deep-links resolve against the app
-   * itself) but broken as-is in an email, which has no origin to resolve
-   * against. Absolute links pass through untouched.
-   */
   private absoluteLink(link: unknown): string {
     const path = String(link ?? '/');
     return /^https?:\/\//.test(path) ? path : `${this.appUrl}${path.startsWith('/') ? '' : '/'}${path}`;
   }
 
-  /**
-   * Fire-and-forget notification dispatch. Never awaited by the caller —
-   * failures are caught and logged here rather than ever thrown back.
-   */
   notify(event: NotificationEvent, userId: string, data: NotificationData): void {
     this.dispatch(event, userId, data).catch((err) => {
       this.logger.error(`[notify] dispatch failed for event=${event} userId=${userId}`, err);
@@ -212,10 +177,6 @@ export class NotificationsService {
 
     const allResults: DispatchResult[] = [];
 
-    // Always record an in-app notification inbox entry so notifications appear
-    // in the UI /inbox regardless of whether external FCM push tokens are registered.
-    // Saved before any email/push network call: those can take seconds (SMTP),
-    // and the bell badge / inbox read this row, so it must not wait on them.
     await this.notificationLog.save(
       this.notificationLog.create({
         user_id: userId,
@@ -232,13 +193,8 @@ export class NotificationsService {
     }
 
     if (profile.notif_push && profile.fcm_tokens?.length) {
-      // Resolved from the recipient's own preferred_locale, not the
-      // (possibly different) locale of whoever triggered this event — a
-      // host's "listing is live" push should render in the host's
-      // language, not the admin's who approved it.
       const { title, body } = notificationCopy(event, data as Record<string, unknown>, profile.preferred_locale ?? undefined);
       const { results: pushResults, staleTokens } = await this.sendPush(profile.fcm_tokens, title, body, data.link);
-      // We already logged the base inbox push entry above; if sendPush had results, we can record them or let staleTokens prune.
       if (staleTokens.length) {
         await this.pruneTokens(userId, staleTokens);
       }
@@ -261,16 +217,6 @@ export class NotificationsService {
     }
   }
 
-  /**
-   * Awaited email send for the one caller that must see a failure rather
-   * than have it swallowed: AuthController.sendEmailOtp. Every other email
-   * in this app goes through notify()'s fire-and-forget dispatch(), where a
-   * failed send is merely logged — fine for a "welcome" or "dispute
-   * escalated" email, not fine for the OTP itself, since the user has no
-   * other way to know the code never arrived. Reuses the same EMAIL_TEMPLATES
-   * lookup and sendEmail() plumbing as every other template; just doesn't
-   * swallow the result.
-   */
   async sendEmailNow(to: string, event: string, data: Record<string, unknown>): Promise<void> {
     const result = await this.sendEmail(to, event, data);
     if (result.status === 'failed') {
@@ -281,17 +227,6 @@ export class NotificationsService {
     }
   }
 
-  /**
-   * OTP-only delivery path, via Gmail SMTP instead of Resend. Resend's
-   * shared onboarding@resend.dev sender only delivers to a handful of
-   * Resend-owned test addresses until a real domain is verified on the
-   * account — fine for the "welcome"/dispute emails during development
-   * (those go to whoever's testing), but useless for an OTP code that has
-   * to reach an arbitrary real inbox right now. Kept entirely separate from
-   * sendEmailNow/sendEmail above: same EMAIL_TEMPLATES['auth.otp_code']
-   * template, different transport, and this is the only thing SMTP_* is
-   * used for — every other email in this app still goes through Resend.
-   */
   private smtpTransporter: nodemailer.Transporter | null = null;
 
   private getSmtpTransporter(): nodemailer.Transporter {
@@ -309,14 +244,8 @@ export class NotificationsService {
     this.smtpTransporter = nodemailer.createTransport({
       host,
       port: Number(port),
-      // 587 is STARTTLS (secure: false, upgraded after connect), not the
-      // implicit-TLS 465 that Gmail also serves — the two are not
-      // interchangeable with the same `secure` flag.
       secure: Number(port) === 465,
       auth: { user, pass },
-      // Keep the authenticated connection open and reuse it, instead of a
-      // fresh TCP + TLS + AUTH handshake to Gmail on every code (most of the
-      // multi-second send time).
       pool: true,
     });
     return this.smtpTransporter;
@@ -331,9 +260,6 @@ export class NotificationsService {
     });
 
     const transporter = this.getSmtpTransporter();
-    // SMTP_FROM overrides the visible sender (e.g. "Basera <no-reply@basera.in>");
-    // the SMTP server must be allowed to send as that address. Defaults to the
-    // authenticated account, as before.
     const from = this.config.get<string>('SMTP_FROM') ?? `Basera <${this.config.get<string>('SMTP_USER')!}>`;
 
     try {
@@ -343,7 +269,6 @@ export class NotificationsService {
     }
   }
 
-  // ── Email delivery (Resend) ─────────────────────────────────────────────
   private async sendEmail(
     to: string,
     event: string,
@@ -372,10 +297,6 @@ export class NotificationsService {
     const resendKey = this.config.get<string>('RESEND_API_KEY');
     if (!resendKey) return { channel: 'email', status: 'skipped' };
 
-    // Falls back to Resend's shared test sender, which works with zero
-    // setup, while basera.in (or any real domain) is unverified in the
-    // Resend account. Set EMAIL_FROM once a real domain is verified — see
-    // https://resend.com/domains.
     const from = this.config.get<string>('EMAIL_FROM') ?? 'Basera <onboarding@resend.dev>';
 
     try {
@@ -398,10 +319,6 @@ export class NotificationsService {
     }
   }
 
-  // ── FCM bearer token via service account ────────────────────────────────
-  // Ported from getFcmBearerToken() (Deno SubtleCrypto RS256 signing) using
-  // Node's jsonwebtoken package instead — same JWT claims, same
-  // grant_type:jwt-bearer token exchange against Google's OAuth endpoint.
   private async getFcmBearerToken(): Promise<string | null> {
     if (this.fcmToken && Date.now() < this.fcmTokenExpiry) return this.fcmToken;
 
@@ -435,8 +352,6 @@ export class NotificationsService {
 
       const tokenData = await tokenRes.json();
       if (!tokenRes.ok || !tokenData.access_token) {
-        // Google's OAuth error is { error, error_description } — safe to log, it
-        // never echoes the assertion or key.
         this.logger.warn(
           `[FCM] OAuth token exchange failed: http=${tokenRes.status} error=${tokenData?.error ?? 'n/a'} description="${String(tokenData?.error_description ?? '').slice(0, 200)}"`,
         );
@@ -450,13 +365,6 @@ export class NotificationsService {
     }
   }
 
-  // ── Push delivery (FCM v1 API) ───────────────────────────────────────────
-  // A token FCM reports as UNREGISTERED/NotRegistered is permanently dead —
-  // the device unregistered, the browser data was cleared, or the token
-  // rotated. Without pruning these, profiles.fcm_tokens only ever grows and
-  // every future push re-attempts (and re-fails) every dead entry forever.
-  // Re-reads the row so a token the browser registered while this push was in
-  // flight is not wiped out by a stale in-memory copy of the array.
   async pruneTokens(userId: string, staleTokens: string[]): Promise<void> {
     if (!staleTokens.length) return;
     try {
@@ -491,13 +399,6 @@ export class NotificationsService {
 
     const resolvedLink = this.absoluteLink(link);
 
-    // One notification can carry many devices per recipient (fcm_tokens
-    // grows per device, never per notification) — sequential awaits here
-    // meant total latency scaled linearly with device count instead of
-    // being bounded by the slowest single FCM call. Each token's outcome
-    // is independent (one device's failure/staleness must never affect
-    // another's), so Promise.all + per-token try/catch keeps that
-    // isolation while sending every request concurrently.
     const perToken = await Promise.all(
       fcmTokens.map(async (token): Promise<{ result: DispatchResult; staleToken: string | null }> => {
         try {
@@ -520,7 +421,6 @@ export class NotificationsService {
             const err = await res.text();
             const info = parseFcmError(res.status, err);
             this.logger.warn(`[FCM] Push send failed: ${describeFcmError(info)}${info.tokenDead ? ' (token will be pruned)' : ''}`);
-            // A 401 means our cached bearer is bad; drop it so the next send re-authenticates.
             if (res.status === 401) this.fcmToken = null;
             return {
               result: { channel: 'push', status: 'failed', error: `${info.status || res.status} ${info.errorCode}`.trim() },

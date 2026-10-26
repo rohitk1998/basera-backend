@@ -1,12 +1,3 @@
-/**
- * Runs the attractions import from the command line and exits:
- *
- *   npm run import:attractions                 # all 12 districts
- *   npm run import:attractions -- Kullu        # one district
- *
- * Needs the normal backend .env (Wikidata needs no key). Everything it adds
- * is a draft: publish from the admin console's Explore places tab.
- */
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
 import { HP_DISTRICTS, type HpDistrict } from '../listings/hp-locations';

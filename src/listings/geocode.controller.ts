@@ -3,11 +3,6 @@ import { Throttle } from '@nestjs/throttler';
 import { AuthGuard } from '../auth/auth.guard';
 import { GeocodeService } from './geocode.service';
 
-/**
- * "Find on map" for the host listing form (web and app): district + tehsil +
- * what the host typed -> a pin, as exact as the data allows. Logged-in users
- * only, and throttled, because each lookup reaches a shared public service.
- */
 @Controller('api/geocode')
 @UseGuards(AuthGuard)
 export class GeocodeController {
@@ -24,7 +19,6 @@ export class GeocodeController {
     return { success: true, ...result };
   }
 
-  /** The address of a pin the host placed or dragged, so the form can show it back. */
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Get('reverse')
   async reverse(@Query('lat') lat = '', @Query('lng') lng = '') {

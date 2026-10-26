@@ -9,7 +9,7 @@ async function run() {
   console.log('payments:', res);
   const bookings = await dataSource.query(`SELECT * FROM bookings WHERE id = $1`, [res[0].booking_id]);
   console.log('bookings:', bookings);
-  
+
   process.exit(0);
 }
 run();

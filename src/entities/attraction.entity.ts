@@ -5,7 +5,6 @@ import type {
   AttractionStatus,
 } from '../attractions/attraction.types';
 
-/** A place to visit near stays — see migrations/20261001_attractions.sql. */
 @Entity('attractions')
 export class AttractionEntity {
   @PrimaryGeneratedColumn('uuid')
@@ -50,7 +49,6 @@ export class AttractionEntity {
   @Column({ type: 'text', nullable: true })
   duration: string | null;
 
-  // numeric comes back from pg as a string; the transformer keeps it a number.
   @Column({
     type: 'numeric',
     precision: 6,

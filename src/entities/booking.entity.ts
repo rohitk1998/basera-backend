@@ -1,9 +1,5 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 
-// listing_id + status + the date range together back the listings-search
-// overlap check (NOT EXISTS ... WHERE listing_id = ... AND status = ANY(...)
-// AND move_in < ... AND move_out > ...) — see
-// migrations/20260921_perf_indexes.sql.
 @Index(['listing_id', 'status', 'move_in', 'move_out'])
 @Entity('bookings')
 export class BookingEntity {
@@ -30,8 +26,6 @@ export class BookingEntity {
   @Column('date')
   move_out: string;
 
-  /** Set when a dispute resolves: the day the stay really ended. Availability
-   *  and overlap checks use COALESCE(actual_move_out, move_out). */
   @Column({ type: 'date', nullable: true })
   actual_move_out: string | null;
 

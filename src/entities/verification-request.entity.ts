@@ -1,14 +1,5 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
-// One row per verification submission, across all verification
-// types (identity / pan / bank / selfie) via the `verification_type`
-// discriminator — see migrations/20260913_verification_requests.sql for
-// the full rationale. A row only exists once a user has submitted
-// something: there is no "not_started" status — that state is the
-// absence of any row for a given (user_id, verification_type). The most
-// recent row per (user_id, verification_type) is always the current
-// status; older rows are resubmission history and are intentionally
-// never overwritten (no unique constraint on that pair).
 @Entity('verification_requests')
 export class VerificationRequestEntity {
   @PrimaryGeneratedColumn('uuid')
@@ -18,48 +9,23 @@ export class VerificationRequestEntity {
   user_id: string;
 
   @Column()
-  verification_type: string; // identity | pan | bank | selfie
+  verification_type: string;
 
   @Column({ type: 'text', nullable: true })
-  document_subtype: string | null; // identity only: 'aadhaar'
+  document_subtype: string | null;
 
   @Column({ default: 'pending' })
-  status: string; // pending | verified | rejected
+  status: string;
 
-  // Storage path in the private "verification-documents" bucket, shaped
-  // {userId}/{verificationType}/{randomUUID()}.{ext}. Nullable — a bank
-  // submission may carry only account details, no document.
   @Column({ type: 'text', nullable: true })
   document_path: string | null;
 
-  // Back side of the Aadhaar card. Same storage-path shape as document_path.
-  // Null for every non-identity row.
   @Column({ type: 'text', nullable: true })
   document_path_back: string | null;
 
-  // Bank-specific fields, only populated when verification_type = 'bank'.
-  // UPI/account-holder-name identity checks stay on profiles
-  // (bank_upi, bank_account_name) — these are the fields that table
-  // does not already have.
-  @Column({ type: 'text', nullable: true })
-  bank_account_number: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  bank_ifsc: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  bank_account_holder_name: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  bank_name: string | null;
-
-  // Output of DocumentAnalysisService — structural/quality signals only,
-  // never extracted sensitive field values (no PAN/aadhaar/account
-  // numbers). See src/verification/document-analysis.service.ts.
   @Column({ type: 'jsonb', nullable: true })
   analysis_result: Record<string, unknown> | null;
 
-  // Required by app logic (not a DB constraint) whenever status = 'rejected'.
   @Column({ type: 'text', nullable: true })
   rejection_reason: string | null;
 

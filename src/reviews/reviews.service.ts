@@ -60,11 +60,6 @@ export class ReviewsService {
         content,
       });
     } catch (err: any) {
-      // Race: a double-submit (slow network, impatient double-tap) or a
-      // retried request lands here between the findOne check above and
-      // this insert. The DB unique constraint on (booking_id, author_id)
-      // is the real guard; the findOne above is just the friendly-error
-      // fast path for the common case.
       if (err?.code === '23505') {
         throw new ConflictException('You have already reviewed this stay');
       }

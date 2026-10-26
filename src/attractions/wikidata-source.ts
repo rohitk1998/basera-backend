@@ -1,57 +1,36 @@
-/**
- * Wikidata as the attractions source. A place that has its own English
- * Wikipedia article is, by that fact, a notable one, which is exactly the
- * "popular places only" rule. The public SPARQL endpoint needs no account or
- * key. The number of Wikipedia languages an article exists in doubles as the
- * popularity score: Hadimba Devi Temple is in many languages, a village shrine
- * in none.
- *
- * Wikidata is CC0. Descriptions come from Wikipedia (credited in the app) and
- * photos from Wikimedia Commons (author and license shown under each photo).
- */
 import type { AttractionCategory } from './attraction.types';
 import { USER_AGENT, getJson, getWithRetry } from './external-sources';
 
-/**
- * Wikidata classes we show, in priority order: a place with several classes
- * takes the first category that matches. Valleys, passes, glaciers, hot
- * springs, parks and general attractions are filed as scenic spots.
- */
 const TYPE_CATEGORY: ReadonlyArray<readonly [string, AttractionCategory]> = [
-  ['Q842402', 'temple'], // Hindu temple
-  ['Q44539', 'temple'], // temple
-  ['Q5393308', 'temple'], // Buddhist temple
-  ['Q44613', 'temple'], // monastery
-  ['Q57821', 'fort'], // fortification
-  ['Q23413', 'fort'], // castle
-  ['Q16560', 'fort'], // palace
+  ['Q842402', 'temple'],
+  ['Q44539', 'temple'],
+  ['Q5393308', 'temple'],
+  ['Q44613', 'temple'],
+  ['Q57821', 'fort'],
+  ['Q23413', 'fort'],
+  ['Q16560', 'fort'],
   ['Q33506', 'museum'],
   ['Q34038', 'waterfall'],
   ['Q23397', 'lake'],
-  ['Q130003', 'adventure'], // ski resort
-  ['Q39816', 'viewpoint'], // valley
-  ['Q133056', 'viewpoint'], // mountain pass
-  ['Q35666', 'viewpoint'], // glacier
-  ['Q177380', 'viewpoint'], // hot spring
-  ['Q46169', 'viewpoint'], // national park
-  ['Q759421', 'viewpoint'], // nature reserve
-  ['Q570116', 'viewpoint'], // tourist attraction
+  ['Q130003', 'adventure'],
+  ['Q39816', 'viewpoint'],
+  ['Q133056', 'viewpoint'],
+  ['Q35666', 'viewpoint'],
+  ['Q177380', 'viewpoint'],
+  ['Q46169', 'viewpoint'],
+  ['Q759421', 'viewpoint'],
+  ['Q570116', 'viewpoint'],
 ];
 
 export type WikiPlace = {
-  /** Wikidata item id, e.g. "Q5754265" — the stable key across imports. */
   qid: string;
   name: string;
   lat: number;
   lng: number;
   category: AttractionCategory;
-  /** A Commons file URL from the item's image property, if it has one. */
   commonsImage: string | null;
-  /** Title of the English Wikipedia article. */
   articleTitle: string;
-  /** How many Wikipedia language editions have an article. */
   languages: number;
-  /** 0–100, from `languages`. */
   popularity: number;
 };
 
@@ -85,7 +64,6 @@ export function buildSparql(
 
 const qidOf = (uri: string) => uri.slice(uri.lastIndexOf('/') + 1);
 
-/** Distance in km between two points (equirectangular is plenty at this scale). */
 function approxKm(
   a: { lat: number; lng: number },
   b: { lat: number; lng: number },
@@ -101,12 +79,6 @@ const normalise = (name: string) =>
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 
-/**
- * Turns SPARQL rows into places: one per item (an item matches several
- * classes, so it appears in several rows), items without an English label are
- * dropped, and near-duplicates are merged. Wikidata sometimes has two items
- * for one real place (a spelling variant); the one in more languages wins.
- */
 export function parseBindings(rows: Binding[]): WikiPlace[] {
   const byQid = new Map<string, WikiPlace & { rank: number }>();
   for (const row of rows) {
@@ -118,7 +90,7 @@ export function parseBindings(rows: Binding[]): WikiPlace[] {
     const rank = TYPE_CATEGORY.findIndex(([q]) => q === typeQid);
     if (!itemUri || !name || !article || !coord || rank < 0) continue;
     const qid = qidOf(itemUri);
-    if (/^Q\d+$/.test(name)) continue; // no English label
+    if (/^Q\d+$/.test(name)) continue;
     const prev = byQid.get(qid);
     if (prev && prev.rank <= rank) continue;
     const languages = Number.parseInt(row.links?.value ?? '1', 10) || 1;
@@ -159,7 +131,6 @@ export function parseBindings(rows: Binding[]): WikiPlace[] {
   return kept;
 }
 
-/** Notable places of our kinds within `radiusKm` of a point. Throws if Wikidata cannot be reached. */
 export async function fetchWikidataPlaces(
   lat: number,
   lng: number,
@@ -170,15 +141,12 @@ export async function fetchWikidataPlaces(
   return parseBindings(body.results?.bindings ?? []);
 }
 
-// --------------------------------------------------------------- Wikipedia
-
 export type WikiSummary = {
   text: string;
   url: string;
   imageUrl: string | null;
 };
 
-/** "en:Hadimba Temple" → the English summary. Other-language links are skipped: the site copy is English. */
 export async function fetchWikipediaSummary(
   wikipediaTag: string,
 ): Promise<WikiSummary | null> {
@@ -187,7 +155,6 @@ export async function fetchWikipediaSummary(
   return summaryByTitle(m[1]);
 }
 
-/** The English Wikipedia summary for a Wikidata item, through its enwiki sitelink. */
 export async function fetchWikipediaSummaryForQid(
   qid: string,
 ): Promise<WikiSummary | null> {

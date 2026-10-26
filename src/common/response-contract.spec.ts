@@ -33,7 +33,6 @@ const CONTROLLERS = [
 
 const METHOD_NAME = { [RequestMethod.POST]: 'POST', [RequestMethod.PUT]: 'PUT', [RequestMethod.PATCH]: 'PATCH', [RequestMethod.DELETE]: 'DELETE' } as Record<number, string>;
 
-/** Every route handler that changes something, as "POST BookingsController.approve". */
 function mutatingHandlers() {
   const found: { label: string; handler: Function }[] = [];
   for (const controller of CONTROLLERS) {
@@ -52,7 +51,7 @@ describe('response contract', () => {
   const handlers = mutatingHandlers();
 
   it('finds the create/update/delete endpoints (guards against this test silently checking nothing)', () => {
-    expect(handlers.length).toBeGreaterThanOrEqual(57);
+    expect(handlers.length).toBeGreaterThanOrEqual(51);
   });
 
   it('every POST / PUT / PATCH / DELETE handler declares a success message', () => {

@@ -19,13 +19,6 @@ import { HostListingsService } from '../src/listings/host-listings.service';
 import { RedisService } from '../src/redis/redis.service';
 import { VerificationService } from '../src/verification/verification.service';
 
-/**
- * The whole host submission driven over HTTP only, no UI: capture-config ->
- * photos -> walkthrough -> submit-full, from a pin in Mohali (outside
- * Himachal). Storage, Redis and the database are in-memory fakes; the
- * controller, service, validation and gate are the real ones.
- */
-
 const MOHALI = { lat: 30.7046, lng: 76.7179 };
 const ROOMS = ['exterior', 'living', 'bedroom', 'kitchen', 'bath'];
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'host-submit-flow-'));
@@ -40,7 +33,7 @@ describe('host listing submission, API only (Mohali pin)', () => {
   let redisStore: Map<string, string>;
   let rows: Row[];
   let captureConfig: { locationBypass: boolean };
-  let status: { identity: { status: string }; pan: { status: string }; bank: { status: string } };
+  let status: { identity: { status: string } };
   let profile: Row;
 
   beforeAll(() => {
@@ -56,8 +49,8 @@ describe('host listing submission, API only (Mohali pin)', () => {
     redisStore = new Map();
     rows = [];
     captureConfig = { locationBypass: true };
-    status = { identity: { status: 'verified' }, pan: { status: 'verified' }, bank: { status: 'verified' } };
-    profile = { id: 'u1', host_kind: 'individual', pan: 'ABCDE1234F', gst: null, selfie_uploaded_at: new Date() };
+    status = { identity: { status: 'verified' } };
+    profile = { id: 'u1', host_kind: 'individual', gst: null, selfie_uploaded_at: new Date() };
 
     const listingsRepo = {
       findOne: async ({ where }: any) => rows.find((r) => Object.entries(where).every(([k, v]) => r[k] === v)) ?? null,
@@ -178,7 +171,6 @@ describe('host listing submission, API only (Mohali pin)', () => {
     ...over,
   });
 
-  /** capture-config -> photos -> walkthrough, returning what the form needs. */
   const capture = async () => {
     const cfg = await api().get(`${U}/capture-config`).set(auth).expect(200);
     expect(cfg.body).toMatchObject({ success: true, locationBypass: true });
@@ -199,20 +191,18 @@ describe('host listing submission, API only (Mohali pin)', () => {
     expect(rows[0]).toMatchObject({ host_id: 'u1', status: 'in_review' });
     expect(rows[0].draft_data.property_details).toMatchObject({ title: 'Mohali Test Cabin', lat: MOHALI.lat, lng: MOHALI.lng, city: 'Mohali' });
     expect(rows[0].draft_data.property_details.photos).toHaveLength(ROOMS.length);
-    expect(rows[0].draft_data.identity.pan).toBe('ABCDE1234F');
+    expect(rows[0].draft_data.identity).toEqual({ gst: '' });
 
-    // The reviewer sees that nothing about location was checked, so approval needs an audited override.
     const evidence = evaluateCaptureEvidence(rows[0].draft_data);
     expect(evidence.status).not.toBe('passed');
     expect(evidence.problems.join(' ')).toMatch(/bypassed/);
 
-    // The token is single use.
     const again = await api().post(`${U}/submit-full`).set(auth).send(form(photos, walk)).expect(400);
     expect(again.body.message).toMatch(/expired or was already used/);
     expect(rows).toHaveLength(1);
   });
 
-  it('the gate is identity + selfie only: either missing is a 403 with nothing stored or spent; PAN and bank are not required', async () => {
+  it('the gate is identity + selfie only: either missing is a 403 with nothing stored or spent', async () => {
     const { photos, walk } = await capture();
     const submit = () => api().post(`${U}/submit-full`).set(auth).send(form(photos, walk));
 
@@ -225,9 +215,6 @@ describe('host listing submission, API only (Mohali pin)', () => {
     profile.selfie_uploaded_at = new Date();
 
     expect(rows).toHaveLength(0);
-    // Nothing above spent the walkthrough receipt; PAN and bank unverified do not block.
-    status.pan.status = 'not_started';
-    status.bank.status = 'not_started';
     await submit().expect(201);
     expect(rows).toHaveLength(1);
   });

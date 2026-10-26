@@ -12,7 +12,7 @@ describe('availableFrom in the past', () => {
   });
 
   it('uses the IST day, not the UTC day, near midnight', () => {
-    jest.setSystemTime(new Date('2026-10-15T19:00:00Z')); // 00:30 on the 16th in India
+    jest.setSystemTime(new Date('2026-10-15T19:00:00Z'));
     expect(clampPastAvailableFrom({ availableFrom: '2026-10-15' }, 'Asia/Kolkata').availableFrom).toBe('2026-10-16');
     jest.setSystemTime(new Date('2026-10-15T10:00:00Z'));
   });

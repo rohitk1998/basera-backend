@@ -6,15 +6,12 @@ import { ConfigService } from '@nestjs/config';
 import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { FindOperator } from 'typeorm';
 import { ApiExceptionFilter } from '../src/common/filters/api-exception.filter';
 import { ResponseMessageInterceptor } from '../src/common/interceptors/response-message.interceptor';
 import { AuthGuard } from '../src/auth/auth.guard';
-import { CashfreeService } from '../src/payments/cashfree.service';
 import { StorageService } from '../src/storage/storage.service';
 import { DiditController } from '../src/verification/didit.controller';
 import { DiditService, signWebhookBody } from '../src/verification/didit.service';
-import { DocumentAnalysisService } from '../src/verification/document-analysis.service';
 import { VerificationController } from '../src/verification/verification.controller';
 import { VerificationService } from '../src/verification/verification.service';
 import { assertKycVerified } from '../src/user/verification-gate.util';
@@ -57,15 +54,7 @@ function makeStore() {
   const rows: Record<string, any>[] = [];
   const audit: Record<string, any>[] = [];
   let seq = 0;
-  const match = (r: any, where: any) =>
-    Object.entries(where).every(([k, v]) => {
-      if (v instanceof FindOperator) {
-        // Evaluates the Raw() exclusion used by the Cashfree daily cap.
-        const sql = v.getSql!('x');
-        return !(sql.includes('IS DISTINCT FROM') && sql.includes("'didit'") && r[k] === 'didit');
-      }
-      return r[k] === v;
-    });
+  const match = (r: any, where: any) => Object.entries(where).every(([k, v]) => r[k] === v);
   const requests = {
     findOne: async ({ where, order }: any) => {
       const m = rows.filter((r) => match(r, where));
@@ -75,11 +64,8 @@ function makeStore() {
     create: (r: any) => ({ reviewed_at: null, reviewed_by: null, rejection_reason: null, document_path: null, document_path_back: null, submitted_at: new Date(), ...r }),
     save: async (r: any) => { r.id = r.id ?? `row-${++seq}`; r.seq = seq; rows.push(r); return r; },
     update: async (where: any, patch: any) => { rows.filter((r) => match(r, where)).forEach((r) => Object.assign(r, patch)); },
-    // The cap's rule: rejected, not by an admin, not "replaced by", and not Didit (Raw operator).
-    count: async ({ where }: any) =>
-      rows.filter((r) => match(r, { document_subtype: where.document_subtype }) && r.user_id === where.user_id && r.verification_type === where.verification_type && r.status === 'rejected' && !r.reviewed_by && !String(r.rejection_reason).startsWith('Replaced by')).length,
   };
-  const profile: Record<string, any> = { id: USER, full_name: 'Asha Rao', selfie_uploaded_at: null, bank_upi: null };
+  const profile: Record<string, any> = { id: USER, full_name: 'Asha Rao', selfie_uploaded_at: null };
   const profiles = {
     findOne: async ({ where }: any) => (where.id === USER ? { ...profile } : null),
     update: async (_w: any, patch: any) => Object.assign(profile, patch),
@@ -102,15 +88,12 @@ describe('Didit hosted KYC (session + signed webhook, fake Didit, in-memory DB)'
   let store: ReturnType<typeof makeStore>;
   let handler: (s: Seen) => { status: number; body?: unknown; delayMs?: number };
   let env: Record<string, any>;
-  let cashfreeVerifyPan: jest.Mock;
 
   beforeEach(async () => {
     handler = () => ({ status: 201, body: { session_id: 'sess-1', session_token: 'tok', url: 'https://verify.didit.me/s/sess-1', status: 'Not Started' } });
     didit = await startDidit((s) => handler(s));
     store = makeStore();
-    cashfreeVerifyPan = jest.fn(async () => ({ verified: true, referenceId: 'cf-1' }));
     env = {
-      KYC_PROVIDER: 'didit',
       DIDIT_API_KEY: API_KEY,
       DIDIT_WORKFLOW_ID: 'wf-123',
       DIDIT_WEBHOOK_SECRET: WH_SECRET,
@@ -121,10 +104,8 @@ describe('Didit hosted KYC (session + signed webhook, fake Didit, in-memory DB)'
       providers: [
         VerificationService,
         DiditService,
-        { provide: CashfreeService, useValue: { verifyPan: cashfreeVerifyPan } },
         { provide: APP_INTERCEPTOR, useClass: ResponseMessageInterceptor },
         { provide: APP_FILTER, useClass: ApiExceptionFilter },
-        { provide: DocumentAnalysisService, useValue: {} },
         { provide: StorageService, useValue: {} },
         { provide: getRepositoryToken(VerificationRequestEntity), useValue: store.requests },
         { provide: getRepositoryToken(VerificationAuditLogEntity), useValue: store.auditLog },
@@ -205,12 +186,6 @@ describe('Didit hosted KYC (session + signed webhook, fake Didit, in-memory DB)'
       expect(didit.calls).toHaveLength(0);
     });
 
-    it('409 when the provider is not didit', async () => {
-      env.KYC_PROVIDER = 'admin';
-      await session().expect(409);
-      expect(didit.calls).toHaveLength(0);
-    });
-
     it('409 when identity and selfie are both already verified', async () => {
       await hook(event('Approved')).expect(200);
       await session().expect(409);
@@ -245,11 +220,6 @@ describe('Didit hosted KYC (session + signed webhook, fake Didit, in-memory DB)'
   });
 
   describe('POST /api/verification/didit/webhook', () => {
-    it('404 when the provider is not didit', async () => {
-      env.KYC_PROVIDER = 'admin';
-      await hook(event('Approved')).expect(404);
-    });
-
     it('400 on a non-object body', async () => {
       await request(app.getHttpServer()).post('/api/verification/didit/webhook').send([1, 2]).expect(400);
       await request(app.getHttpServer()).post('/api/verification/didit/webhook').set('Content-Type', 'application/json').send('"str"').expect(400);
@@ -294,8 +264,8 @@ describe('Didit hosted KYC (session + signed webhook, fake Didit, in-memory DB)'
       expect(store.audit).toHaveLength(2);
 
       const status = await statusOf();
-      expect(status).toMatchObject({ kycProvider: 'didit', identity: { status: 'verified' }, selfie: { status: 'verified' } });
-      // The gate used by booking creation and listing submission.
+      expect(status).toMatchObject({ identity: { status: 'verified' }, selfie: { status: 'verified' } });
+      expect(status).not.toHaveProperty('kycProvider');
       expect(() => assertKycVerified(store.profile as any, { identity: { status: status.identity.status } })).not.toThrow();
     });
 
@@ -398,18 +368,6 @@ describe('Didit hosted KYC (session + signed webhook, fake Didit, in-memory DB)'
       await hook(event('Declined', { timestamp: nowS() - 5 })).expect(200);
       await hook(event('In Review', { timestamp: nowS() - 60 })).expect(200);
       expect(latest('identity')!.status).toBe('rejected');
-    });
-
-    it('Didit rejections do not count towards the Cashfree daily cap', async () => {
-      const seed = (n: number, subtype: string | null) =>
-        Array.from({ length: n }, () =>
-          store.rows.push({ user_id: USER, verification_type: 'pan', status: 'rejected', reviewed_by: null, rejection_reason: 'x', document_subtype: subtype, submitted_at: new Date(), seq: 0 }));
-      seed(5, 'didit');
-      await request(app.getHttpServer()).post('/api/verification/pan/verify').set('x-test-user', '1').send({ pan: 'ABCDE1234F', name: 'Asha Rao' }).expect(201);
-      expect(cashfreeVerifyPan).toHaveBeenCalledTimes(1);
-      store.rows.length = 0;
-      seed(5, null);
-      await request(app.getHttpServer()).post('/api/verification/pan/verify').set('x-test-user', '1').send({ pan: 'ABCDE1234F', name: 'Asha Rao' }).expect(429);
     });
   });
 });

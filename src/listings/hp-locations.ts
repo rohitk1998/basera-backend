@@ -1,17 +1,4 @@
-/**
- * Himachal Pradesh districts and the tehsils / sub-tehsils under each, as
- * published by the district administrations (hp<district>.nic.in). A host picks
- * a district, then a tehsil, then describes the exact spot; the map pin is
- * found from that, or placed directly on the map anywhere inside the state.
- *
- * Plain data module (no 'use client') so it can be imported from client
- * components, server code and the backend alike. The backend
- * (src/listings/hp-locations.ts) and the Expo app (src/api/hp-locations.ts)
- * keep byte-identical copies, like the other shared listing schemas.
- *
- * Tehsils and sub-tehsils are listed together: to a host they are the same
- * thing — "the administrative area my village falls under".
- */
+
 
 export const HP_DISTRICTS = [
   'Bilaspur',
@@ -31,7 +18,6 @@ export const HP_DISTRICTS = [
 export type HpDistrict = (typeof HP_DISTRICTS)[number];
 
 type DistrictInfo = {
-  /** Where the map opens, and the last-resort pin when nothing more exact is found. */
   centre: { lat: number; lng: number };
   tehsils: readonly string[];
 };
@@ -117,7 +103,6 @@ const RAW_LOCATIONS: Record<HpDistrict, DistrictInfo> = {
   },
 };
 
-/** The same data with every tehsil list in alphabetical order, so a dropdown is easy to scan. */
 export const HP_LOCATIONS: Record<HpDistrict, DistrictInfo> = Object.fromEntries(
   HP_DISTRICTS.map((d) => [
     d,
@@ -137,14 +122,6 @@ export function districtCentre(district: string | undefined | null): { lat: numb
   return district && district in HP_LOCATIONS ? HP_LOCATIONS[district as HpDistrict].centre : null;
 }
 
-/**
- * A deliberately generous outline of Himachal Pradesh, [lat, lng] going
- * clockwise from the south-west. It is wider than the real border by design:
- * it exists to refuse pins that are plainly in another state (Chandigarh,
- * Pathankot, Jammu, Dehradun, Leh), never to reject a real HP address near the
- * edge — border towns on the wrong side of a line are better accepted than a
- * host in Kaza or Parwanoo being turned away.
- */
 const HP_OUTLINE: readonly (readonly [number, number])[] = [
   [30.35, 77.15], [30.35, 77.75], [30.7, 78.0], [31.0, 78.35], [31.3, 78.75], [31.75, 78.95],
   [32.25, 79.15], [32.7, 78.85], [33.05, 78.4], [33.05, 77.3], [33.3, 76.95], [33.3, 76.35],
@@ -152,7 +129,6 @@ const HP_OUTLINE: readonly (readonly [number, number])[] = [
   [31.35, 76.1], [31.05, 76.55], [30.85, 76.8], [30.65, 77.05],
 ];
 
-/** True when the point falls inside the (generous) outline of Himachal Pradesh. */
 export function isInsideHimachal(lat: number, lng: number): boolean {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
   let inside = false;
@@ -165,7 +141,6 @@ export function isInsideHimachal(lat: number, lng: number): boolean {
   return inside;
 }
 
-/** Distance between two points in kilometres (haversine). */
 export function distanceKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
   const rad = (d: number) => (d * Math.PI) / 180;
   const h =

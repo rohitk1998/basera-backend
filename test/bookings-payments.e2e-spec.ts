@@ -1,6 +1,7 @@
 import request from 'supertest';
 import * as jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
+import { createHmac } from 'crypto';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
@@ -13,6 +14,8 @@ import { AuthGuard, SESSION_COOKIE } from '../src/auth/auth.guard';
 import { SupabaseProvider } from '../src/auth/supabase.provider';
 import { BookingsController } from '../src/bookings/bookings.controller';
 import { BookingsService } from '../src/bookings/bookings.service';
+import { PaymentWebhookController } from '../src/bookings/payment-webhook.controller';
+import { CashfreeService, PgOrder } from '../src/payments/cashfree.service';
 import { PaymentsController } from '../src/payments/payments.controller';
 import { PaymentsService } from '../src/payments/payments.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
@@ -28,20 +31,17 @@ import {
   VerificationRequestEntity,
 } from '../src/entities';
 
-/* ── Fixtures ─────────────────────────────────────────────────────────────── */
-
 const SECRET = 'test-jwt-secret';
 const GUEST = 'guest-1';
 const HOST = 'host-1';
 const STRANGER = 'stranger-1';
 const LISTING_ID = '11111111-1111-4111-8111-111111111111';
 const MISSING_ID = 'does-not-exist';
+const PG_SECRET = 'test-pg-client-secret';
 
 const day = (offset: number) => new Date(Date.now() + offset * 86400000).toISOString().slice(0, 10);
 const tokenFor = (sub: string, opts: jwt.SignOptions = {}) => jwt.sign({ sub }, SECRET, opts);
 const as = (sub: string) => `${SESSION_COOKIE}=${tokenFor(sub)}`;
-
-/* ── Generic in-memory repository (equality `where`, array `where` = OR) ──── */
 
 function makeRepo(rows: Record<string, any>[] = [], opts: { idPrefix?: string } = {}) {
   let seq = 0;
@@ -101,7 +101,6 @@ function buildStore() {
   const caseEvents = makeRepo();
   const payments = makeRepo([], { idPrefix: 'pay' });
 
-  // Fake query builder for the two overlap checks in BookingsService.create().
   (bookings as any).createQueryBuilder = () => {
     const params: Record<string, any> = {};
     const qb: any = {
@@ -133,18 +132,20 @@ function buildStore() {
         update: (entity: any, where: any, patch: any) => repoByEntity.get(entity).update(where, patch),
         getRepository: (entity: any) => repoByEntity.get(entity),
       }),
-    // Fake of the query builder PaymentsService.listTransactions() uses.
     createQueryBuilder: () => {
       let whereSql = '';
       let userId = '';
+      let hidden: string[] = [];
       const qb: any = {
         innerJoin: () => qb,
         leftJoin: () => qb,
         select: () => qb,
         orderBy: () => qb,
         where: (sql: string, p: any) => ((whereSql = sql), (userId = p.userId), qb),
+        andWhere: (_sql: string, p: any) => ((hidden = p.unpaid), qb),
         getRawMany: async () =>
           payments.rows
+            .filter((p) => !hidden.includes(p.status))
             .map((p) => ({ p, b: bookings.rows.find((b) => b.id === p.booking_id)! }))
             .filter(({ b }) =>
               whereSql.includes(' OR ') ? b.guest_id === userId || b.host_id === userId : whereSql.includes('guest_id') ? b.guest_id === userId : b.host_id === userId,
@@ -173,13 +174,26 @@ function buildStore() {
   };
   const notify = jest.fn();
 
+  const orders = new Map<string, PgOrder>();
+  const realCashfree = new CashfreeService({ get: (k: string) => ({ CASHFREE_PG_CLIENT_SECRET: PG_SECRET })[k] } as unknown as ConfigService);
+  const cashfree = {
+    checkoutMode: 'sandbox' as const,
+    createPgOrder: jest.fn(async (p: { orderId: string; amount: number }) => {
+      const order: PgOrder = { orderId: p.orderId, status: 'ACTIVE', amount: p.amount, currency: 'INR', paymentSessionId: `session_${p.orderId}` };
+      orders.set(p.orderId, order);
+      return order;
+    }),
+    fetchPgOrder: jest.fn(async (orderId: string) => orders.get(orderId) ?? null),
+    fetchSuccessfulPaymentId: jest.fn(async () => 'cfpay-1'),
+    verifyWebhookSignature: (raw: Buffer | string, sig?: string, ts?: string) => realCashfree.verifyWebhookSignature(raw, sig, ts),
+  };
+
   listings.seed({ id: LISTING_ID, host_id: HOST, status: 'live', draft_data: { property_details: { title: 'Pine Cottage', dailyBaseRate: 1000, maxGuests: 4, minDays: 2 } } });
-  // The shared KYC gate: approved identity + a live selfie. No bank, no PAN.
-  profiles.seed({ id: GUEST, full_name: 'Gita Guest', selfie_uploaded_at: new Date() });
+  profiles.seed({ id: GUEST, full_name: 'Gita Guest', phone: '+919876543210', selfie_uploaded_at: new Date() });
   verifications.seed({ user_id: GUEST, verification_type: 'identity', status: 'verified', submitted_at: new Date() });
   profiles.seed({ id: HOST, full_name: 'Hari Host' });
 
-  return { bookings, events, listings, profiles, verifications, reviews, cases, caseEvents, payments, dataSource, supabase, upload, notify };
+  return { bookings, events, listings, profiles, verifications, reviews, cases, caseEvents, payments, dataSource, supabase, upload, notify, orders, cashfree };
 }
 
 type Store = ReturnType<typeof buildStore>;
@@ -218,8 +232,6 @@ const seedCase = (s: Store, bookingId: string, over: Record<string, any> = {}) =
 const seedCaseEvent = (s: Store, caseId: string, over: Record<string, any>) =>
   s.caseEvents.seed({ dispute_case_id: caseId, ...over });
 
-/* ── The suite ────────────────────────────────────────────────────────────── */
-
 describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-memory repos)', () => {
   let app: INestApplication;
   let s: Store;
@@ -228,10 +240,11 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
   beforeEach(async () => {
     s = buildStore();
     const moduleRef = await Test.createTestingModule({
-      controllers: [BookingsController, PaymentsController],
+      controllers: [BookingsController, PaymentsController, PaymentWebhookController],
       providers: [
         BookingsService,
         PaymentsService,
+        { provide: CashfreeService, useValue: s.cashfree },
         AuthGuard,
         { provide: APP_INTERCEPTOR, useClass: ResponseMessageInterceptor },
         { provide: APP_FILTER, useClass: ApiExceptionFilter },
@@ -250,9 +263,9 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       ],
     }).compile();
 
-    app = moduleRef.createNestApplication();
+    app = moduleRef.createNestApplication({ rawBody: true });
     app.use(cookieParser());
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true })); // as in main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
     await app.init();
   });
 
@@ -268,8 +281,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     if (msg) expect(res.body.message).toMatch(msg);
   };
 
-  /* ── Authentication, across every route ───────────────────────────────── */
-
   describe('authentication (real AuthGuard)', () => {
     const routes: [string, string][] = [
       ['post', '/api/bookings'],
@@ -279,6 +290,7 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       ['post', '/api/bookings/x/decline'],
       ['post', '/api/bookings/x/cancel'],
       ['post', '/api/bookings/x/pay'],
+      ['get', '/api/bookings/x/payment'],
       ['post', '/api/bookings/x/checkin'],
       ['post', '/api/bookings/x/dispute'],
       ['get', '/api/bookings/x/dispute'],
@@ -321,8 +333,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
   });
 
-  /* ── POST /api/bookings ───────────────────────────────────────────────── */
-
   describe('POST /api/bookings (create)', () => {
     const body = (over: Record<string, any> = {}) => ({ listingId: LISTING_ID, moveIn: day(10), moveOut: day(15), days: 5, paymentMethod: 'upi', ...over });
     const create = (b: any, user = GUEST) => api().post('/api/bookings').set('Cookie', as(user)).send(b);
@@ -335,7 +345,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       expect(Object.keys(res.body).slice(0, 2)).toEqual(['success', 'message']);
 
       const row = s.bookings.rows[0];
-      // 5 days * 1000/day, no discount; 10% commission.
       expect(row).toMatchObject({ guest_id: GUEST, host_id: HOST, status: 'requested', monthly_rent: 5000, gross_booking_amount: 5000, platform_commission: 500, host_payout_amount: 4500, adults: 1, children: 0 });
       expect(s.events.rows[0]).toMatchObject({ from_status: null, to_status: 'requested', actor: GUEST });
       expect(s.notify).toHaveBeenCalledWith('booking.requested', HOST, expect.objectContaining({ listingTitle: 'Pine Cottage', guestName: 'Gita Guest' }));
@@ -462,8 +471,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
   });
 
-  /* ── GET /api/bookings ────────────────────────────────────────────────── */
-
   describe('GET /api/bookings (list)', () => {
     const list = (q = '', user = GUEST) => api().get(`/api/bookings${q}`).set('Cookie', as(user));
 
@@ -518,8 +525,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
   });
 
-  /* ── GET /api/bookings/:id ────────────────────────────────────────────── */
-
   describe('GET /api/bookings/:id', () => {
     it('200 for the guest and for the host, with payment status', async () => {
       const b = seedBooking(s, { status: 'confirmed' });
@@ -542,8 +547,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       expectError(await api().get(`/api/bookings/${MISSING_ID}`).set('Cookie', as(GUEST)), 404, /Booking not found/);
     });
   });
-
-  /* ── approve / decline / cancel ───────────────────────────────────────── */
 
   describe('POST /api/bookings/:id/approve', () => {
     const approve = (id: string, user = HOST) => api().post(`/api/bookings/${id}/approve`).set('Cookie', as(user));
@@ -651,28 +654,94 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
   });
 
-  /* ── pay / checkin ────────────────────────────────────────────────────── */
-
   describe('POST /api/bookings/:id/pay', () => {
     const pay = (id: string, user = GUEST) => api().post(`/api/bookings/${id}/pay`).set('Cookie', as(user));
 
-    it('201: guest pays; a held payment with the mocked split is created and host notified', async () => {
+    it('201: returns a Cashfree checkout session and leaves a pending payment (no code, no notifications yet)', async () => {
       const b = seedBooking(s, { status: 'confirmed', due_at_move_in: 5000 });
       const res = await pay(b.id);
       expect(res.status).toBe(201);
-      expect(res.body).toMatchObject({ success: true, message: 'Payment received. It is held until 24 hours after check-in.', status: 'confirmed' });
+      const orderId = `bk_${b.id.replace(/-/g, '')}_1`;
+      expect(res.body).toMatchObject({ success: true, message: 'Payment started.', status: 'confirmed', paid: false, orderId, paymentSessionId: `session_${orderId}`, checkoutMode: 'sandbox' });
+      expect(s.cashfree.createPgOrder).toHaveBeenCalledWith(expect.objectContaining({ orderId, amount: 5000, customerId: GUEST, customerPhone: '9876543210' }));
       expect(s.payments.rows).toHaveLength(1);
       expect(s.payments.rows[0]).toMatchObject({
         booking_id: b.id,
         amount: 5000,
-        status: 'held',
+        status: 'pending',
+        attempt: 1,
+        cashfree_order_id: orderId,
         cashfree_split_payload: { platform_amount: 500, splits: [{ vendor_id: `SIMULATED-VENDOR-${HOST}`, amount: 4500 }] },
       });
-      expect(s.payments.rows[0].cashfree_order_id).toMatch(/^SIMULATED-/);
-      expect(s.notify).toHaveBeenCalledWith('booking.payment_held', HOST, expect.anything());
-      // The code is generated only after payment, never put in a notification payload.
+      expect(b.checkin_code).toBeNull();
+      expect(s.notify).not.toHaveBeenCalled();
+    });
+    it('400 when the guest has no usable mobile number; nothing is created', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      s.profiles.rows.find((r) => r.id === GUEST)!.phone = null;
+      expectError(await pay(b.id), 400, /mobile number/);
+      expect(s.cashfree.createPgOrder).not.toHaveBeenCalled();
+      expect(s.payments.rows).toHaveLength(0);
+    });
+    it('paying again while the order is ACTIVE returns the same order and creates nothing new', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      const first = await pay(b.id);
+      const second = await pay(b.id);
+      expect(second.status).toBe(201);
+      expect(second.body).toMatchObject({ paid: false, orderId: first.body.orderId, paymentSessionId: first.body.paymentSessionId });
+      expect(s.cashfree.createPgOrder).toHaveBeenCalledTimes(1);
+      expect(s.payments.rows).toHaveLength(1);
+    });
+    it('paying again when Cashfree already shows the order PAID confirms it instead of starting another', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      const first = await pay(b.id);
+      s.orders.get(first.body.orderId)!.status = 'PAID';
+      const res = await pay(b.id);
+      expect(res.body).toMatchObject({ success: true, status: 'confirmed', paid: true });
+      expect(s.payments.rows[0].status).toBe('held');
       expect(b.checkin_code).toMatch(/^\d{4}$/);
-      expect(s.notify).toHaveBeenCalledWith('booking.checkin_code_ready', HOST, expect.not.objectContaining({ checkinCode: expect.anything() }));
+      expect(s.cashfree.createPgOrder).toHaveBeenCalledTimes(1);
+    });
+    it('an EXPIRED order is marked failed by the sync, then pay() opens attempt 2 on the same row', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      const first = await pay(b.id);
+      s.orders.get(first.body.orderId)!.status = 'EXPIRED';
+      const status = await api().get(`/api/bookings/${b.id}/payment`).set('Cookie', as(GUEST));
+      expect(status.body).toMatchObject({ success: true, paymentStatus: 'failed' });
+      expect(s.payments.rows[0].status).toBe('failed');
+
+      const retry = await pay(b.id);
+      expect(retry.status).toBe(201);
+      expect(retry.body.orderId).toBe(`bk_${b.id.replace(/-/g, '')}_2`);
+      expect(retry.body.orderId).not.toBe(first.body.orderId);
+      expect(s.payments.rows).toHaveLength(1);
+      expect(s.payments.rows[0]).toMatchObject({ status: 'pending', attempt: 2, cashfree_order_id: retry.body.orderId });
+    });
+    it('a pending row whose Cashfree order is gone (404) is replaced with a new attempt', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      const first = await pay(b.id);
+      s.orders.delete(first.body.orderId);
+      const retry = await pay(b.id);
+      expect(retry.body.orderId).toMatch(/_2$/);
+      expect(s.payments.rows[0]).toMatchObject({ status: 'pending', attempt: 2 });
+    });
+    it('cancelling the booking marks a pending payment failed', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      await pay(b.id);
+      const res = await api().post(`/api/bookings/${b.id}/cancel`).set('Cookie', as(GUEST));
+      expect(res.status).toBe(201);
+      expect(s.payments.rows[0].status).toBe('failed');
+    });
+    it('list(): isPaid is false while pending and true once held; transactions hide the pending row', async () => {
+      const b = seedBooking(s, { status: 'confirmed' });
+      const { body } = await pay(b.id);
+      const isPaid = async () => (await api().get('/api/bookings').set('Cookie', as(GUEST))).body.bookings[0].isPaid;
+      expect(await isPaid()).toBe(false);
+      expect((await api().get('/api/transactions').set('Cookie', as(GUEST))).body.transactions).toHaveLength(0);
+      s.orders.get(body.orderId)!.status = 'PAID';
+      await api().get(`/api/bookings/${b.id}/payment`).set('Cookie', as(GUEST));
+      expect(await isPaid()).toBe(true);
+      expect((await api().get('/api/transactions').set('Cookie', as(GUEST))).body.transactions).toHaveLength(1);
     });
     it('check-in code is visible to the host but never to the guest (list)', async () => {
       const b = seedBooking(s, { status: 'confirmed', checkin_code: '4821' });
@@ -703,18 +772,20 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       const b = seedBooking(s, { status });
       expectError(await pay(b.id), 409, new RegExp(`Cannot pay for a booking in status "${status}"`));
     });
-    it('409 on double payment (application check) and only one payment row exists', async () => {
+    it('409 once the payment is held (application check) and only one payment row exists', async () => {
       const b = seedBooking(s, { status: 'confirmed' });
-      expect((await pay(b.id)).status).toBe(201);
+      const first = await pay(b.id);
+      s.orders.get(first.body.orderId)!.status = 'PAID';
+      await api().get(`/api/bookings/${b.id}/payment`).set('Cookie', as(GUEST));
       expectError(await pay(b.id), 409, /already been paid/);
       expect(s.payments.rows).toHaveLength(1);
     });
-    it('409 when a concurrent pay loses the unique-index race (23505 -> Conflict, not 500)', async () => {
+    it('409 when a concurrent first pay loses the unique-index race (23505 -> Conflict, not 500)', async () => {
       const b = seedBooking(s, { status: 'confirmed' });
       s.payments.save = async () => {
         throw new QueryFailedError('INSERT', [], Object.assign(new Error('duplicate key'), { code: '23505' }) as any);
       };
-      expectError(await pay(b.id), 409, /already been paid/);
+      expectError(await pay(b.id), 409, /already in progress/);
     });
     it('500 generic for any other payment persistence failure', async () => {
       const b = seedBooking(s, { status: 'confirmed' });
@@ -724,6 +795,131 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       const res = await pay(b.id);
       expectError(res, 500);
       expect(res.body.message).not.toMatch(/secret/);
+    });
+  });
+
+  describe('payment sync (GET /api/bookings/:id/payment)', () => {
+    const pay = (id: string) => api().post(`/api/bookings/${id}/pay`).set('Cookie', as(GUEST));
+    const status = (id: string, user = GUEST) => api().get(`/api/bookings/${id}/payment`).set('Cookie', as(user));
+    const started = async () => {
+      const b = seedBooking(s, { status: 'confirmed', due_at_move_in: 5000 });
+      const { body } = await pay(b.id);
+      return { b, order: s.orders.get(body.orderId)! };
+    };
+
+    it('stays pending while the order is ACTIVE', async () => {
+      const { b } = await started();
+      expect((await status(b.id)).body).toMatchObject({ success: true, paymentStatus: 'pending' });
+      expect(s.payments.rows[0].status).toBe('pending');
+      expect(s.notify).not.toHaveBeenCalled();
+    });
+    it('PAID flips to held exactly once: code generated, notifications sent once, a second call adds nothing', async () => {
+      const { b, order } = await started();
+      order.status = 'PAID';
+      expect((await status(b.id)).body).toMatchObject({ paymentStatus: 'held' });
+      expect(s.payments.rows[0]).toMatchObject({ status: 'held', cf_payment_id: 'cfpay-1' });
+      expect(s.payments.rows[0].paid_at).toBeInstanceOf(Date);
+      expect(b.checkin_code).toMatch(/^\d{4}$/);
+      const code = b.checkin_code;
+      expect(s.notify).toHaveBeenCalledWith('booking.payment_held', HOST, expect.anything());
+      expect(s.notify).toHaveBeenCalledWith('booking.checkin_code_ready', HOST, expect.not.objectContaining({ checkinCode: expect.anything() }));
+      const calls = s.notify.mock.calls.length;
+      expect(calls).toBe(3);
+
+      expect((await status(b.id)).body).toMatchObject({ paymentStatus: 'held' });
+      expect(s.notify).toHaveBeenCalledTimes(calls);
+      expect(b.checkin_code).toBe(code);
+    });
+    it('concurrent syncs of a PAID order still run the post-payment work once', async () => {
+      const { b, order } = await started();
+      order.status = 'PAID';
+      await Promise.all([status(b.id), status(b.id), status(b.id)]);
+      expect(s.notify).toHaveBeenCalledTimes(3);
+      expect(s.payments.rows[0].status).toBe('held');
+    });
+    it('does not confirm when the paid amount differs from what we expect', async () => {
+      const { b, order } = await started();
+      order.status = 'PAID';
+      order.amount = 1;
+      expect((await status(b.id)).body).toMatchObject({ paymentStatus: 'pending' });
+      expect(s.payments.rows[0].status).toBe('pending');
+      expect(b.checkin_code).toBeNull();
+      expect(s.notify).not.toHaveBeenCalled();
+    });
+    it('does not confirm when the order currency is not INR', async () => {
+      const { b, order } = await started();
+      order.status = 'PAID';
+      order.currency = 'USD';
+      expect((await status(b.id)).body).toMatchObject({ paymentStatus: 'pending' });
+      expect(s.payments.rows[0].status).toBe('pending');
+    });
+    it.each(['EXPIRED', 'TERMINATED'])('%s -> failed', async (orderStatus) => {
+      const { b, order } = await started();
+      order.status = orderStatus;
+      expect((await status(b.id)).body).toMatchObject({ paymentStatus: 'failed' });
+      expect(s.payments.rows[0].status).toBe('failed');
+    });
+    it('the host may check too; a stranger gets 403; unknown booking 404; no payment -> none', async () => {
+      const { b } = await started();
+      expect((await status(b.id, HOST)).status).toBe(200);
+      expectError(await status(b.id, STRANGER), 403);
+      expectError(await status(MISSING_ID), 404);
+      const other = seedBooking(s, { status: 'confirmed' });
+      expect((await status(other.id)).body).toMatchObject({ paymentStatus: 'none' });
+    });
+  });
+
+  describe('POST /api/payments/cashfree/webhook', () => {
+    const TS = '1700000000000';
+    const sign = (raw: string, secret = PG_SECRET, ts = TS) => createHmac('sha256', secret).update(ts + raw).digest('base64');
+    const payload = (orderId: string) => JSON.stringify({ type: 'PAYMENT_SUCCESS_WEBHOOK', data: { order: { order_id: orderId, order_amount: 5000 } } });
+    const post = (raw: string, headers: Record<string, string> = {}) =>
+      api().post('/api/payments/cashfree/webhook').set('Content-Type', 'application/json').set(headers).send(raw);
+    const signed = (raw: string) => ({ 'x-webhook-signature': sign(raw), 'x-webhook-timestamp': TS });
+
+    const started = async () => {
+      const b = seedBooking(s, { status: 'confirmed', due_at_move_in: 5000 });
+      const res = await api().post(`/api/bookings/${b.id}/pay`).set('Cookie', as(GUEST));
+      return { b, orderId: res.body.orderId as string };
+    };
+
+    it('401 without signature headers and for a bad signature; nothing changes', async () => {
+      const { b, orderId } = await started();
+      s.orders.get(orderId)!.status = 'PAID';
+      const raw = payload(orderId);
+      expectError(await post(raw), 401, /signature/);
+      expectError(await post(raw, { 'x-webhook-signature': sign(raw, 'wrong-secret'), 'x-webhook-timestamp': TS }), 401);
+      expectError(await post(raw, { 'x-webhook-signature': sign(raw), 'x-webhook-timestamp': '1' }), 401);
+      expectError(await post(payload('tampered'), signed(raw)), 401);
+      expect(s.payments.rows[0].status).toBe('pending');
+      expect(b.checkin_code).toBeNull();
+    });
+    it('200 with a good signature for a PAID order flips the payment to held once, even if delivered twice', async () => {
+      const { b, orderId } = await started();
+      s.orders.get(orderId)!.status = 'PAID';
+      const raw = payload(orderId);
+      const first = await post(raw, signed(raw));
+      expect(first.status).toBe(200);
+      expect(first.body).toMatchObject({ received: true });
+      expect(s.payments.rows[0].status).toBe('held');
+      expect(b.checkin_code).toMatch(/^\d{4}$/);
+      expect(s.notify).toHaveBeenCalledTimes(3);
+      expect((await post(raw, signed(raw))).status).toBe(200);
+      expect(s.notify).toHaveBeenCalledTimes(3);
+    });
+    it('a signed webhook claiming success for an order Cashfree still shows ACTIVE does not confirm', async () => {
+      const { orderId } = await started();
+      const raw = payload(orderId);
+      expect((await post(raw, signed(raw))).status).toBe(200);
+      expect(s.payments.rows[0].status).toBe('pending');
+      expect(s.notify).not.toHaveBeenCalled();
+    });
+    it('200 (so Cashfree stops retrying) for an unknown order and for a payload with no order', async () => {
+      const raw = payload('bk_unknown_1');
+      expect((await post(raw, signed(raw))).status).toBe(200);
+      const ping = JSON.stringify({ type: 'WEBHOOK', data: {} });
+      expect((await post(ping, signed(ping))).status).toBe(200);
+      expect(s.cashfree.fetchPgOrder).not.toHaveBeenCalled();
     });
   });
 
@@ -789,8 +985,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
   });
 
-  /* ── checkout ─────────────────────────────────────────────────────────── */
-
   describe('POST /api/bookings/:id/checkout', () => {
     const checkout = (id: string, user = GUEST) => api().post(`/api/bookings/${id}/checkout`).set('Cookie', as(user));
 
@@ -821,7 +1015,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       const today = new Date();
       const localToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
       const b = seedBooking(s, { status: 'checked_in', move_out: localToday });
-      // Same-day: guest allowed, host held back until the official time (skipped in the last minute of the day).
       if (today.getHours() === 23 && today.getMinutes() === 59) return;
       expectError(await checkout(b.id, HOST), 409, /official checkout time \(11:59 PM\)/);
     });
@@ -837,8 +1030,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       expectError(await checkout(b.id), 409, new RegExp(`Cannot checkout a booking in status "${status}"`));
     });
   });
-
-  /* ── Disputes ─────────────────────────────────────────────────────────── */
 
   describe('POST /api/bookings/:id/dispute (raise)', () => {
     const dispute = (id: string, body: any, user = GUEST) => api().post(`/api/bookings/${id}/dispute`).set('Cookie', as(user)).send(body);
@@ -1112,7 +1303,7 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
     it('409 when accepting with no offer made yet', async () => {
       const { b } = negotiating();
-      s.caseEvents.rows.splice(1, 1); // only the guest's own claim remains
+      s.caseEvents.rows.splice(1, 1);
       expectError(await respond(b.id, { action: 'accept' }), 409, /No standing offer/);
     });
     it.each(['resolved', 'escalated'])('409 when the case is already %s', async (case_status) => {
@@ -1177,17 +1368,15 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
     });
   });
 
-  /* ── GET /api/transactions (PaymentsController) ───────────────────────── */
-
   describe('GET /api/transactions', () => {
     const tx = (q = '', user = GUEST) => api().get(`/api/transactions${q}`).set('Cookie', as(user));
     let guestBooking: any;
     let guestAsHostBooking: any;
 
     beforeEach(() => {
-      guestBooking = seedBooking(s, { status: 'confirmed' }); // GUEST pays HOST
+      guestBooking = seedBooking(s, { status: 'confirmed' });
       seedPayment(s, guestBooking.id, { amount: 5000 });
-      guestAsHostBooking = seedBooking(s, { guest_id: STRANGER, host_id: GUEST, status: 'confirmed' }); // GUEST hosts
+      guestAsHostBooking = seedBooking(s, { guest_id: STRANGER, host_id: GUEST, status: 'confirmed' });
       seedPayment(s, guestAsHostBooking.id, { amount: 7000, status: 'released_to_host', cashfree_payout_id: 'SIMULATED-p' });
       const unrelated = seedBooking(s, { guest_id: STRANGER, host_id: 'someone-else' });
       seedPayment(s, unrelated.id);
@@ -1223,8 +1412,6 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       expect(body.transactions.map((t: any) => t.bookingId).sort()).toEqual([guestAsHostBooking.id, s.bookings.rows[2].id].sort());
       expect(body.transactions.some((t: any) => t.bookingId === guestBooking.id)).toBe(false);
     });
-    // NOTE: `role` is not validated (no DTO/pipe), so an unknown value silently falls back to
-    // "both sides" instead of 400. Pinned here as current behaviour; arguably should be 400.
     it('200 (current behaviour, not 400): unknown role falls back to both sides', async () => {
       expect((await tx('?role=admin')).body.transactions).toHaveLength(2);
     });

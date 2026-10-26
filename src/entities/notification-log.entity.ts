@@ -12,10 +12,10 @@ export class NotificationLogEntity {
   event: string;
 
   @Column()
-  channel: string; // email | push
+  channel: string;
 
   @Column()
-  status: string; // sent | failed | skipped
+  status: string;
 
   @Column({ type: 'text', nullable: true })
   error: string | null;

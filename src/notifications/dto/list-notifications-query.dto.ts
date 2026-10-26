@@ -9,9 +9,6 @@ export class ListNotificationsQueryDto {
   @IsUUID()
   beforeId?: string;
 
-  // The viewer's current NEXT_LOCALE cookie, forwarded by the web app —
-  // reflects what's on screen right now, not a possibly-stale synced
-  // preferred_locale value.
   @IsOptional()
   @IsString()
   locale?: string;

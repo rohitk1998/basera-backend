@@ -13,12 +13,6 @@ import {
 } from '../listings/hp-locations';
 import { placeAliasFor } from '../listings/place-aliases';
 
-/**
- * How far from each district centre the import searches, in metres. The big,
- * sparse districts need a wider circle to reach their valleys (Kaza and
- * Keylong are ~120 km apart). Circles overlap; every place found is filed
- * under the district whose centre is nearest.
- */
 export const DISTRICT_SEARCH_RADIUS_M: Record<HpDistrict, number> = {
   Bilaspur: 30_000,
   Chamba: 55_000,
@@ -45,7 +39,6 @@ function clean(v: unknown): string {
     : '';
 }
 
-/** The district whose tehsil list has this name (case-insensitive), or null. */
 function districtOfTehsil(name: string): HpDistrict | null {
   const wanted = name.toLowerCase();
   for (const d of HP_DISTRICTS) {
@@ -55,13 +48,6 @@ function districtOfTehsil(name: string): HpDistrict | null {
   return null;
 }
 
-/**
- * Which district a search is about, from the same params /stays sends to
- * the listings search: an explicit district, else the tehsil's district,
- * else free text that names a district, a tehsil or a known tourist place
- * ("Kasol" is in Kullu). Null when the search is not about one district —
- * then there is nothing to show.
- */
 export function resolveDistrict(
   query: Record<string, unknown>,
 ): HpDistrict | null {
@@ -84,13 +70,11 @@ export function resolveDistrict(
   );
 }
 
-/** The district centre nearest a point. */
 export function nearestDistrict(lat: number, lng: number): HpDistrict {
   let best: HpDistrict = HP_DISTRICTS[0];
   let bestD = Infinity;
   for (const d of HP_DISTRICTS) {
     const c = HP_LOCATIONS[d].centre;
-    // Equirectangular is plenty to rank centres a few dozen km apart.
     const dx = (lng - c.lng) * Math.cos((lat * Math.PI) / 180);
     const dy = lat - c.lat;
     const dist = dx * dx + dy * dy;
@@ -102,7 +86,6 @@ export function nearestDistrict(lat: number, lng: number): HpDistrict {
   return best;
 }
 
-/** URL-safe slug: "Hadimba Devi Temple" → "hadimba-devi-temple". */
 export function slugify(text: string): string {
   return (
     text
@@ -115,7 +98,6 @@ export function slugify(text: string): string {
   );
 }
 
-/** A slug not in `taken`: the base, then base-district, then base-2, base-3… */
 export function uniqueSlug(
   name: string,
   district: string,
@@ -130,7 +112,6 @@ export function uniqueSlug(
   }
 }
 
-/** First sentence(s) of a description, capped for a card. */
 export function summarise(
   text: string | null | undefined,
   max = 160,
@@ -145,7 +126,6 @@ export function summarise(
     : `${cut.slice(0, cut.lastIndexOf(' '))}…`;
 }
 
-/** An 11-character YouTube video id from an id or any common YouTube URL, else null. */
 export function youtubeIdFrom(input: string): string | null {
   const s = input.trim();
   if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
@@ -155,7 +135,6 @@ export function youtubeIdFrom(input: string): string | null {
   return m ? m[1] : null;
 }
 
-/** What the public API returns for one attraction (camelCase, no admin fields). */
 export type PublicAttraction = {
   id: string;
   slug: string;
@@ -209,7 +188,6 @@ const optionalText = (max: number) =>
     .nullable()
     .optional();
 
-/** Admin create/update payload. On update every field is optional. */
 export const attractionInputSchema = z.object({
   name: z.string().trim().min(2, 'Name is too short').max(120),
   category: z.enum(ATTRACTION_CATEGORIES, { message: 'Pick a category' }),
@@ -244,7 +222,6 @@ export const attractionInputSchema = z.object({
     .optional(),
   popularity: z.coerce.number().int().min(0).max(100).optional(),
   status: z.enum(ATTRACTION_STATUSES).optional(),
-  /** A Wikimedia Commons file ("File:X.jpg" or its page URL) to copy in as the photo. */
   commonsImage: optionalText(500),
 });
 export type AttractionInput = z.infer<typeof attractionInputSchema>;

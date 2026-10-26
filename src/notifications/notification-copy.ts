@@ -3,21 +3,15 @@ import type { NotificationEvent } from './notifications.types';
 
 const DEFAULT_LOCALE = 'en';
 
+const NAME_FALLBACK: Record<string, Record<'guestName' | 'hostName' | 'userName', string>> = {
+  en: { guestName: 'A guest', hostName: 'Your host', userName: 'Someone' },
+  hi: { guestName: 'एक गेस्ट', hostName: 'आपके होस्ट', userName: 'कोई' },
+};
+
 function interpolate(template: string, values: Record<string, string>): string {
-  return template.replace(/\{(\w+)\}/g, (match, key) => values[key] ?? match);
+  return template.replace(/\{(\w+)\}/g, (match, key) => values[key] ?? '');
 }
 
-/**
- * Locale-aware title/body for a notification, derived from `event` +
- * `payload.listingTitle` against NOTIFICATION_COPY. Ignores any stored
- * `payload.pushTitle`/`pushBody` — those exist only because sendPush()
- * needs plain text at send time (see notifications.service.ts dispatch()),
- * not because they're the source of truth for display copy. Deriving the
- * inbox and the push body from the same catalog+locale, independently,
- * means both the /notifications inbox and the phone's push banner show the
- * viewer's own language rather than whatever locale the recipient's push
- * happened to be rendered in at send time.
- */
 export function notificationCopy(
   event: string,
   payload: Record<string, unknown>,
@@ -35,8 +29,18 @@ export function notificationCopy(
       ? payload.listingTitle
       : YOUR_LISTING_FALLBACK[locale] ?? YOUR_LISTING_FALLBACK[DEFAULT_LOCALE]!;
 
+  const fallbacks = NAME_FALLBACK[locale] ?? NAME_FALLBACK[DEFAULT_LOCALE]!;
+  const nameOrFallback = (value: unknown, fallback: string): string =>
+    typeof value === 'string' && value.trim() !== '' ? value : fallback;
+  const values = {
+    listingTitle,
+    guestName: nameOrFallback(payload.guestName, fallbacks.guestName),
+    hostName: nameOrFallback(payload.hostName, fallbacks.hostName),
+    userName: nameOrFallback(payload.userName, fallbacks.userName),
+  };
+
   return {
-    title: interpolate(entry.title, { listingTitle }),
-    body: interpolate(entry.body, { listingTitle }),
+    title: interpolate(entry.title, values),
+    body: interpolate(entry.body, values),
   };
 }

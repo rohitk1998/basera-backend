@@ -1,11 +1,10 @@
 import { ListingEntity } from '../entities';
 import { Amenity, AmenityGroup, CategoryId, Listing, Photo, RoomId } from './listing.types';
 import { toFullAddress } from './listing-schema';
+import { isMeasuredYes } from './wifi-test.util';
 
 const ROOMS: readonly RoomId[] = ['exterior', 'living', 'bedroom', 'kitchen', 'view'];
 
-// Mirrors web/lib/listings.ts COMMON_AMENITIES — same labels, same groups,
-// so a host-picked amenity renders under the right heading on the detail page.
 const AMENITY_GROUPS: Record<string, AmenityGroup> = {
   Wifi: 'work',
   Workspace: 'work',
@@ -52,18 +51,6 @@ const AMENITY_GROUPS: Record<string, AmenityGroup> = {
   'Board games for kids': 'family',
 };
 
-/**
- * Ported from web/lib/listing-mapper.ts rowToListing — the single row →
- * `Listing` mapper. This logic used to be copy-pasted into three places in
- * the Next.js app, which is how two bugs survived in all of them at once:
- *
- *   - `coords` was read from `draft.telemetry.coords`, but telemetrySchema is
- *     only `{ walkthroughPassed }`. lat/lng come from locationSchema and land
- *     in `property_details`, so every listing fell back to the same
- *     Dharamshala point and every map pin stacked there.
- * `rating` and `reviewCount` are null for real listings: there is no reviews
- * table, so any number here would be fabricated.
- */
 export function rowToListing(row: ListingEntity): Listing {
   const draft = (row.draft_data as Record<string, any>) || {};
   const propStep = draft.property_details || draft.property || draft.basics || {};
@@ -71,13 +58,11 @@ export function rowToListing(row: ListingEntity): Listing {
 
   const title =
     propStep.title || addressStep.fullAddress || addressStep.line1 || `Mountain Stay (#${row.id.slice(0, 6)})`;
-  // Never invent a place: a listing with no town/tehsil/city falls back to its
-  // district, and to '' (shown as nothing) rather than to some other town.
+
   const town =
     propStep.town || propStep.tehsil || addressStep.town || addressStep.city || propStep.district || '';
   const inPlace = town ? ` in ${town}` : '';
 
-  // propStep.photos entries are { url, room } (photoSchema) — not bare URLs.
   const photos: Photo[] =
     propStep.photos && propStep.photos.length > 0
       ? propStep.photos.map((p: { url: string; room?: RoomId }, i: number) => ({
@@ -92,21 +77,15 @@ export function rowToListing(row: ListingEntity): Listing {
         }));
 
   const amenities: Amenity[] = (
-    propStep.amenities || ['Wifi', 'Workspace', 'Kitchen', 'Hot water', 'Room heater']
+    propStep.amenities || ['Workspace', 'Kitchen', 'Hot water', 'Room heater']
   ).map((label: string, i: number) => ({
     id: `am-${i}`,
     label,
     group: AMENITY_GROUPS[label] || 'safety',
   }));
 
-  // Only the categories the host actually chose. This used to show
-  // ['long', 'work', 'views'] when none were stored, but the category filter
-  // (listings.service.ts, a jsonb containment check on the stored array) can
-  // only match stored values — so a listing would display a "work" badge
-  // that the "work" filter never returned.
   const categories: CategoryId[] = Array.isArray(propStep.categories) ? propStep.categories : [];
 
-  // lat/lng live in property_details (locationSchema), not telemetry.
   const lat = typeof propStep.lat === 'number' ? propStep.lat : draft.telemetry?.coords?.lat;
   const lng = typeof propStep.lng === 'number' ? propStep.lng : draft.telemetry?.coords?.lng;
 
@@ -121,7 +100,7 @@ export function rowToListing(row: ListingEntity): Listing {
       propStep.fullAddress ||
       `${title}${inPlace}, Himachal Pradesh`,
     dailyBaseRate: propStep.dailyBaseRate || Math.round((propStep.price || propStep.monthlyRent || 12000) / 30),
-    // `??`, not `||`: a host who chose 0% must get 0%, not the 15%/40% default.
+
     weeklyDiscountPct: propStep.weeklyDiscountPct ?? 15,
     monthlyDiscountPct: propStep.monthlyDiscountPct ?? 40,
     beds: propStep.beds || (propStep.bedrooms ? `${propStep.bedrooms} BHK` : '1 room · private bath'),
@@ -155,5 +134,9 @@ export function rowToListing(row: ListingEntity): Listing {
     cancellation: propStep.cancellation || 'moderate',
     coords: typeof lat === 'number' && typeof lng === 'number' ? { lat, lng } : null,
     categories,
+
+    ...(isMeasuredYes(draft.wifi)
+      ? { wifiMeasured: { downMbps: draft.wifi.downMbps, upMbps: draft.wifi.upMbps, testedAt: draft.wifi.testedAt } }
+      : {}),
   };
 }

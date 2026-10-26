@@ -22,7 +22,6 @@ describe('calendar-date.util', () => {
 
 describe('todayDayNumberIST', () => {
   it('uses the Asia/Kolkata calendar day, not UTC', () => {
-    // 20:00 UTC on 1 Nov is already 01:30 on 2 Nov in India.
     expect(todayDayNumberIST(new Date('2026-11-01T20:00:00Z'))).toBe(calendarDayNumber('2026-11-02'));
     expect(todayDayNumberIST(new Date('2026-11-01T18:00:00Z'))).toBe(calendarDayNumber('2026-11-01'));
   });

@@ -7,7 +7,7 @@ function makeService(payment: Record<string, unknown> | null, rawRows: Record<st
     update: jest.fn().mockResolvedValue({ affected: 1 }),
   };
   const qb: Record<string, jest.Mock> = {};
-  for (const m of ['innerJoin', 'leftJoin', 'select', 'where', 'orderBy']) qb[m] = jest.fn().mockReturnValue(qb);
+  for (const m of ['innerJoin', 'leftJoin', 'select', 'where', 'andWhere', 'orderBy']) qb[m] = jest.fn().mockReturnValue(qb);
   qb.getRawMany = jest.fn().mockResolvedValue(rawRows);
   const dataSource = { createQueryBuilder: jest.fn().mockReturnValue(qb) };
   return { service: new PaymentsService(paymentsRepo as never, dataSource as never), paymentsRepo };
@@ -48,5 +48,47 @@ describe('PaymentsService.listTransactions', () => {
     const { service } = makeService(null, [{ ...base, amount: 1500, status: 'released_to_host', splitAmountToGuest: null }]);
     const res = await service.listTransactions('g1', 'guest');
     expect(res.transactions[0]).toMatchObject({ refundedAmount: null, hostAmount: null });
+  });
+});
+
+describe('PaymentsService.markHeld / markFailed', () => {
+  it('flips only a pending row and reports true for the caller that changed it', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    const held = await service.markHeld('b1', 'cf-9');
+    expect(held).toBe(true);
+    expect(paymentsRepo.update).toHaveBeenCalledWith(
+      { booking_id: 'b1', status: 'pending' },
+      expect.objectContaining({ status: 'held', cf_payment_id: 'cf-9', paid_at: expect.any(Date) }),
+    );
+  });
+
+  it('returns false when no pending row was updated (already held, or failed)', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    paymentsRepo.update.mockResolvedValue({ affected: 0 });
+    expect(await service.markHeld('b1', null)).toBe(false);
+  });
+
+  it('returns false when the driver reports no affected count', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    paymentsRepo.update.mockResolvedValue({});
+    expect(await service.markHeld('b1', null)).toBe(false);
+  });
+
+  it('only exactly one of two racing callers gets true against a row that is flipped once', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    let status = 'pending';
+    paymentsRepo.update.mockImplementation(async (where: { status: string }) => {
+      if (status !== where.status) return { affected: 0 };
+      status = 'held';
+      return { affected: 1 };
+    });
+    const results = await Promise.all([service.markHeld('b1', 'x'), service.markHeld('b1', 'x')]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+
+  it('markFailed only touches pending rows', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    await service.markFailed('b1');
+    expect(paymentsRepo.update).toHaveBeenCalledWith({ booking_id: 'b1', status: 'pending' }, expect.objectContaining({ status: 'failed' }));
   });
 });

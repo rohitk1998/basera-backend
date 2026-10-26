@@ -1,7 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { canonicalJson, DiditService, signWebhookBody } from './didit.service';
 
-// Hand-computed: printf '%s' '<canonical>' | openssl dgst -sha256 -hmac whsec_test
 const CANONICAL = '{"a":1,"b":[{"x":"é","y":2}],"z":{"k":null,"m":true}}';
 const EXPECTED_HMAC = '4b40c9991b37621f8e2a2c5288359b2ae2c54a44cf03ef254c1016f4b114d14e';
 const body = { z: { m: true, k: null }, b: [{ y: 2.0, x: 'é' }], a: 1 };

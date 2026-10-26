@@ -149,7 +149,7 @@ describe('buildTextCondition', () => {
     expect(c.params).toMatchObject({ qad1: 'kullu', qat1: 'bhuntar' });
     expect(c.sql).toContain("lower(l.draft_data->'property_details'->>'district') = :qad1");
     expect(c.sql).toContain("lower(l.draft_data->'property_details'->>'tehsil') = :qat1");
-    // two units (kasol, cottage) joined with AND
+
     expect(c.sql).toMatch(/\) AND \(\(/);
   });
 

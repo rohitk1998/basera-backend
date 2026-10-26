@@ -5,17 +5,6 @@ import { RESPONSE_MESSAGE, ResponseMessageSpec } from '../decorators/response-me
 
 const READ_ONLY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-/**
- * Every successful create/update/delete answers `{ success: true, message, ...data }`.
- *
- * - `success` and `message` come first; everything the handler returned follows.
- * - A `message` the handler already returned is kept.
- * - Otherwise the handler's `@ResponseMessage(...)` is used.
- * - A handler with neither still gets a generic message (and a warning in the
- *   log naming the route) so a response is never shipped without one.
- *
- * Reads (GET) are left exactly as they were.
- */
 @Injectable()
 export class ResponseMessageInterceptor implements NestInterceptor {
   private readonly logger = new Logger('ResponseMessage');
@@ -31,7 +20,6 @@ export class ResponseMessageInterceptor implements NestInterceptor {
 
     return next.handle().pipe(
       map((body: unknown) => {
-        // Arrays, strings, buffers and other non-object bodies are not ours to reshape.
         if (body !== null && body !== undefined && (typeof body !== 'object' || Array.isArray(body) || Buffer.isBuffer(body))) {
           return body;
         }

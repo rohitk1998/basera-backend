@@ -44,8 +44,6 @@ describe('capture evidence with bypassed records', () => {
     expect(ev.problems.join()).not.toMatch(/too far|no capture data/);
   });
 
-  // A bypassed capture has no checked location, so it must never read as
-  // "passed": approval needs the audited override, now and after the flag is off.
   it('never reads as passed: the camera-capture layer is submitted and blocks approval', () => {
     const ev = evaluateCaptureEvidence({
       property_details: { ...PIN, photos: [{ url: 'u1', room: 'living' }] },
@@ -57,7 +55,7 @@ describe('capture evidence with bypassed records', () => {
     });
     expect(ev.status).toBe('submitted');
     expect(ev.problems.join()).toMatch(/bypassed \(test mode\).*audited override/);
-    const blockers = approvalBlockers({ telemetry: ev.status, banking: 'passed', telemetryProblems: ev.problems });
+    const blockers = approvalBlockers({ telemetry: ev.status, telemetryProblems: ev.problems });
     expect(blockers.join()).toMatch(/Camera capture is submitted.*bypassed/);
   });
 
@@ -98,7 +96,7 @@ describe('submit-time sites with the flag', () => {
     const redis = new Map([[receiptFor('p1'), JSON.stringify(bypassedCaptureRecord('photo', PIN))]]);
     const svc = build(bypass, redis);
     const call = (svc as any).resolvePhotoCaptures('u1', [{ url: 'p1' }], null, FAR_PIN);
-    // A bypassed record is never "too far" even when the flag is later switched off.
+
     await expect(call).resolves.toMatchObject({ captures: { p1: { bypassed: true } } });
     await svc.onModuleDestroy();
   });

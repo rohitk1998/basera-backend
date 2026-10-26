@@ -2,16 +2,6 @@ import type { NotificationEvent } from './notifications.types';
 
 type EventCopy = { title: string; body: string };
 
-/**
- * Backend-owned copy of the `notificationCopy` message namespace from
- * web/messages/*.json. Not imported across the package boundary — this
- * service sends push notifications from a Node process with no active
- * request/cookie, and reaching into a sibling app's directory would break
- * the moment the two are deployed/packaged separately. English + Hindi are
- * kept in sync with the web app's catalog by hand; every other locale
- * falls back to English until reviewed, same convention as
- * web/messages/{locale}.json's `_meta.reviewed` flag.
- */
 export const YOUR_LISTING_FALLBACK: Record<string, string> = {
   en: 'your listing',
   hi: 'आपकी लिस्टिंग',
@@ -45,8 +35,6 @@ export const NOTIFICATION_COPY: Record<string, Partial<Record<NotificationEvent,
     'listing.changes_needed': { title: 'Action needed on your listing', body: '{listingTitle} needs a correction' },
     'message.received': { title: 'New message', body: 'You have a new message on Basera' },
     'call.incoming': { title: 'Incoming call', body: 'Someone is calling you on Basera' },
-    'verification.layer_passed': { title: 'Verification passed', body: 'One of your checks cleared' },
-    'verification.layer_failed': { title: 'Verification needs another look', body: 'A check needs your attention' },
   },
   hi: {
     'user.registered': { title: 'बसेरा में आपका स्वागत है', body: 'आपका अकाउंट तैयार है।' },
@@ -75,7 +63,5 @@ export const NOTIFICATION_COPY: Record<string, Partial<Record<NotificationEvent,
     'listing.changes_needed': { title: 'आपकी लिस्टिंग पर कार्रवाई आवश्यक', body: '{listingTitle} को सुधार की आवश्यकता है' },
     'message.received': { title: 'नया मैसेज', body: 'आपके पास बसेरा पर एक नया मैसेज है' },
     'call.incoming': { title: 'आने वाली कॉल', body: 'कोई आपको बसेरा पर कॉल कर रहा है' },
-    'verification.layer_passed': { title: 'सत्यापन पास हुआ', body: 'आपकी एक जांच पूरी हो गई' },
-    'verification.layer_failed': { title: 'सत्यापन को फिर से देखने की आवश्यकता है', body: 'एक जांच पर आपके ध्यान की आवश्यकता है' },
   },
 };

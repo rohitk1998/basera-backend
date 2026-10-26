@@ -85,7 +85,7 @@ describe('Himachal Pradesh location data', () => {
 
   it('measures distance in kilometres', () => {
     expect(distanceKm({ lat: 32.219, lng: 76.3234 }, { lat: 32.219, lng: 76.3234 })).toBe(0);
-    // Manali to Dharamshala is roughly 170 km by the straight line.
+
     const d = distanceKm({ lat: 32.2432, lng: 77.1892 }, { lat: 32.219, lng: 76.3234 });
     expect(d).toBeGreaterThan(75);
     expect(d).toBeLessThan(95);

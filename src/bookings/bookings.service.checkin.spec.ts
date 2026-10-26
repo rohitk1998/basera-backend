@@ -32,6 +32,7 @@ function makeService(booking: Record<string, unknown>) {
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
   );
   return { service, bookingsRepo };
 }
@@ -49,13 +50,11 @@ describe('BookingsService.checkin date window', () => {
     for (let i = 0; i < 8; i++) {
       await expect(service.checkin(GUEST, ID, '0000')).rejects.toThrow('Check-in opens on 1 Nov 2026.');
     }
-    // Move-in day arrives: a wrong code is a normal 400, not a 429 lockout.
     at('2026-11-01T06:00:00Z');
     await expect(service.checkin(GUEST, ID, '0000')).rejects.toThrow('That check-in code is incorrect.');
   });
 
   it('allows check-in on move-in day (India date)', async () => {
-    // 19:00 UTC on 31 Oct is already 1 Nov in India.
     at('2026-10-31T19:00:00Z');
     const { service } = makeService({ move_in: '2026-11-01', move_out: '2026-11-10' });
     await expect(service.checkin(GUEST, ID, '1234')).resolves.toMatchObject({ status: 'checked_in' });

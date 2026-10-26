@@ -68,14 +68,6 @@ export class AttractionsService {
     private readonly config: ConfigService,
   ) {}
 
-  // ------------------------------------------------------------- public
-
-  /**
-   * Published attractions for the district a /stays search is about. Takes
-   * the same params as the listings search (district / tehsil / q). A search
-   * that is not about one district, or a bad param, is an empty answer — this
-   * never 4xx/5xx's for input, so the search page can always render.
-   */
   async forSearch(
     query: Record<string, unknown>,
   ): Promise<DistrictAttractions> {
@@ -98,7 +90,6 @@ export class AttractionsService {
       try {
         return JSON.parse(cached) as DistrictAttractions;
       } catch {
-        /* fall through to the database */
       }
     }
 
@@ -132,12 +123,9 @@ export class AttractionsService {
     return result;
   }
 
-  /** Drops every cached district answer at once (a generation bump, no key scan). */
   async invalidateCache(): Promise<void> {
     await this.redis.incrementVersion(CACHE_VERSION_KEY);
   }
-
-  // -------------------------------------------------------------- admin
 
   async adminList(query: Record<string, unknown>) {
     const text = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
@@ -288,8 +276,6 @@ export class AttractionsService {
     const row = await this.repo.findOne({ where: { id } });
     if (!row) throw new NotFoundException('Attraction not found');
     if (row.source !== 'manual') {
-      // Deleting an imported row would let the next import bring it back as
-      // a fresh draft. Hiding it keeps it out for good.
       throw new BadRequestException(
         'Imported places cannot be deleted. Hide it instead, so the next import does not add it again.',
       );

@@ -16,12 +16,6 @@ function isRole(value: string): value is Role {
   return (VALID_ROLES as readonly string[]).includes(value);
 }
 
-/**
- * Ported from web/lib/auth.server.ts requireAdmin(). Reads admin status
- * from profiles.role — the only source of truth for "is this user an
- * admin". Never granted by any code path; manually provisioned via direct
- * SQL only.
- */
 @Injectable()
 export class AdminGuard implements CanActivate {
   constructor(

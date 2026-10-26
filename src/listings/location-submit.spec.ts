@@ -1,7 +1,6 @@
 import { fullOnboardingSchema } from './listing-schema';
 import { assertLocationAgrees, assertLocationIsValid, upgradeLegacyLocation } from './location.util';
 
-/** A complete, valid listing payload, without the location fields. */
 const rest = {
   title: 'Deodar Nest Homestay',
   propertyType: 'house',
@@ -40,7 +39,6 @@ const rest = {
   tourUrl: '',
 };
 
-/** What the server does with a submitted body, minus the database. */
 function accept(body: Record<string, unknown>) {
   const parsed = fullOnboardingSchema.safeParse(upgradeLegacyLocation(body));
   if (!parsed.success) return { ok: false as const, message: parsed.error.issues[0]?.message };
@@ -61,7 +59,7 @@ describe('submitting a listing location', () => {
   it('accepts a district that was never in the old list of 18 towns', () => {
     const r = accept({ ...rest, district: 'Hamirpur', tehsil: 'Barsar', lat: 31.64, lng: 76.4, city: 'Barsar', pincode: '177021' });
     expect(r).toMatchObject({ ok: true });
-    expect(r.ok && r.data.town).toBe('Barsar'); // town follows the tehsil when the client sends none
+    expect(r.ok && r.data.town).toBe('Barsar');
   });
 
   it('still accepts an older app build that sends only a town from the old list', () => {
@@ -80,7 +78,7 @@ describe('submitting a listing location', () => {
   });
 
   it('refuses a pin outside Himachal Pradesh, even with a valid district and tehsil', () => {
-    const r = accept({ ...rest, district: 'Solan', tehsil: 'Parwanoo', lat: 30.7333, lng: 76.7794 }); // Chandigarh
+    const r = accept({ ...rest, district: 'Solan', tehsil: 'Parwanoo', lat: 30.7333, lng: 76.7794 });
     expect(r).toMatchObject({ ok: false });
     expect(!r.ok && r.message).toMatch(/outside Himachal Pradesh/);
   });

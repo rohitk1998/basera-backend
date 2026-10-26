@@ -32,7 +32,7 @@ describe('matchTehsil', () => {
   });
 
   it('accepts a name that uniquely starts a longer tehsil name', () => {
-    expect(matchTehsil('Bilaspur', 'Naina Devi')).toBeUndefined(); // "Shri Naina Devi" does not start with it: leave to the host
+    expect(matchTehsil('Bilaspur', 'Naina Devi')).toBeUndefined();
     expect(matchTehsil('Mandi', 'Mandi')).toBe('Mandi Sadar');
   });
 
@@ -72,7 +72,7 @@ describe('streetFrom', () => {
 });
 
 describe('partsFromGoogle', () => {
-  // The spot in the bug report: a pin on NH103 near Sohal, Ghumarwin, Bilaspur.
+
   const ghumarwin = [
     {
       formatted_address: 'NH103, Sohal, Ghumarwin, Himachal Pradesh 174021, India',

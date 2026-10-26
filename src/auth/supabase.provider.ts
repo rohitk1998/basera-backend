@@ -2,9 +2,6 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-// Storage-only usage (buckets, signed URLs) — all row data goes through
-// TypeORM. This mirrors the Next.js app's pattern of a fresh service-role
-// client for anything Postgres/PostgREST can't already do via the ORM.
 @Injectable()
 export class SupabaseProvider {
   readonly client: SupabaseClient;

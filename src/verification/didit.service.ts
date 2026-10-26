@@ -4,16 +4,10 @@ import { ConfigService } from '@nestjs/config';
 
 const DEFAULT_BASE_URL = 'https://verification.didit.me';
 const DEFAULT_TIMEOUT_MS = 10_000;
-/** A webhook whose timestamp is further than this from now (either way) is rejected as a replay. */
 export const WEBHOOK_MAX_SKEW_SECONDS = 300;
 
 export const DIDIT_UNAVAILABLE = 'Verification service is temporarily unavailable. Please try again.';
 
-/**
- * Didit signs the canonical JSON of the parsed body: object keys sorted
- * recursively, compact separators, Unicode kept, whole-valued floats written as
- * integers (JS numbers already serialise 1.0 as 1).
- */
 export function canonicalJson(value: unknown): string {
   const normalise = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(normalise);
@@ -38,16 +32,9 @@ export interface DiditSession {
   url: string;
 }
 
-/**
- * Client for Didit's hosted workflow sessions (the free tier). Any failure that
- * is not the user's fault (network, timeout, 5xx, 401/403 incl. out of credits,
- * 429, missing config, bad body) is a generic 503. Only the endpoint and HTTP
- * status (plus a short operator message for 401/403/429) are logged.
- */
 @Injectable()
 export class DiditService {
   private readonly logger = new Logger(DiditService.name);
-  /** Overridable in tests. */
   timeoutMs = DEFAULT_TIMEOUT_MS;
 
   constructor(private readonly config: ConfigService) {}
@@ -90,7 +77,6 @@ export class DiditService {
     }
 
     if (!res.ok) {
-      // Auth / out-of-credits / rate-limit bodies are short operator messages.
       const detail = [401, 403, 429].includes(res.status) ? ` ${text.replace(/\s+/g, ' ').slice(0, 200)}` : '';
       this.logger.error(`[Didit] session -> ${res.status}${detail}`);
       throw new ServiceUnavailableException(DIDIT_UNAVAILABLE);
@@ -108,7 +94,6 @@ export class DiditService {
     return { sessionId: body.session_id, url: body.url };
   }
 
-  /** Checks X-Signature-V2 (constant time) and the +/-5 minute timestamp window. */
   verifyWebhook(body: unknown, signature: string | undefined, nowMs: number = Date.now()): WebhookCheck {
     const secret = this.config.get<string>('DIDIT_WEBHOOK_SECRET');
     if (!secret) return 'not_configured';

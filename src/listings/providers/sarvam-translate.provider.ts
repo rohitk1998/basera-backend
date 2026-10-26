@@ -7,40 +7,16 @@ import type { DetectResult, TranslateProvider, TranslateResult } from './transla
 const API_BASE = 'https://api.sarvam.ai';
 const MODEL = 'sarvam-translate:v1';
 
-// Every fetch() below passes this as `signal`. Without it, a hung Sarvam
-// call holds its pLimit(20) slot indefinitely — with up to 20 slots and no
-// timeout, a sustained Sarvam stall can starve the entire translation
-// pipeline (every other in-flight and queued translate/detect call) rather
-// than just failing the one request that's actually stuck.
 const REQUEST_TIMEOUT_MS = 10_000;
 
-// Process-wide cap on concurrent outbound Sarvam calls. A single listing
-// already fans out to ~10+ calls (one per field); without a shared cap,
-// several simultaneous cache-miss listings could fan out to hundreds of
-// concurrent HTTP requests and trip Sarvam's own rate limiting. Shared
-// across all callers (translate + detect), not per-listing, since the
-// external API is the actual bottleneck.
 const limit = pLimit(20);
 
-// Sarvam's language codes are our bare locale + '-IN', except Odia, which
-// Sarvam spells 'od' where our locale list (and ISO 639) uses 'or'.
 const LOCALE_TO_SARVAM: Record<string, string> = { or: 'od' };
 
 function toSarvamCode(locale: string): string {
   return `${LOCALE_TO_SARVAM[locale] ?? locale}-IN`;
 }
 
-/**
- * Sarvam AI translation (sarvam-translate:v1) — covers all 22 scheduled
- * Indian languages + English, no corporate KYC, low per-call cost. Chosen
- * over Google Cloud Translation because it doesn't require the KYC-gated
- * Google Cloud billing account. Degrades to 'skipped' when no key is
- * configured, matching every other external-API integration in this
- * codebase (Resend, Firebase, Unsplash).
- *
- * Unlike Google's batch endpoint, Sarvam's /translate takes one string per
- * call — every translatable field is sent as its own concurrent request.
- */
 @Injectable()
 export class SarvamTranslateProvider implements TranslateProvider {
   private readonly logger = new Logger(SarvamTranslateProvider.name);
@@ -67,7 +43,7 @@ export class SarvamTranslateProvider implements TranslateProvider {
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (!res.ok) {
-          // Body/status only — never log the key itself or the translated text.
+
           this.logger.warn(`translate ${from}->${to} failed: HTTP ${res.status}`);
           return null;
         }
@@ -84,8 +60,6 @@ export class SarvamTranslateProvider implements TranslateProvider {
     const apiKey = this.apiKey;
     if (!apiKey) return { status: 'skipped' };
 
-    // Sarvam has no standalone detect endpoint outside a translate call;
-    // mayura:v1 accepts 'auto' as source and echoes back what it detected.
     return limit(async () => {
       try {
         const res = await fetch(`${API_BASE}/translate`, {
@@ -134,9 +108,6 @@ export class SarvamTranslateProvider implements TranslateProvider {
         ...fields.amenityLabels.map((label) => this.translateOne(label, from, to, apiKey)),
       ]);
 
-    // Any single failed call fails the whole listing rather than caching a
-    // half-translated result — a partial cache entry would be served as
-    // 'ready' on every future request for this (listing, locale) pair.
     if (title === null || description === null || houseRulesCheckIn === null || houseRulesCheckOut === null) {
       return { status: 'failed' };
     }

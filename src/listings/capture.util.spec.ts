@@ -1,6 +1,6 @@
 import { assessCapture, parseCaptureClaim, withDistanceFrom, isWithinTolerance, CAPTURE_MAX_ACCURACY_METRES } from './capture.util';
 
-const PIN = { lat: 32.219, lng: 76.3234 }; // Dharamshala
+const PIN = { lat: 32.219, lng: 76.3234 };
 const NOW = Date.UTC(2026, 8, 30, 12, 0, 0);
 const claim = (over: Record<string, unknown> = {}) => ({
   lat: PIN.lat,
@@ -66,9 +66,9 @@ describe('assessCapture', () => {
   });
 
   it('refuses a capture more than 200 m from the pin, and names the distance', () => {
-    const near = assessCapture(claim({ lat: PIN.lat + 0.0015 }), PIN, 'photo', NOW); // ~167 m
+    const near = assessCapture(claim({ lat: PIN.lat + 0.0015 }), PIN, 'photo', NOW);
     expect(near.ok).toBe(true);
-    const far = assessCapture(claim({ lat: PIN.lat + 0.003 }), PIN, 'photo', NOW); // ~333 m
+    const far = assessCapture(claim({ lat: PIN.lat + 0.003 }), PIN, 'photo', NOW);
     expect(far.ok).toBe(false);
     if (!far.ok) expect(far.reason).toMatch(/captured \d+m from the pin/);
   });

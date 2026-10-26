@@ -1,8 +1,5 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
-// Append-only audit trail for verification_requests. Metadata only —
-// action/status/reason — NEVER document contents, bytes, or extracted
-// sensitive fields (PAN/aadhaar/account numbers etc).
 @Entity('verification_audit_log')
 export class VerificationAuditLogEntity {
   @PrimaryGeneratedColumn('uuid')
@@ -18,7 +15,7 @@ export class VerificationAuditLogEntity {
   admin_id: string | null;
 
   @Column()
-  action: string; // submitted | approved | rejected | resubmitted
+  action: string;
 
   @Column({ type: 'text', nullable: true })
   previous_status: string | null;

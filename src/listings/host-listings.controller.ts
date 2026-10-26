@@ -3,16 +3,22 @@ import {
   Body,
   Controller,
   Get,
+  Header,
   Param,
   Patch,
   Post,
   Query,
+  Req,
+  Res,
   UploadedFile,
   UploadedFiles,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
+import { Throttle } from '@nestjs/throttler';
+import type { Request, Response } from 'express';
+import { randomBytes } from 'crypto';
 import * as os from 'os';
 import { unlink } from 'fs/promises';
 import { AuthGuard } from '../auth/auth.guard';
@@ -20,6 +26,7 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/types';
 import { HostListingsService } from './host-listings.service';
 import { ResponseMessage } from '../common/decorators/response-message.decorator';
+import { clampDownloadBytes, SPEEDTEST_MAX_BYTES } from './wifi-test.util';
 
 interface UploadedMulterFile {
   buffer?: Buffer;
@@ -33,9 +40,6 @@ const VIDEO_MAX_BYTES = 150 * 1024 * 1024;
 
 const blank = (raw: unknown) => raw === undefined || raw === null || String(raw).trim() === '';
 
-/** The pin comes from a form field. Number('') is 0, so a blank one must be
- *  refused explicitly or it would silently be checked against 0,0 (the Gulf of
- *  Guinea). */
 function parsePin(latRaw: unknown, lngRaw: unknown, message: string): { lat: number; lng: number } {
   const lat = blank(latRaw) ? NaN : Number(latRaw);
   const lng = blank(lngRaw) ? NaN : Number(lngRaw);
@@ -50,15 +54,12 @@ function parseJsonArray(raw: unknown, name: string): unknown[] {
     const v = JSON.parse(typeof raw === 'string' ? raw : '[]');
     if (Array.isArray(v)) return v;
   } catch {
-    /* falls through */
   }
   throw new BadRequestException(`${name} must be a JSON array`);
 }
 
 function parseJsonObject(raw: unknown, name: string, bypass = false): unknown {
   if (typeof raw !== 'string' || raw.trim() === '') {
-    // Bypass (test only): the capture object may be absent of location, but a
-    // client that sends nothing at all is not using the in-app camera path.
     if (bypass && raw !== undefined) return {};
     throw new BadRequestException(
       'This video has no camera capture details. Record it with the in-app camera, with location access allowed.',
@@ -71,24 +72,21 @@ function parseJsonObject(raw: unknown, name: string, bypass = false): unknown {
   }
 }
 
-/**
- * Host-facing listing management. Ported from web/app/api/host/listings/
- * route.ts, .../[id]/route.ts and .../submit-full/route.ts. No notifications
- * are sent from any of these routes in the original — only admin review and
- * booking actions do that.
- */
+let speedtestBlock: Buffer | undefined;
+const speedtestChunk = () => (speedtestBlock ??= randomBytes(256 * 1024));
+
+const SPEEDTEST_THROTTLE = { default: { ttl: 60_000, limit: 240 } };
+
 @Controller('api/host/listings')
 @UseGuards(AuthGuard)
 export class HostListingsController {
   constructor(private readonly hostListingsService: HostListingsService) {}
 
-  /** The pin is required, except with the test-only location bypass on. */
   private pinOrUndefined(latRaw: unknown, lngRaw: unknown, message: string) {
     if (this.hostListingsService.locationBypass && (blank(latRaw) || blank(lngRaw))) return undefined;
     return parsePin(latRaw, lngRaw, message);
   }
 
-  // Registered before `:id`. Lets the web read the single server-side flag.
   @Get('capture-config')
   captureConfig() {
     return { success: true, locationBypass: this.hostListingsService.locationBypass };
@@ -100,9 +98,6 @@ export class HostListingsController {
     return { success: true, listings };
   }
 
-  // Registered before the `:id` routes below — Nest/Express match routes in
-  // declaration order, and "submit-full"/"save-draft"/"draft"/"media/..."
-  // would otherwise be swallowed as an `:id` value.
   @ResponseMessage('Listing submitted for review.')
   @Post('submit-full')
   async submitFull(
@@ -118,10 +113,6 @@ export class HostListingsController {
     return { success: true, listingId, status };
   }
 
-  // "Save & exit" — no schema-completeness requirement, unlike submit-full.
-  // `listingId` in the body is optional: omitted on the first save (a new
-  // draft row is created), then echoed back by the client on every save
-  // after so the same in-progress row is reused rather than forking.
   @ResponseMessage('Draft saved.')
   @Post('save-draft')
   async saveDraft(
@@ -137,25 +128,12 @@ export class HostListingsController {
     return { success: true, listingId: id, status };
   }
 
-  // The caller's most recent draft, if any — lets the wizard offer to
-  // resume it on a different device/browser than the one it was saved on.
-  // `listingId`, when passed, fetches that exact draft instead of "most recent" — see
-  // findLatestDraft's doc comment for why those can disagree.
   @Get('draft')
   async latestDraft(@CurrentUser() user: AuthUser, @Query('listingId') listingId?: string) {
     const { listing } = await this.hostListingsService.findLatestDraft(user.userId, listingId);
     return { success: true, listing };
   }
 
-  // Keyed off the caller only, not a listing id — the wizard is a one-page
-  // form with no listing row until final submit, so photos are uploaded to the
-  // host's own storage folder first and the resulting URLs ride along in the
-  // submit-full/resubmit body, same as every other field.
-  //
-  // Photos are taken with the in-app camera and sent the moment they are taken:
-  // each file comes with `captures[i]` (the device-reported lat/lng/accuracy and
-  // capture time) and the listing pin (`lat`, `lng`) it is checked against.
-  // `rooms` and `captures` are JSON arrays parallel to `files`.
   @ResponseMessage('Photos uploaded.')
   @Post('media/photos')
   @UseInterceptors(FilesInterceptor('files', 20, { limits: { fileSize: PHOTO_MAX_BYTES } }))
@@ -177,10 +155,6 @@ export class HostListingsController {
     return { success: true, photos };
   }
 
-  // Listing videos used to be uploaded here from the gallery. They are now
-  // recorded with the in-app camera and go through media/walkthrough, so this
-  // route accepts nothing: it stays only so an out-of-date client gets a
-  // readable message instead of a 404.
   @ResponseMessage('Property videos can no longer be uploaded.')
   @Post('media/video')
   async uploadVideo() {
@@ -189,13 +163,6 @@ export class HostListingsController {
     );
   }
 
-  // The walkthrough video is recorded with the in-app camera and arrives with
-  // the device-reported location at the end of the recording (`capture`, JSON)
-  // plus the pinned lat/lng it is checked against. A pass only means "the
-  // device said it was near the pin and the file looks like a video" — it never
-  // looks at the footage, and the location is the client's word — so the
-  // message says a person still reviews it, not that the location is
-  // confirmed. A passed check's video is kept in Storage for that reviewer.
   @ResponseMessage((r) =>
     r.passed
       ? r.method === 'unanalysed'
@@ -216,7 +183,7 @@ export class HostListingsController {
     if (!file) {
       throw new BadRequestException('No file provided');
     }
-    // The upload is on disk before this runs; remove it on a request we refuse.
+
     let pin: { lat: number; lng: number } | undefined;
     let capture: unknown;
     try {
@@ -228,6 +195,111 @@ export class HostListingsController {
     }
     const duration = durationRaw === undefined || String(durationRaw).trim() === '' ? undefined : Number(durationRaw);
     const result = await this.hostListingsService.verifyWalkthroughVideo(user.userId, file, pin, capture, duration);
+    return { success: true, ...result };
+  }
+
+  @Post('speedtest/start')
+  async startSpeedtest(@CurrentUser() user: AuthUser) {
+    const { testId } = await this.hostListingsService.startSpeedtest(user.userId);
+    return { success: true, testId };
+  }
+
+  @Throttle(SPEEDTEST_THROTTLE)
+  @Get('speedtest/ping')
+  @Header('Cache-Control', 'no-store')
+  async speedtestPing(@CurrentUser() user: AuthUser, @Query('testId') testId: string) {
+    await this.hostListingsService.assertSpeedtest(user.userId, testId);
+    return { t: Date.now() };
+  }
+
+  @Throttle(SPEEDTEST_THROTTLE)
+  @Get('speedtest/download')
+  async speedtestDownload(
+    @CurrentUser() user: AuthUser,
+    @Query('testId') testIdRaw: string,
+    @Query('bytes') bytesRaw: string,
+    @Res() res: Response,
+  ) {
+    const testId = await this.hostListingsService.assertSpeedtest(user.userId, testIdRaw, 'download');
+    const total = clampDownloadBytes(bytesRaw);
+    res.status(200);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Encoding', 'identity');
+    res.setHeader('Content-Length', String(total));
+
+    const chunk = speedtestChunk();
+    let written = 0;
+    let firstAt = 0;
+    let lastAt = 0;
+    let recorded = false;
+    const record = () => {
+      if (recorded) return;
+      recorded = true;
+      void this.hostListingsService
+        .recordSpeedtestSample(user.userId, testId, 'download', { bytes: written, firstAt, lastAt })
+        .catch(() => {});
+    };
+    res.on('close', record);
+
+    const pump = () => {
+      while (written < total && !res.destroyed) {
+        const n = Math.min(chunk.length, total - written);
+        const ok = res.write(n === chunk.length ? chunk : chunk.subarray(0, n));
+        const now = Date.now();
+        if (!firstAt) firstAt = now;
+        lastAt = now;
+        written += n;
+        if (!ok) {
+          res.once('drain', pump);
+          return;
+        }
+      }
+      if (written >= total) {
+        res.end();
+        record();
+      }
+    };
+    pump();
+  }
+
+  @Throttle(SPEEDTEST_THROTTLE)
+  @Post('speedtest/upload')
+  async speedtestUpload(
+    @CurrentUser() user: AuthUser,
+    @Query('testId') testIdRaw: string,
+    @Req() req: Request,
+  ) {
+    const testId = await this.hostListingsService.assertSpeedtest(user.userId, testIdRaw, 'upload');
+    let bytes = 0;
+    let firstAt = 0;
+    let lastAt = 0;
+    await new Promise<void>((resolve, reject) => {
+      if (req.readableEnded) return resolve();
+      req.on('data', (c: Buffer) => {
+        const now = Date.now();
+        if (!firstAt) firstAt = now;
+        lastAt = now;
+        bytes += c.length;
+        if (bytes > SPEEDTEST_MAX_BYTES) {
+          req.destroy();
+          reject(new BadRequestException('A speed test upload may be at most 25 MB.'));
+        }
+      });
+      req.on('end', () => resolve());
+      req.on('aborted', () => resolve());
+      req.on('error', (err) => reject(err));
+    });
+    await this.hostListingsService.recordSpeedtestSample(user.userId, testId, 'upload', { bytes, firstAt, lastAt });
+    return { success: true, bytes };
+  }
+
+  @ResponseMessage((r) =>
+    r.passed ? 'Wi-Fi speed measured at the property.' : (r.reason ?? 'The Wi-Fi test could not be checked.'),
+  )
+  @Post('wifi-test')
+  async wifiTest(@CurrentUser() user: AuthUser, @Body() body: unknown) {
+    const result = await this.hostListingsService.recordWifiTest(user.userId, body);
     return { success: true, ...result };
   }
 

@@ -41,7 +41,7 @@ describe('assertLocationIsValid', () => {
   });
 
   it('accepts a pin anywhere in the state, not just near the chosen tehsil', () => {
-    // A host may really be in a village far from the tehsil headquarters.
+
     expect(() => assertLocationIsValid({ ...ok, lat: 32.5534, lng: 76.1258 })).not.toThrow();
   });
 

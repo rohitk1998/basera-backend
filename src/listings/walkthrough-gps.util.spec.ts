@@ -43,8 +43,6 @@ describe('assessWalkthroughMetadata', () => {
 });
 
 describe('assessWalkthroughMetadata for an in-app (MediaRecorder) capture', () => {
-  // MediaRecorder writes no date and no camera name, and the capture time is
-  // checked separately, so those three observations must not fire on every clip.
   const recorder = { ImageWidth: 1280, ImageHeight: 720 };
 
   it('does not warn about the missing date, camera name or an old date', () => {

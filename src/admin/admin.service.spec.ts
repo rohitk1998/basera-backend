@@ -2,35 +2,28 @@ import { approvalBlockers } from './admin.service';
 import { evaluateCaptureEvidence } from '../listings/capture-evidence.util';
 
 describe('approvalBlockers', () => {
-  it('is empty when camera capture and banking have passed — no field visit is asked for', () => {
-    expect(approvalBlockers({ telemetry: 'passed', banking: 'passed' })).toEqual([]);
+  it('is empty when camera capture has passed — no field visit is asked for', () => {
+    expect(approvalBlockers({ telemetry: 'passed' })).toEqual([]);
   });
 
   it('ignores a field-visit status entirely, passed or not', () => {
-    // Extra properties at runtime (an old caller still passing `visit`) must not matter.
-    const layers = { telemetry: 'passed', banking: 'passed', visit: 'not_started' } as { telemetry: string; banking: string };
+    const layers = { telemetry: 'passed', visit: 'not_started' } as { telemetry: string };
     expect(approvalBlockers(layers)).toEqual([]);
   });
 
-  it('names every unmet check, treating not_started as unmet', () => {
-    expect(approvalBlockers({ telemetry: 'not_started', banking: 'not_started' })).toEqual([
-      'Camera capture is not started',
-      'Banking is not started',
-    ]);
+  it('treats not_started as unmet', () => {
+    expect(approvalBlockers({ telemetry: 'not_started' })).toEqual(['Camera capture is not started']);
   });
 
   it('does not accept a submitted or failed check as passed', () => {
-    expect(approvalBlockers({ telemetry: 'submitted', banking: 'failed' })).toEqual([
-      'Camera capture is submitted',
-      'Banking is failed',
-    ]);
+    expect(approvalBlockers({ telemetry: 'submitted' })).toEqual(['Camera capture is submitted']);
+    expect(approvalBlockers({ telemetry: 'failed' })).toEqual(['Camera capture is failed']);
   });
 
   it('says why camera capture is not passed', () => {
     expect(
       approvalBlockers({
         telemetry: 'submitted',
-        banking: 'passed',
         telemetryProblems: ['2 photos uploaded before camera capture (no capture data)'],
       }),
     ).toEqual(['Camera capture is submitted (2 photos uploaded before camera capture (no capture data))']);

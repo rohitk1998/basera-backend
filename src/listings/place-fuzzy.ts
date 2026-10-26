@@ -1,18 +1,3 @@
-/**
- * Misspelling tolerance for place search ("dharmshala", "simla", "bhagsu").
- *
- * Pure, dependency-free helpers: a normaliser, a Damerau-Levenshtein distance,
- * a token-wise corrector over a vocabulary, and the curated "nearby village ->
- * parent town" labels. Exact spelling variants that map to a real tehsil live
- * in PLACE_ALIASES (place-aliases.ts); this file is the fallback for everything
- * those do not list.
- *
- * Plain data/logic module (no 'use client', no imports) so the backend
- * (src/listings/place-fuzzy.ts) and the web app (lib/place-fuzzy.ts) keep
- * byte-identical copies, and scripts/check-place-fuzzy.mjs can load it alone.
- */
-
-/** Lower-case, diacritics and punctuation stripped, single-spaced. "McLeod-Ganj" -> "mcleod ganj". */
 export function foldPlace(s: string): string {
   return s
     .normalize('NFD')
@@ -22,12 +7,10 @@ export function foldPlace(s: string): string {
     .trim();
 }
 
-/** foldPlace without spaces and with doubled letters collapsed: "Manaali" and "Mcleod Ganj" -> "manali", "mcleodganj". */
 export function placeSkeleton(s: string): string {
   return foldPlace(s).replace(/ /g, '').replace(/(.)\1+/g, '$1');
 }
 
-/** Optimal-string-alignment (Damerau-Levenshtein) distance: insert, delete, substitute, swap neighbours. */
 export function damerauLevenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -49,12 +32,10 @@ export function damerauLevenshtein(a: string, b: string): number {
   return rows[a.length][b.length];
 }
 
-/** Edits tolerated for a word: none under 4 letters (too ambiguous), 1 up to 5, 2 beyond. */
 export function fuzzyBudget(word: string): number {
   return word.length < 4 ? 0 : word.length <= 5 ? 1 : 2;
 }
 
-/** A vocabulary prepared once: each distinct term with its skeleton and words. */
 export type PlaceVocab = { terms: { name: string; skeleton: string; words: string[] }[]; words: Set<string> };
 
 export function buildPlaceVocab(names: Iterable<string>): PlaceVocab {
@@ -73,7 +54,6 @@ export function buildPlaceVocab(names: Iterable<string>): PlaceVocab {
   return { terms, words };
 }
 
-/** The closest vocabulary term to `text` within the edit budget (prefix of a term counts as exact), or null. */
 export function closestTerm(text: string, vocab: PlaceVocab): { name: string; distance: number } | null {
   const skeleton = placeSkeleton(text);
   if (skeleton.length < 3) return null;
@@ -86,7 +66,7 @@ export function closestTerm(text: string, vocab: PlaceVocab): { name: string; di
     else if (budget > 0) {
       const d = damerauLevenshtein(skeleton, term.skeleton);
       if (d <= budget) distance = d;
-      // A typo inside the first word of a longer name ("dharmshala" for "Dharamshala Cantt").
+
       if (term.words.length > 1 && distance === Infinity) {
         const first = placeSkeleton(term.words[0]);
         const d0 = damerauLevenshtein(skeleton, first);
@@ -100,12 +80,6 @@ export function closestTerm(text: string, vocab: PlaceVocab): { name: string; di
 
 export type PlaceCorrection = { query: string; corrected: boolean };
 
-/**
- * Token-wise correction of a free-text query. A word that already is (or starts)
- * a vocabulary word is kept as typed; otherwise it is replaced by the closest
- * vocabulary term within budget. Adjacent words are tried together first, so
- * "mcleod gunj" can become "McLeodganj". Returns null when nothing changed.
- */
 export function correctPlaceQuery(q: string, vocab: PlaceVocab): PlaceCorrection | null {
   const words = foldPlace(q).split(' ').filter(Boolean);
   if (words.length === 0) return null;
@@ -139,12 +113,6 @@ export function correctPlaceQuery(q: string, vocab: PlaceVocab): PlaceCorrection
   return changed ? { query: out.join(' '), corrected: true } : null;
 }
 
-/**
- * Small villages and trailheads folded into the town a guest should be shown
- * homes in. Key: folded name. Value: how the parent is labelled. The parent's
- * district/tehsil come from the same key in PLACE_ALIASES, so this table is
- * only the "Showing homes near X" label source. Only places we are sure of.
- */
 export const NEARBY_PLACES: Readonly<Record<string, { label: string; parent: string }>> = {
   bhagsu: { label: 'Bhagsu', parent: 'Dharamshala' },
   dharamkot: { label: 'Dharamkot', parent: 'Dharamshala' },
@@ -156,18 +124,12 @@ export const NEARBY_PLACES: Readonly<Record<string, { label: string; parent: str
   tosh: { label: 'Tosh', parent: 'Kullu' },
 };
 
-/** The nearby-village entry for a whole query ("Bhagsu", "bhagsunag"), or null. */
 export function nearbyPlaceFor(q: string | null | undefined): { key: string; label: string; parent: string } | null {
   if (!q) return null;
   const key = foldPlace(q);
   return Object.prototype.hasOwnProperty.call(NEARBY_PLACES, key) ? { key, ...NEARBY_PLACES[key] } : null;
 }
 
-/**
- * Spellings guests commonly use for a place we know under another name. They
- * resolve through PLACE_ALIASES with no correction pass; this table only
- * supplies the name to show in "Showing results for X". Key: folded spelling.
- */
 export const SPELLING_VARIANTS: Readonly<Record<string, string>> = {
   dharmshala: 'Dharamshala',
   dharmsala: 'Dharamshala',
@@ -183,7 +145,6 @@ export const SPELLING_VARIANTS: Readonly<Record<string, string>> = {
   'bhagsu nag': 'Bhagsu',
 };
 
-/** The usual spelling of a whole query that is a known variant ("dharmshala" -> "Dharamshala"), or null. */
 export function spellingVariantFor(q: string | null | undefined): string | null {
   if (!q) return null;
   const key = foldPlace(q);

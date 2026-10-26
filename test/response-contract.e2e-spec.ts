@@ -89,7 +89,7 @@ class TestController {
   }
   @Post('bad')
   bad() {
-    throw new BadRequestException('Enter a valid IFSC code.');
+    throw new BadRequestException('Enter a valid pincode.');
   }
   @Post('unavailable')
   unavailable() {
@@ -184,7 +184,7 @@ describe('response contract (HTTP)', () => {
 
     it('400 bad request: real message in both fields, not "Bad Request"', async () => {
       const res = await http().post('/t/bad').expect(400);
-      shape(res.body, 400, 'Enter a valid IFSC code.');
+      shape(res.body, 400, 'Enter a valid pincode.');
     });
 
     it('503: keeps our user-safe message', async () => {

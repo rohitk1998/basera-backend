@@ -1,25 +1,12 @@
-/**
- * Parsing of FCM v1 / Google OAuth error bodies, for logging and for deciding
- * whether a device token is permanently dead.
- *
- * Nothing here ever returns the token, the private key or a bearer: only the
- * HTTP status, FCM's own status string (e.g. UNAUTHENTICATED) and error code
- * (e.g. UNREGISTERED), plus FCM's human message with any long opaque string
- * (which could be a registration token) redacted.
- */
 export interface FcmErrorInfo {
   httpStatus: number;
-  /** google.rpc status, e.g. INVALID_ARGUMENT, PERMISSION_DENIED, UNAUTHENTICATED. */
   status: string;
-  /** FcmError.errorCode from details[], e.g. UNREGISTERED. Empty when absent. */
   errorCode: string;
   message: string;
-  /** The token is permanently invalid and should be removed from the account. */
   tokenDead: boolean;
 }
 
 function redact(text: string): string {
-  // Registration tokens and keys are long unbroken runs of token characters.
   return text.replace(/[A-Za-z0-9_:\-.]{40,}/g, '[redacted]').slice(0, 300);
 }
 
@@ -45,7 +32,6 @@ export function parseFcmError(httpStatus: number, bodyText: string): FcmErrorInf
     status === 'NOT_FOUND' ||
     bodyText.includes('UNREGISTERED') ||
     bodyText.includes('NotRegistered') ||
-    // INVALID_ARGUMENT also covers a bad payload; only the token variant means the token is dead.
     (status === 'INVALID_ARGUMENT' && /registration token/i.test(message));
 
   return { httpStatus, status, errorCode, message: redact(message), tokenDead };

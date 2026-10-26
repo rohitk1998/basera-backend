@@ -8,13 +8,6 @@ import { MarkReadDto } from './dto/mark-read.dto';
 import { ListNotificationsQueryDto } from './dto/list-notifications-query.dto';
 import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
-/**
- * The caller's own notification history — what /notifications reads.
- * notification_log has no RLS that works for this app (its policy checks
- * auth.uid(), which is always null here — sessions are Firebase-derived,
- * not Supabase Auth), so this controller does the same manual
- * user_id filtering every other route in this app already does.
- */
 @Controller('api/notifications')
 @UseGuards(AuthGuard)
 export class NotificationsController {

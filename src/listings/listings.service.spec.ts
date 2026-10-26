@@ -4,7 +4,6 @@ import { normalizeListingSearch } from './listing-search.util';
 
 type Call = [string, unknown[]];
 
-/** A query builder that records every call and returns empty results. */
 function stubQueryBuilder(calls: Call[]) {
   const qb: any = new Proxy(
     {},
@@ -95,9 +94,7 @@ describe('ListingsService.findLive', () => {
     const { service, calls } = makeService();
     await service.findLive(search({ date: '2026-10-02', dateEnd: '2026-10-31' }));
     const where = calls.filter(([n]) => n === 'andWhere').map(([, a]) => String(a[0]));
-    // `::` binds tighter than `->>`: `->>'availableFrom'::date` casts the word
-    // "availableFrom" and every dated search 500s ("invalid input syntax for
-    // type date"). The JSON text must be wrapped before it is cast.
+
     expect(where.length).toBeGreaterThan(0);
     for (const w of where) expect(w).not.toMatch(/->>'\w+'::/);
     expect(where.some((w) => w.includes(")::date <= :moveIn"))).toBe(true);
@@ -215,7 +212,7 @@ describe('ListingsService facets', () => {
     expect(first.facets?.districts).toEqual([{ name: 'Kangra', count: 3, coverUrl: 'early.jpg' }]);
     expect(first.facets?.places.map((p) => p.tehsil)).toEqual(['Dharamshala', 'Palampur']);
     expect(scans).toBe(1);
-    await service.findLive(search({ facets: '1', pageSize: '2' })); // other page size: facets cache hit
+    await service.findLive(search({ facets: '1', pageSize: '2' }));
     expect(scans).toBe(1);
   });
 

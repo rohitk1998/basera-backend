@@ -30,8 +30,6 @@ import {
   UserEntity,
 } from '../src/entities';
 
-/* ── Fixtures ──────────────────────────────────────────────────────────────── */
-
 const SECRET = 'test-secret';
 const GUEST = '11111111-1111-4111-8111-111111111111';
 const HOST = '22222222-2222-4222-8222-222222222222';
@@ -41,8 +39,6 @@ const MISSING_UUID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
 const tokenFor = (sub: string, opts: jwt.SignOptions = {}) => jwt.sign({ sub }, SECRET, opts);
 const cookie = (sub: string) => `${SESSION_COOKIE}=${tokenFor(sub)}`;
-
-/* ── Tiny in-memory repository ─────────────────────────────────────────────── */
 
 let seq = 0;
 const uid = () => `00000000-0000-4000-8000-${String(++seq).padStart(12, '0')}`;
@@ -84,7 +80,6 @@ function makeRepo<T extends Record<string, any>>(rows: T[] = []) {
   };
 }
 
-/** Query-builder stand-in that honours the filters NotificationsService actually applies. */
 function makeNotificationLog(rows: any[]) {
   const repo = makeRepo(rows);
   const builder = () => {
@@ -116,8 +111,6 @@ function makeNotificationLog(rows: any[]) {
   };
   return { ...repo, createQueryBuilder: builder };
 }
-
-/* ── App under test ────────────────────────────────────────────────────────── */
 
 describe('Social endpoints: conversations, reviews, notifications, storage (HTTP, real controllers + services + AuthGuard, in-memory fakes)', () => {
   let app: INestApplication;
@@ -196,7 +189,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
     })
       .compile();
 
-    // Swap just notify() on the real NotificationsService so message/call flows stay offline.
     jest.spyOn(moduleRef.get(NotificationsService), 'notify').mockImplementation(notify);
 
     app = moduleRef.createNestApplication();
@@ -218,7 +210,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
     if (message) expect(res.body.message).toMatch(message instanceof RegExp ? message : new RegExp(message));
   };
 
-  /** Every guarded route must refuse missing, garbage, wrongly-signed and expired sessions. */
   const guarded: [string, string, string, any?][] = [
     ['GET', '/api/conversations', 'list conversations', null],
     ['POST', '/api/conversations', 'create conversation', { listingId: LISTING }],
@@ -271,8 +262,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
     });
   });
 
-  /* ── Conversations ───────────────────────────────────────────────────── */
-
   describe('GET /api/conversations', () => {
     it('returns an empty list for a user with no conversations', async () => {
       const res = await http().get('/api/conversations').set('Cookie', cookie(GUEST)).expect(200);
@@ -288,9 +277,9 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
         { id: 'c-other', listing_id: LISTING, guest_id: STRANGER, host_id: HOST, last_message_at: t2 },
       );
       const asGuest = await http().get('/api/conversations').set('Cookie', cookie(GUEST)).expect(200);
-      expect(asGuest.body.map((c: any) => c.id)).toEqual(['c-new', 'c-old']); // newest first, c-other hidden
+      expect(asGuest.body.map((c: any) => c.id)).toEqual(['c-new', 'c-old']);
       expect(asGuest.body[1]).toMatchObject({ listingId: LISTING, listingTitle: 'Sea View Flat', otherPartyName: 'Hari Host', role: 'guest' });
-      expect(asGuest.body[0]).toMatchObject({ role: 'host', otherPartyName: 'Basera user' }); // unknown profile falls back
+      expect(asGuest.body[0]).toMatchObject({ role: 'host', otherPartyName: 'Basera user' });
 
       const asHost = await http().get('/api/conversations').set('Cookie', cookie(HOST)).expect(200);
       expect(asHost.body.map((c: any) => c.id).sort()).toEqual(['c-old', 'c-other']);
@@ -528,8 +517,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
     });
   });
 
-  /* ── Reviews ─────────────────────────────────────────────────────────── */
-
   describe('POST /api/reviews/booking/:bookingId', () => {
     const review = (bookingId: string, body: any, who = GUEST) => http().post(`/api/reviews/booking/${bookingId}`).set('Cookie', cookie(who)).send(body);
     const good = { rating: 5, content: 'Lovely stay' };
@@ -620,7 +607,7 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
       expect(res.body.success).toBe(true);
       expect(res.body.reviews.map((r: any) => r.id)).toEqual(['r2', 'r1']);
       expect(res.body.reviews[1]).toMatchObject({ rating: 5, content: 'old', authorName: 'Gita Guest', authorAvatar: 'g.png' });
-      expect(res.body.reviews[0]).toMatchObject({ authorName: 'Guest', authorAvatar: null }); // unknown author fallback
+      expect(res.body.reviews[0]).toMatchObject({ authorName: 'Guest', authorAvatar: null });
     });
 
     it('an unknown listing simply has no reviews (200, not 404)', async () => {
@@ -635,8 +622,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
       expect(res.body.reviews[0]).toMatchObject({ rating: 4, content: 'Nice', authorName: 'Gita Guest' });
     });
   });
-
-  /* ── Notifications ───────────────────────────────────────────────────── */
 
   describe('notifications', () => {
     const seed = (n: number, userId = GUEST, extra: Record<string, any> = {}) => {
@@ -676,7 +661,7 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
           channel: 'push',
           status: 'sent',
           title: 'New booking request',
-          body: 'Someone wants to stay at Sea View Flat', // derived from the catalog, not stored pushTitle
+          body: 'Someone wants to stay at Sea View Flat',
           link: '/host/bookings',
           readAt: null,
         });
@@ -786,8 +771,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
     });
   });
 
-  /* ── Storage ─────────────────────────────────────────────────────────── */
-
   describe('POST /api/storage/upload-url', () => {
     const up = (body: any, who = GUEST) => http().post('/api/storage/upload-url').set('Cookie', cookie(who)).send(body);
 
@@ -824,15 +807,11 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
       expect(uploadCalls).toHaveLength(0);
     });
 
-    // BUG (reported, src untouched): fileName is concatenated into the object path unchecked, so a
-    // signed upload URL can be minted for ANOTHER user's folder via "../<victim>/file".
     it.failing('BUG: rejects path-traversal in fileName instead of minting a URL outside the caller\'s folder', async () => {
       const res = await up({ fileName: `../${STRANGER}/passport.png` });
       expect(res.status).toBe(400);
     });
 
-    // BUG (reported): any authenticated user can choose any bucket, including private ones
-    // such as "verification-documents", with no allow-list.
     it.failing('BUG: rejects a bucket outside an allow-list (e.g. the private verification-documents bucket)', async () => {
       const res = await up({ fileName: 'a.png', bucket: 'verification-documents' });
       expect(res.status).toBeGreaterThanOrEqual(400);
@@ -840,9 +819,6 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
     });
   });
 
-  /* ── Reported data-quality bug ───────────────────────────────────────── */
-
-  // BUG (reported): "   " passes @IsNotEmpty, so a whitespace-only review/message body is accepted.
   it.failing('BUG: rejects a whitespace-only review content', async () => {
     const res = await http().post('/api/reviews/booking/b-done').set('Cookie', cookie(GUEST)).send({ rating: 5, content: '   ' });
     expect(res.status).toBe(400);

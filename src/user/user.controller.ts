@@ -49,9 +49,6 @@ export class UserController {
     const { isFirstTimeSignup } = await this.userService.updateProfile(user.userId, dto);
 
     if (isFirstTimeSignup) {
-      // Fire-and-forget — never awaited, same as the original route. Gated
-      // to fire exactly once per account by isFirstTimeSignup, captured
-      // before the update above.
       this.notifications.notify('user.registered', user.userId, {
         userName: dto.name,
         isHost: dto.isHost ?? false,
@@ -66,17 +63,11 @@ export class UserController {
     return { success: true };
   }
 
-  /**
-   * Sets `isHost` on the caller's own account — the "Become a host" entry
-   * point. Deliberately narrower than POST above: never touches name,
-   * avatar, or languages.
-   */
   @ResponseMessage((_r, req) => (req.body?.isHost ? 'You are now a host.' : 'Host mode turned off.'))
   @Patch('profile')
   becomeHost(@CurrentUser() user: AuthUser, @Body() dto: BecomeHostDto) {
     return this.userService.setIsHost(user.userId, dto.isHost);
   }
-
 
   @ResponseMessage('Profile photo updated.')
   @Post('avatar')

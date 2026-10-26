@@ -2,11 +2,6 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { AttractionsImportService } from './attractions-import.service';
 
-/**
- * Re-runs the import every three months (03:30 on the 1st of Jan/Apr/Jul/Oct)
- * so newly mapped places reach the admin queue as drafts. Nothing goes live
- * without a review.
- */
 @Injectable()
 export class AttractionsScheduler {
   private readonly logger = new Logger(AttractionsScheduler.name);

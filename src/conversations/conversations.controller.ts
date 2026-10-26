@@ -25,9 +25,6 @@ export class ConversationsController {
     return this.conversations.getOrCreate(user.userId, dto);
   }
 
-  // Message history itself is read directly by the browser via Supabase
-  // (RLS-gated) with a postgres_changes subscription for live delivery —
-  // no GET route here. This is the only write path.
   @ResponseMessage('Message sent.')
   @Post(':id/messages')
   sendMessage(
@@ -38,9 +35,6 @@ export class ConversationsController {
     return this.conversations.sendMessage(user.userId, conversationId, dto);
   }
 
-  // Called every ~15s by the client while the thread is open and the tab
-  // is foregrounded — see ConversationPresenceEntity. No response body
-  // needed; the caller doesn't act on this beyond firing it.
   @ResponseMessage('Presence updated.')
   @Post(':id/presence')
   heartbeat(@CurrentUser() user: AuthUser, @Param('id') conversationId: string) {

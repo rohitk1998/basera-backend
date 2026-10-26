@@ -39,11 +39,6 @@ function mockAuthService() {
   };
 }
 
-// AuthController is now a thin HTTP layer: it reads the request, delegates
-// every actual decision to AuthService, and writes cookies from whatever
-// AuthService returns. These tests check that wiring — the business-logic
-// cases (bcrypt, OTP validation, signup races, etc.) now live in
-// auth.service.spec.ts against AuthService directly.
 describe('AuthController', () => {
   let controller: AuthController;
   let auth: ReturnType<typeof mockAuthService>;
@@ -55,11 +50,6 @@ describe('AuthController', () => {
       controllers: [AuthController],
       providers: [{ provide: AuthService, useValue: auth }],
     })
-      // realtimeToken is @UseGuards(AuthGuard) — these tests call the
-      // controller method directly rather than through Nest's HTTP
-      // pipeline, so the guard never actually runs regardless; overriding
-      // it here just satisfies module compilation (AuthGuard needs a real
-      // ConfigService this test has no reason to provide).
       .overrideGuard(AuthGuard)
       .useValue({ canActivate: () => true })
       .compile();
@@ -175,11 +165,6 @@ describe('AuthController', () => {
     });
   });
 
-  // completeSignup is now a multipart endpoint (the picked avatar, if any,
-  // rides along in the same request — see AuthService.completeSignup's doc
-  // comment) — Nest binds each multipart field with its own @Body(field)
-  // decorator rather than one @Body() DTO, so these tests call the method
-  // with that same expanded argument list.
   describe('completeSignup', () => {
     it('issues a session using whatever AuthService resolves the signup to', async () => {
       auth.completeSignup.mockResolvedValue({

@@ -10,9 +10,6 @@ import { NotificationsModule } from '../notifications/notifications.module';
   imports: [TypeOrmModule.forFeature([UserEntity, VerificationRequestEntity]), forwardRef(() => AuthModule), NotificationsModule],
   controllers: [UserController],
   providers: [UserService],
-  // AuthService.completeSignup uploads a picked avatar via
-  // UserService.validateAvatarFile/uploadAvatarToStorage — see
-  // AuthModule's forwardRef(() => UserModule) import.
   exports: [UserService],
 })
 export class UserModule {}

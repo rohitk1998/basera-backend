@@ -1,12 +1,6 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn, Unique } from 'typeorm';
 import type { Amenity } from '../listings/listing.types';
 
-/**
- * Cache-aside store of machine translations of a listing's free-text
- * fields into a guest's locale. Keyed on (listing_id, locale, content_hash)
- * so a host edit — which changes the hash — never serves a stale
- * translation; the old row is just never matched again.
- */
 @Entity('listing_translations')
 @Unique(['listing_id', 'locale', 'content_hash'])
 @Index(['listing_id', 'locale', 'content_hash'])

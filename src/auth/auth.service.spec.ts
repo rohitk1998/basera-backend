@@ -316,9 +316,6 @@ describe('AuthService', () => {
 
     it('re-issues (update, not insert) for a replayed phone-OTP token whose row already exists', async () => {
       const token = proofToken({ phone: '+91123', firebaseUid: 'uid-1' });
-      // userId is deterministic from firebaseUid (firebaseUidToSupabaseUuid),
-      // not read off this mocked row — its `id` is irrelevant, only its
-      // existence is what makes completeSignup take the update branch.
       profiles.findOne.mockResolvedValue({ id: 'some-existing-row' });
       profiles.update.mockResolvedValue({});
 
@@ -540,7 +537,6 @@ describe('AuthService', () => {
     it('still honours the old token just after the winner rotated it', async () => {
       profiles.findOne.mockResolvedValue(liveProfile());
       const first = await service.rotateSession('user-1', raw);
-      // The DB now holds the rotated hash, so the old token no longer matches.
       profiles.findOne.mockResolvedValue({ ...liveProfile(), refresh_token_hash: 'rotated' });
 
       await expect(service.rotateSession('user-1', raw)).resolves.toBe(first);

@@ -38,7 +38,7 @@ describe('resolveDistrict', () => {
 
 describe('nearestDistrict', () => {
   it('files a point under the nearest district centre', () => {
-    expect(nearestDistrict(32.24, 77.19)).toBe('Kullu'); // Manali
+    expect(nearestDistrict(32.24, 77.19)).toBe('Kullu');
     expect(nearestDistrict(31.1, 77.17)).toBe('Shimla');
   });
   it('has a search radius for every district', () => {

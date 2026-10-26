@@ -1,14 +1,3 @@
-// Ported verbatim from supabase/functions/notification-dispatcher/index.ts —
-// the email shell + per-event templates. This is customer-facing copy;
-// every string and every inline style here matters.
-
-// ── Email shell ───────────────────────────────────────────────────────────
-// Table-based layout with every rule inlined: the only markup that survives
-// unpredictably-aggressive CSS stripping across real inboxes (Gmail app,
-// Outlook desktop). No external stylesheet, no <style> block, no web font —
-// all three are stripped or ignored somewhere in the matrix of clients this
-// has to render in. System font stack mirrors --body in app/globals.css as
-// closely as an email can.
 import { calendarDayNumber } from '../common/calendar-date.util';
 
 const BRAND_GREEN ='#00a67d';
@@ -25,14 +14,12 @@ function escapeHtml(value: unknown): string {
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-/** "2026-11-01" -> "1 Nov 2026", straight from the string so no timezone can shift it. */
 function formatCalendarDate(iso: unknown): string {
   if (typeof iso !== 'string' || isNaN(calendarDayNumber(iso))) return '';
   const [y, m, d] = iso.split('-').map(Number);
   return `${d} ${MONTHS[m - 1]} ${y}`;
 }
 
-/** A real instant (ISO string) shown in India time, e.g. "15 Oct 2026, 3:30 pm IST". */
 function formatInstantIST(value: unknown): string {
   const date = new Date(String(value ?? ''));
   if (isNaN(date.getTime())) return '';
@@ -54,14 +41,11 @@ function formatRupees(value: unknown): string {
   return `₹${n.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 }
 
-/** " of ₹X to the guest" when an offer amount is in the payload. */
 function amountToGuest(d: Record<string, unknown>): string {
   const amount = formatRupees(d.offerAmount);
   return amount ? `: <strong>${escapeHtml(amount)}</strong> back to the guest` : '';
 }
 
-/** Refund / payout lines for a resolved dispute. Amounts come from the same
- *  values the resolution used; absent ones are simply left out. */
 function resolutionLines(d: Record<string, unknown>): string {
   const toGuest = formatRupees(d.amountToGuest);
   const toHost = formatRupees(d.amountToHost);
@@ -158,25 +142,6 @@ export function emailShell(opts: EmailShellOpts): string {
 </html>`;
 }
 
-// ── Email templates ───────────────────────────────────────────────────────
-// One human sentence, one clear next step. Every event name that produces
-// an email is called with exactly this key from an app route — see
-// grep -rn "notify(" app/api — so a key here with no caller, or a caller
-// with no key here, is a real gap, not a naming choice.
-//
-// Guest-facing payment receipt and check-in confirmation are also templated
-// here. The check-in code is host-only and must never appear in any guest
-// email, so these templates never read a code field.
-//
-// Deliberately narrow: email fires only for account registration and the
-// dispute sub-flow. Everything else in the booking lifecycle (confirmed,
-// declined, cancelled, completed, listing status, verification, messages,
-// calls) reaches the user through push + in-app only — see notify() in
-// notifications.service.ts, which skips email whenever EMAIL_TEMPLATES has
-// no entry for the event. Disputes get email because they're money-on-the-
-// line and time-boxed (a missed push shouldn't cost someone their response
-// window); registration gets it because it's the one message guaranteed to
-// land before push permission has even been granted.
 export type Template = (
   data: Record<string, unknown>,
   ctx: { absoluteLink: (link: unknown) => string; appUrl: string; logoIconUrl: string },
@@ -202,8 +167,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       logoIconUrl,
     }),
   }),
-  // Sent once when a brand-new account finishes signup (AuthService.completeSignup).
-  // Never carries a code or any secret.
   'user.welcome': (d, { absoluteLink, appUrl, logoIconUrl }) => {
     const name = d.userName ? `, ${escapeHtml(d.userName)}` : '';
     return {
@@ -226,9 +189,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       }),
     };
   },
-  // Guest-facing request outcome. Approval means "awaiting payment" — the
-  // check-in code only exists once the guest has paid, and it goes to the
-  // host, so neither email carries one.
   'booking.confirmed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
     subject: `Your request for ${d.listingTitle} was approved`,
     html: emailShell({
@@ -258,8 +218,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       logoIconUrl,
     }),
   }),
-  // Guest receipt once pay() holds the payment. Plain hold-and-release wording
-  // only — not "escrow", not a guarantee (web/AGENTS.md). No check-in code.
   'booking.payment_receipt': (d, { absoluteLink, appUrl, logoIconUrl }) => {
     const moveIn = formatCalendarDate(d.moveIn);
     const moveOut = formatCalendarDate(d.moveOut);
@@ -280,7 +238,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       }),
     };
   },
-  // Guest confirmation once checkin() succeeds.
   'booking.checkin_confirmed': (d, { absoluteLink, appUrl, logoIconUrl }) => {
     const checkedInAt = formatInstantIST(d.checkinTime);
     const releaseAt = formatInstantIST(d.escrowReleaseTime);
@@ -300,9 +257,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       }),
     };
   },
-  // ── Host booking emails ──────────────────────────────────────────────
-  // The check-in code is shown to the host in the app only; these templates
-  // never read a code field, so it cannot reach an inbox or notification_log.
   'booking.requested': (d, { absoluteLink, appUrl, logoIconUrl }) => {
     const moveIn = formatCalendarDate(d.moveIn);
     return {
@@ -348,7 +302,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       logoIconUrl,
     }),
   }),
-  // ── Dispute emails (guest and host) ──────────────────────────────────
   'dispute.raised_confirmation': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
     subject: `We received your dispute for ${d.listingTitle}`,
     html: emailShell({
@@ -450,14 +403,6 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       logoIconUrl,
     }),
   }),
-  // Transactional — sent by the dedicated awaited send path in
-  // AuthController.sendEmailOtp, not via notify()/dispatch() like every
-  // other row here (a failed OTP email must surface to the caller as an
-  // error, not be swallowed the way notify() swallows failures). Kept in
-  // this same lookup table anyway so every "what emails does this app
-  // send" grep still finds it in one place.
-  // `purpose` is chosen server-side (AuthService.sendEmailOtp): 'signup' for
-  // an address with no completed account yet, anything else is a login.
   'auth.otp_code': (d, { appUrl, logoIconUrl }) => {
     const code = escapeHtml(d.code);
     const minutes = escapeHtml(d.expiresInMinutes);

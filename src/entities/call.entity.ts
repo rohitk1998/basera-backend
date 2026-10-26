@@ -1,10 +1,5 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
-// A row exists purely for ring/missed-call history and to trigger the
-// 'call.incoming' push notification — the actual audio/video never
-// touches this table or this server. WebRTC signaling (SDP offer/answer,
-// ICE candidates) happens over an ephemeral Supabase Realtime broadcast
-// channel, never persisted.
 @Entity('calls')
 export class CallEntity {
   @PrimaryGeneratedColumn('uuid')

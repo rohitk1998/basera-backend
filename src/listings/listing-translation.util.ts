@@ -23,8 +23,6 @@ export function extractTranslatableFields(listing: Listing): TranslatableFields 
   };
 }
 
-/** Deterministic hash over the translatable fields, in a fixed key order,
- *  so field reordering never changes the hash but any content edit does. */
 export function hashTranslatableContent(listing: Listing): string {
   const fields = extractTranslatableFields(listing);
   const stable = JSON.stringify({

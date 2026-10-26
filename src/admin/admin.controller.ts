@@ -77,9 +77,6 @@ export class AdminController {
     return this.adminService.getDisputeCase(bookingId);
   }
 
-  // Money-moving: validated the same way bookings' own dispute-offer
-  // endpoint is (DisputeOfferDto), instead of the previous unknown-typed
-  // body left to admin.service.ts's own hand-rolled checks.
   @ResponseMessage('Dispute resolved.')
   @Patch('disputes/:bookingId')
   resolveDispute(
@@ -108,12 +105,6 @@ export class AdminController {
   @Get('verification/:id')
   getVerificationRequestDetail(@Param('id') id: string) {
     return this.adminService.getVerificationRequestDetail(id);
-  }
-
-  @ResponseMessage((_r, req) => (req.body?.decision === 'approve' ? 'Verification approved.' : 'Verification rejected.'))
-  @Post('verification/:id/review')
-  reviewVerificationRequest(@Param('id') id: string, @CurrentUser() admin: AuthUser, @Body() body: unknown) {
-    return this.adminService.reviewVerificationRequest(id, admin.userId, body);
   }
 
   @Get('verification/:id/document-url')

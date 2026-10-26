@@ -1,21 +1,12 @@
 import { z } from 'zod';
 import { HP_DISTRICTS } from './hp-locations';
 
-/* Ported from web/lib/listing-schema.ts. One schema per wizard step, composed
-   into a whole-listing schema — kept as zod here (rather than class-validator
-   DTOs) so every min/max/regex rule is copy-identical to the Next.js app's,
-   which the client there also imports from. */
-
-/** "₹12,000" / "12,000" / "12000" → 12000. Integer rupees, never a float. */
 export const parseRupees = (v: unknown) => {
   if (typeof v === 'number') return Math.round(v);
   const digits = String(v ?? '').replace(/[^\d]/g, '');
   return digits ? Number.parseInt(digits, 10) : Number.NaN;
 };
 
-/* The full Airbnb-style category set, kept even for types unlikely to ever
-   list here (Boat, Windmill, Yurt, ...) — parity with the reference flow
-   was an explicit product decision, not an oversight. */
 export const PROPERTY_TYPES = [
   'house',
   'flat',
@@ -51,10 +42,6 @@ export const PROPERTY_TYPES = [
 
 export const PLACE_TYPES = ['entire', 'room', 'sharedRoom'] as const;
 
-/* Ported from web/lib/districts.ts (PLACES) — the platform only operates in
-   Himachal Pradesh, so town is drawn from this curated list of HP tourist
-   towns, and state is a fixed literal rather than free text. Keep this array
-   byte-for-byte identical to web/lib/districts.ts's PLACES. */
 export const PLACES = [
   'Manali',
   'Shimla',
@@ -93,19 +80,10 @@ export const basicsSchema = z.object({
 });
 
 export const locationSchema = z.object({
-  /* Where in Himachal Pradesh: a district, then a tehsil under it. `town` is
-     the place name the public site groups, filters and searches by — the
-     clients set it to the tehsil. Whether the tehsil belongs to the district,
-     and whether the pin is inside the state, is checked by
-     assertLocationIsValid (location.util.ts), because this object is merged
-     into larger schemas and cannot carry a refinement itself. */
   district: z.enum(HP_DISTRICTS, { message: 'Choose the district.' }),
   tehsil: z.string().trim().min(2, 'Choose the tehsil.').max(80),
   town: z.string().trim().min(2, 'Choose the tehsil.').max(80),
-  /* Structured the way Airbnb's address confirm step collects it. Composed
-     into one `fullAddress` string for storage/display (see toFullAddress
-     below) rather than adding per-field DB columns — draft_data is a
-     schemaless JSONB blob, so these just become new keys inside it. */
+
   flatNumber: z.string().trim().max(60).optional().or(z.literal('')),
   streetAddress: z.string().trim().min(3, 'Give the street address.'),
   landmark: z.string().trim().max(120).optional().or(z.literal('')),
@@ -116,16 +94,11 @@ export const locationSchema = z.object({
     .string()
     .trim()
     .regex(/^17[1-7]\d{3}$/, 'Enter a Himachal Pradesh PIN code (171xxx–177xxx).'),
-  /* The pin is checked against the device-reported location of every photo and
-     the walkthrough video (capture.util.ts), so it has to be the real spot even though guests see it offset. The
-     range here is a cheap first filter; being inside Himachal Pradesh itself
-     is enforced by assertLocationIsValid. */
+
   lat: z.number({ message: 'Drop the pin on the property.' }).min(30).max(34, 'Drop the pin on the property.'),
   lng: z.number({ message: 'Drop the pin on the property.' }).min(74).max(80, 'Drop the pin on the property.'),
 });
 
-/** Composes the structured address fields into the single string the rest
- *  of the app (listing cards, the detail page's fullLocation) displays. */
 export function toFullAddress(a: {
   flatNumber?: string;
   streetAddress: string;
@@ -174,16 +147,11 @@ export const pricingSchema = z.object({
   billsIncluded: z.enum(['all', 'electricity_extra', 'none']),
 });
 
-/** Bedrooms a size label implies: a Studio has none, "NBHK" has N. */
 const BEDROOMS_FOR_SIZE: Record<string, number> = { Studio: 0, '1BHK': 1, '2BHK': 2, '3BHK': 3 };
 
-/** Today as YYYY-MM-DD in the given IST-or-local frame (date-only, so no timezone drift). */
 const todayIso = (timeZone?: string) =>
   new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 
-/** An edit of an already-submitted listing may carry an availability date that
- *  has since passed; it is moved to today (in the given timezone) instead of
- *  being refused. Anything that is not a plain past YYYY-MM-DD is returned as is. */
 export function clampPastAvailableFrom<T extends { availableFrom?: string }>(d: T, timeZone?: string): T {
   const today = todayIso(timeZone);
   if (d.availableFrom && /^\d{4}-\d{2}-\d{2}$/.test(d.availableFrom) && d.availableFrom < today) {
@@ -192,9 +160,6 @@ export function clampPastAvailableFrom<T extends { availableFrom?: string }>(d: 
   return d;
 }
 
-/** The cross-field rules a schema cannot hold (these schemas are merged into
- *  larger ones, which rules out wrapping them in a refinement): returned as
- *  field errors for the form. Whole-listing submits only — drafts are partial. */
 export function listingIssues(
   d: {
     beds?: string;
@@ -252,11 +217,6 @@ export const kindSchema = z.object({
 });
 
 export const identitySchema = z.object({
-  pan: z
-    .string()
-    .trim()
-    .toUpperCase()
-    .regex(/^[A-Z]{5}\d{4}[A-Z]$/, 'Enter a valid 10-character PAN.'),
   gst: z
     .string()
     .trim()
@@ -267,28 +227,21 @@ export const identitySchema = z.object({
 });
 
 export const telemetrySchema = z.object({
-  /* Client-set tick, not trusted on its own: what the server stores is decided
-     by resolveWalkthrough (host-listings.service.ts) from a receipt or from
-     what is already on the listing. It is kept as a required literal so a form
-     with no walkthrough fails with a clear message before any of that runs. */
   walkthroughPassed: z.literal(true, { message: 'Record the walkthrough video with the camera before submitting.' }),
-  /* The server-issued receipt from POST media/walkthrough
-     (HostListingsService.verifyWalkthroughVideo): it names exactly which pin
-     the recording was checked against. Optional because a host who edits a
-     listing without recording again has no fresh receipt — the walkthrough
-     already stored on the listing is kept instead (and re-measured against
-     the pin). Without a receipt AND without a stored walkthrough, submit
-     fails regardless of what walkthroughPassed says. */
+
   walkthroughToken: z.string().uuid('Record the walkthrough video again before submitting.').optional(),
-  /* Display-only and never stored from here: the video URL saved with the
-     listing is the one the server put in the receipt. */
+
   walkthroughVideoUrl: z.string().url().optional(),
+});
+
+export const wifiSchema = z.object({
+  wifiAnswer: z.enum(['yes', 'no', 'later']).optional(),
+  wifiTestToken: z.string().uuid('Run the Wi-Fi test again before submitting.').optional(),
 });
 
 export const mediaSchema = z.object({
   videoUrl: z.string().url().optional().or(z.literal('')),
-  /* http(s) only: a `javascript:` or `data:` link is valid to `.url()` but is
-     an XSS vector once it is rendered as an href. */
+
   tourUrl: z
     .string()
     .trim()
@@ -303,15 +256,9 @@ export const hostKycSchema = kindSchema.merge(identitySchema);
 
 export type HostKycPayload = z.infer<typeof hostKycSchema>;
 
-/* The one-page listing form (submit-full / resubmit). Identity/host-type
-   are NOT part of it — those come from the verified profile server-side.
-   Payout details (bankingSchema) are not part of it either: every listing pays out to the
-   host's one verified account (users.bank_account_number/bank_ifsc via the
-   account-level bank-verification flow, gated by assertVerified), never a
-   per-listing UPI/name the host retyped and that was never cross-checked
-   against anything real. */
 export const fullOnboardingSchema = listingSchema
   .merge(telemetrySchema)
+  .merge(wifiSchema)
   .merge(mediaSchema);
 
 export type FullOnboardingDraft = z.infer<typeof fullOnboardingSchema>;

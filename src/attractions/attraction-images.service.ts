@@ -7,7 +7,6 @@ import {
   fetchCommonsImage,
 } from './external-sources';
 
-/** Same public bucket the homepage destination photos already live in. */
 const BUCKET = 'basera_assets';
 const PREFIX = 'attractions';
 const EXT: Record<string, string> = {
@@ -16,12 +15,6 @@ const EXT: Record<string, string> = {
   'image/webp': 'webp',
 };
 
-/**
- * Copies an openly licensed Wikimedia Commons photo into our own storage, so
- * guests load it from Supabase and never from Wikimedia. Returns null — never
- * throws — when the file is missing, unlicensed or fails to download: an
- * attraction without a photo still shows, with a placeholder.
- */
 @Injectable()
 export class AttractionImagesService {
   private readonly logger = new Logger(AttractionImagesService.name);
@@ -64,7 +57,6 @@ export class AttractionImagesService {
       }
       this.bucketChecked = true;
     }
-    // A fresh name per upload, so a replaced photo is never served stale from a CDN cache.
     const path = `${PREFIX}/${slug}-${randomUUID().slice(0, 8)}.${EXT[contentType] ?? 'jpg'}`;
     const { error } = await storage.from(BUCKET).upload(path, buffer, {
       contentType,

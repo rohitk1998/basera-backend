@@ -24,18 +24,13 @@ export type NotificationEvent =
   | 'listing.live'
   | 'listing.changes_needed'
   | 'message.received'
-  | 'call.incoming'
-  | 'verification.layer_passed'
-  | 'verification.layer_failed';
+  | 'call.incoming';
 
 export interface NotificationData {
-  // Common
   listingTitle?: string;
   link?: string;
-  // Push overrides
   pushTitle?: string;
   pushBody?: string;
-  // Event-specific
   userName?: string;
   guestName?: string;
   hostName?: string;

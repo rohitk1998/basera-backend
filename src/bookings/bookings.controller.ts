@@ -54,8 +54,6 @@ export class BookingsController {
     });
   }
 
-  // A non-UUID id (e.g. the unknown path /api/bookings/mine) can't be a booking:
-  // 404 here instead of letting Postgres reject the cast as a 500.
   @Get(':id')
   getById(
     @CurrentUser() user: AuthUser,
@@ -82,10 +80,16 @@ export class BookingsController {
     return this.bookingsService.cancel(user.userId, id);
   }
 
-  @ResponseMessage('Payment received. It is held until 24 hours after check-in.')
+  @ResponseMessage('Payment started.')
   @Post(':id/pay')
   pay(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.bookingsService.pay(user.userId, id);
+  }
+
+  @Throttle({ default: { ttl: 60_000, limit: 30 } })
+  @Get(':id/payment')
+  paymentStatus(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.bookingsService.getPaymentStatus(user.userId, id);
   }
 
   @ResponseMessage('Check-in confirmed.')

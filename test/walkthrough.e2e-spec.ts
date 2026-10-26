@@ -18,15 +18,7 @@ import { HostListingsService } from '../src/listings/host-listings.service';
 import { RedisService } from '../src/redis/redis.service';
 import { VerificationService } from '../src/verification/verification.service';
 
-/**
- * The walkthrough check goes browser -> Next.js proxy -> this route, with a
- * multipart video recorded in the browser, the device-reported capture
- * location, a Redis token and a storage upload. This runs the REAL controller
- * and service (and the real global interceptor and filter) against real video
- * files, with only Redis, storage and the database faked.
- */
-
-const PIN = { lat: 32.219, lng: 76.3234 }; // Dharamshala
+const PIN = { lat: 32.219, lng: 76.3234 };
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'walkthrough-e2e-'));
 
 function makeVideo(name: string, opts: { seconds: number; extra?: string[] }) {
@@ -35,7 +27,6 @@ function makeVideo(name: string, opts: { seconds: number; extra?: string[] }) {
   return file;
 }
 
-/** A WebM streamed to a pipe: no Duration in the header, exactly like a MediaRecorder recording. */
 function makeLiveWebm(name: string, seconds: number) {
   const file = path.join(tmp, name);
   const out = execFileSync('ffmpeg', ['-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `testsrc=duration=${seconds}:size=160x120:rate=10`, '-c:v', 'libvpx', '-f', 'webm', '-live', '1', 'pipe:1'], { maxBuffer: 50 * 1024 * 1024 });
@@ -43,16 +34,14 @@ function makeLiveWebm(name: string, seconds: number) {
   return file;
 }
 
-/** An .mp4 with sound but no picture at all. */
 function makeAudioOnly(name: string, seconds: number) {
   const file = path.join(tmp, name);
   execFileSync('ffmpeg', ['-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `sine=duration=${seconds}`, '-c:a', 'aac', file]);
   return file;
 }
 
-/** What the browser sends: the fix at the moment of capture. */
 const capture = (over: Record<string, unknown> = {}) => ({
-  lat: PIN.lat + 0.0003, // ~33 m from the pin
+  lat: PIN.lat + 0.0003,
   lng: PIN.lng,
   accuracy: 12,
   capturedAt: new Date().toISOString(),
@@ -64,7 +53,6 @@ describe('POST /api/host/listings/media/walkthrough', () => {
   let redisWrites: { key: string; value: string }[];
   let uploads: string[];
   let uploadedBuffers: Record<string, Buffer>;
-  /** How many of the next cache writes fail, as they do when the Redis connection has gone stale. */
   let redisFailures: number;
   let storageBehaviour: 'ok' | 'error' | 'throws' | 'slow';
   const files: Record<string, string> = {};
@@ -96,7 +84,6 @@ describe('POST /api/host/listings/media/walkthrough', () => {
         { provide: getDataSourceToken(), useValue: {} },
         { provide: VerificationService, useValue: {} },
         { provide: RedisService, useValue: {
-            // Same contract as RedisService.set: true when stored, false when it could not be.
             set: async (key: string, value: string) => {
               if (redisFailures > 0) {
                 redisFailures--;
@@ -122,9 +109,7 @@ describe('POST /api/host/listings/media/walkthrough', () => {
                       return { error: null };
                     }
                     if (storageBehaviour === 'throws') throw new Error('storage exploded');
-                    // A storage upload that takes far longer than any proxy will wait.
                     if (storageBehaviour === 'slow') await new Promise((r) => setTimeout(r, 4000));
-                    // Drain the stream like the real client does.
                     await new Promise<void>((res, rej) => (stream.on('data', () => {}), stream.on('end', () => res()), stream.on('error', rej)));
                     if (storageBehaviour === 'error') return { error: { message: 'bucket unavailable' } };
                     uploads.push(p);
@@ -149,7 +134,6 @@ describe('POST /api/host/listings/media/walkthrough', () => {
 
   afterEach(async () => app.close());
 
-  /** Waits for the background upload to finish and the temp file to be cleaned up. */
   const settle = (ms = 300) => new Promise((r) => setTimeout(r, ms));
 
   const check = (
@@ -186,12 +170,12 @@ describe('POST /api/host/listings/media/walkthrough', () => {
     expect(JSON.parse(redisWrites[0].value)).toMatchObject(PIN);
     expect(redisWrites[0].key).toContain(res.body.walkthroughToken);
     await settle();
-    expect(uploads).toHaveLength(1); // the upload completes in the background
+    expect(uploads).toHaveLength(1);
   });
 
   it('records the capture as device-reported and never as verified', async () => {
     const res = await check(files.good).expect(201);
-    expect(res.body.warnings.join(' ')).not.toMatch(/recording date|camera make/); // in-app files carry neither
+    expect(res.body.warnings.join(' ')).not.toMatch(/recording date|camera make/);
     const stored = JSON.parse(redisWrites[0].value);
     expect(stored.check).toMatchObject({
       method: 'camera_captured',
@@ -258,7 +242,7 @@ describe('POST /api/host/listings/media/walkthrough', () => {
     expect(res.body).toMatchObject({ passed: true, method: 'unanalysed', needsVisualReview: true, message: 'Video received. Our team will review it.' });
     expect(JSON.parse(redisWrites[0].value).check).toMatchObject({ method: 'unanalysed', visuallyVerified: false, capture: { source: 'device_reported' } });
     await settle();
-    expect(uploads).toHaveLength(1); // the reviewer still gets the footage
+    expect(uploads).toHaveLength(1);
   });
 
   it('still checks the capture location when the analyser is down', async () => {
@@ -282,22 +266,21 @@ describe('POST /api/host/listings/media/walkthrough', () => {
       storageBehaviour = behaviour;
       const res = await check(files.good).expect(201);
       expect(res.body).toMatchObject({ passed: true });
-      await settle(); // the background upload fails here; nothing may crash or reject
+      await settle();
     }
-    // The app still answers afterwards.
     storageBehaviour = 'ok';
     expect((await check(files.good).expect(201)).body.passed).toBe(true);
-    await settle(); // its own background upload, so it cannot leak into the next test
+    await settle();
   });
 
   it('answers right after the check, without waiting for the storage upload', async () => {
-    storageBehaviour = 'slow'; // the upload takes 4s
+    storageBehaviour = 'slow';
     const started = Date.now();
     const res = await check(files.good).expect(201);
     const took = Date.now() - started;
     expect(res.body).toMatchObject({ passed: true });
     expect(took).toBeLessThan(2500);
-    await settle(4600); // let the slow upload finish so the test ends cleanly
+    await settle(4600);
     expect(uploads).toHaveLength(1);
   });
 
@@ -310,13 +293,13 @@ describe('POST /api/host/listings/media/walkthrough', () => {
   });
 
   it('does not report a pass when the token cannot be saved, and keeps nothing', async () => {
-    redisFailures = 99; // the cache is down
+    redisFailures = 99;
     const res = await check(files.good).expect(201);
     expect(res.body).toMatchObject({ success: true, passed: false });
     expect(res.body.message).toMatch(/send the video again/);
     expect(res.body.walkthroughToken).toBeUndefined();
     await settle();
-    expect(uploads).toHaveLength(0); // nothing is stored for a check that did not pass
+    expect(uploads).toHaveLength(0);
   });
 
   it('asks for a file, and a pin, with a readable 400', async () => {
@@ -340,7 +323,7 @@ describe('POST /api/host/listings/media/walkthrough', () => {
     await check(files.good).expect(201);
     await check(files.good, { capture: capture({ accuracy: 900 }) }).expect(201);
     await check(files.good, { capture: null }).expect(400);
-    await settle(600); // the passed check's file is removed once its background upload ends
+    await settle(600);
     expect(fs.readdirSync(os.tmpdir()).length).toBeLessThanOrEqual(before);
   });
 
@@ -445,7 +428,7 @@ describe('POST /api/host/listings/media/photos', () => {
     const gpsFile = path.join(tmp, 'check-before.jpg');
     fs.writeFileSync(gpsFile, jpegWithGps);
     const tagsBefore = await exiftool.read(gpsFile);
-    expect(tagsBefore.GPSLatitude).toBeDefined(); // the fixture really carries a location
+    expect(tagsBefore.GPSLatitude).toBeDefined();
 
     await send([{ data: jpegWithGps }]).expect(201);
     const [stored] = Object.values(uploadedBuffers);
@@ -456,8 +439,7 @@ describe('POST /api/host/listings/media/photos', () => {
     expect(tagsAfter.GPSLongitude).toBeUndefined();
     expect(tagsAfter.Make).toBeUndefined();
     expect(tagsAfter.Model).toBeUndefined();
-    expect(tagsAfter.ImageWidth).toBe(320); // still a valid, intact image
-    // and it still decodes
+    expect(tagsAfter.ImageWidth).toBe(320);
     execFileSync('ffmpeg', ['-loglevel', 'error', '-v', 'error', '-i', storedFile, '-f', 'null', '-']);
   });
 
@@ -477,7 +459,7 @@ describe('POST /api/host/listings/media/photos', () => {
     const res = await send([{ data: cleanJpeg }, { data: cleanJpeg }], { captures: [capture(), capture(over)] }).expect(400);
     expect(res.body.message).toMatch(/^Photo 2: /);
     expect(res.body.message).toMatch(message);
-    expect(Object.keys(uploadedBuffers)).toHaveLength(0); // the good first photo was not stored either
+    expect(Object.keys(uploadedBuffers)).toHaveLength(0);
     expect(redisStore.size).toBe(0);
   });
 

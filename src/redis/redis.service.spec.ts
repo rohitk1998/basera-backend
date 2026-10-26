@@ -3,11 +3,6 @@ import { AddressInfo } from 'net';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from './redis.service';
 
-/**
- * A Redis that accepts connections and then never answers — what a silently
- * dropped connection looks like from the client. Before commandTimeout was set
- * every call below waited forever, hanging whatever request needed the cache.
- */
 describe('RedisService with a connection that never answers', () => {
   let server: Server;
   let sockets: Socket[];

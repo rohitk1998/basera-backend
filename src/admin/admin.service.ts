@@ -22,33 +22,24 @@ import { evaluateCaptureEvidence, type CaptureEvidence } from '../listings/captu
 
 type AuditEvent = {
   id: string;
-  kind: 'telemetry' | 'banking';
+  kind: 'telemetry';
   title: string;
   desc: string;
   actor: string;
   time: string;
 };
 
-const AUDIT_EVENT_TYPES = [
-  'telemetry_check',
-  'banking_check',
-  'telemetry_passed',
-  'banking_passed',
-  'telemetry_failed',
-  'banking_failed',
-];
+const AUDIT_EVENT_TYPES = ['telemetry_check', 'telemetry_passed', 'telemetry_failed'];
 
 const NEGATIVE_STATUSES = ['changes_needed', 'rejected'] as const;
 
 const OVERRIDE_REASON_MIN_LENGTH = 10;
 
-/** Mirrors ListingStatus in common/domain.ts. `draft` is absent on purpose:
- *  only a host moves a listing back to draft, never ops. */
 const reviewSchema = z
   .object({
     status: z.enum(['in_review', 'changes_needed', 'live', 'paused', 'rejected']).optional(),
     reviewNotes: z.string().trim().max(2000).optional(),
-    reviewReasonCategory: z.enum(['telemetry', 'banking', 'listing_content', 'other']).optional(),
+    reviewReasonCategory: z.enum(['telemetry', 'listing_content', 'other']).optional(),
     markVisitPassed: z.boolean().optional(),
     overrideChecks: z.boolean().optional(),
     overrideReason: z.string().trim().max(2000).optional(),
@@ -59,9 +50,6 @@ const reviewSchema = z
       !(NEGATIVE_STATUSES as readonly string[]).includes(body.status) ||
       (!!body.reviewReasonCategory && !!body.reviewNotes?.trim()),
     {
-      // A host has no other way to learn what to fix — see
-      // HostListings, which used to show only a generic "something needs
-      // correcting" line regardless of the real reason.
       message: 'A reason category and an explanation are required to request changes or reject a listing.',
     },
   )
@@ -71,27 +59,7 @@ const reviewSchema = z
 
 export type ReviewDecisionInput = z.infer<typeof reviewSchema>;
 
-const VERIFICATION_TYPES = ['identity', 'pan', 'bank', 'selfie'] as const;
-
-/** Same reason-required-on-reject shape as reviewSchema above, for the
- *  verification_requests review decision. */
-const verificationReviewSchema = z
-  .object({
-    decision: z.enum(['approve', 'reject']),
-    rejectionReason: z.string().trim().max(2000).optional(),
-  })
-  .refine((body) => body.decision !== 'reject' || !!body.rejectionReason?.trim(), {
-    message: 'A rejection reason is required to reject a verification request.',
-  });
-
-export type VerificationReviewInput = z.infer<typeof verificationReviewSchema>;
-
-const VERIFICATION_LAYER_NAME: Record<string, string> = {
-  identity: 'identity',
-  pan: 'PAN',
-  bank: 'bank',
-  selfie: 'selfie',
-};
+const VERIFICATION_TYPES = ['identity', 'selfie'] as const;
 
 function resolveIsHost(p: { isHost?: unknown; role?: unknown }): boolean {
   if (typeof p.isHost === 'boolean') return p.isHost;
@@ -102,17 +70,8 @@ function resolveIsAdmin(p: { role?: unknown }): boolean {
   return p.role === 'admin';
 }
 
-// --- trust layers ---------------------------------------------------------
-//
-// The console used to read `draft_data.telemetry.status` / `.banking.status`.
-// Neither key is ever written as a verdict, and payout details live on the
-// host's verified account, not on the listing. So every layer read
-// 'not_started' regardless of what had actually been checked. The layers are
-// now derived from the records that really are the source of truth.
-
 type LayerStatus = 'passed' | 'submitted' | 'failed' | 'not_started';
 
-/** verification_requests.status → the vocabulary the console shows. */
 const REQUEST_STATUS_TO_LAYER: Record<string, LayerStatus> = {
   verified: 'passed',
   pending: 'submitted',
@@ -121,7 +80,6 @@ const REQUEST_STATUS_TO_LAYER: Record<string, LayerStatus> = {
 
 const LISTING_MEDIA_BUCKET = 'listing-media';
 
-/** Newest request per verification_type; `requests` must be newest-first. */
 function latestRequestByType(requests: VerificationRequestEntity[]): Map<string, VerificationRequestEntity> {
   const latest = new Map<string, VerificationRequestEntity>();
   for (const request of requests) {
@@ -134,66 +92,34 @@ function requestLayerStatus(request: VerificationRequestEntity | undefined): Lay
   return request ? (REQUEST_STATUS_TO_LAYER[request.status] ?? 'not_started') : 'not_started';
 }
 
-/**
- * The "camera capture" layer: the walkthrough video and every listing photo
- * were taken with the in-app camera, and the location the device reported at
- * each capture sits near the pin (evaluateCaptureEvidence). Every coordinate
- * is DEVICE-REPORTED — a modified client can claim any position — so
- * 'passed' means "the evidence a reviewer should look at is present and
- * consistent", not "Basera verified the host was there". A listing with
- * media from before camera capture existed is 'submitted', never 'passed':
- * it has no capture data to judge.
- */
 function resolveTelemetryStatus(evidence: CaptureEvidence): LayerStatus {
   return evidence.status;
 }
 
-/** Banking is the host's account-level bank verification, not a per-listing step. */
-function resolveBankingStatus(
-  profile: Partial<UserEntity>,
-  latestBank: VerificationRequestEntity | undefined,
-): LayerStatus {
-  const fromRequest = requestLayerStatus(latestBank);
-  // go-live gates on bank_verified_at, so 'passed' has to agree with it.
-  if (fromRequest === 'passed' && !profile.bank_verified_at) return 'submitted';
-  if (fromRequest === 'not_started' && profile.bank_verified_at) return 'passed';
-  return fromRequest;
-}
-
-/** Kept for rows that recorded a visit before it stopped being a requirement. */
 function resolveVisitStatus(row: ListingEntity, draft: Record<string, any>): string {
   return row.visit_status || draft.visit?.status || 'not_started';
 }
 
-function resolveLayerStatuses(
-  row: ListingEntity,
-  profile: Partial<UserEntity>,
-  requests: VerificationRequestEntity[],
-) {
+function resolveLayerStatuses(row: ListingEntity) {
   const draft = (row.draft_data as Record<string, any>) || {};
   const evidence = evaluateCaptureEvidence(draft);
   return {
     telemetry: resolveTelemetryStatus(evidence),
     telemetryProblems: evidence.problems,
     evidence,
-    banking: resolveBankingStatus(profile, latestRequestByType(requests).get('bank')),
     visit: resolveVisitStatus(row, draft),
   };
 }
 
-/** The checks standing between a listing and 'live'; empty means clear to
- *  approve. A field visit is not one of them: camera capture replaced it. */
-export function approvalBlockers(layers: { telemetry: string; banking: string; telemetryProblems?: string[] }): string[] {
+export function approvalBlockers(layers: { telemetry: string; telemetryProblems?: string[] }): string[] {
   const blockers: string[] = [];
   if (layers.telemetry !== 'passed') {
     const why = layers.telemetryProblems?.length ? ` (${layers.telemetryProblems.join('; ')})` : '';
     blockers.push(`Camera capture is ${layers.telemetry.replace('_', ' ')}${why}`);
   }
-  if (layers.banking !== 'passed') blockers.push(`Banking is ${layers.banking.replace('_', ' ')}`);
   return blockers;
 }
 
-/** Path inside the listing-media bucket for a URL that points at it, else null. */
 function listingMediaPath(url: string): string | null {
   const marker = `/${LISTING_MEDIA_BUCKET}/`;
   const at = url.indexOf(marker);
@@ -221,16 +147,6 @@ export class AdminService {
     private readonly storage: StorageService,
   ) {}
 
-  // --- audits -------------------------------------------------------------
-
-  /**
-   * The original route reads a `notification_events` table this backend's
-   * scaffolding never got (only `notification_log` exists, and its columns
-   * don't match — no `event_type`/`actor`/`listing_id`, those live inside
-   * `payload`/`event` here). Approximated on `notification_log` filtered by
-   * `event` instead of `event_type`; falls through to the listings
-   * synthesis exactly as the original when that yields nothing. See report.
-   */
   async getAudits(): Promise<{ audits: AuditEvent[]; total: number }> {
     const rows = await this.notificationLog
       .createQueryBuilder('n')
@@ -242,7 +158,7 @@ export class AdminService {
     if (rows.length > 0) {
       const audits: AuditEvent[] = rows.map((row) => {
         const payload = (row.payload as any) || {};
-        const kind: AuditEvent['kind'] = row.event.includes('banking') ? 'banking' : 'telemetry';
+        const kind: AuditEvent['kind'] = 'telemetry';
 
         const passed = row.event.includes('passed');
         const failed = row.event.includes('failed');
@@ -280,7 +196,6 @@ export class AdminService {
     for (const l of listings) {
       const draft = (l.draft_data as any) || {};
       const telemetry = draft.telemetry || {};
-      const banking = draft.banking || {};
 
       const when = new Date(l.updated_at || l.created_at).toLocaleString('en-IN', {
         day: 'numeric',
@@ -303,26 +218,10 @@ export class AdminService {
           time: when,
         });
       }
-
-      if (banking.status) {
-        synthesised.push({
-          id: `banking-${l.id}`,
-          kind: 'banking',
-          title: `Banking Penny-Drop — ${banking.status === 'passed' ? 'Passed ✓' : banking.status === 'failed' ? 'Failed ✗' : 'Submitted'}`,
-          desc:
-            banking.pennyDropStatus === 'matched'
-              ? `₹1 penny-drop confirmed. Account name "${banking.accountName || '—'}" matches PAN.`
-              : `₹1 penny-drop initiated for UPI ${banking.upiId || '—'}.`,
-          actor: 'Basera Banking Verification',
-          time: when,
-        });
-      }
     }
 
     return { audits: synthesised, total: synthesised.length };
   }
-
-  // --- properties -----------------------------------------------------------
 
   async getProperties(statusParam?: string, q?: string, page = 1, pageSize = 20) {
     const query = q?.toLowerCase();
@@ -330,11 +229,6 @@ export class AdminService {
     const qb = this.listings.createQueryBuilder('l').orderBy('l.created_at', 'DESC');
     if (statusParam) qb.andWhere('l.status = :status', { status: statusParam });
 
-    // `q` matches fields derived from draft_data JSON below (title/town/
-    // hostName), not raw columns, so it can't be pushed into this query —
-    // it has to run in JS after mapping. Without `q` that's not needed, so
-    // paginate in SQL for the common (no-search) case instead of loading
-    // every row just to slice it in Node.
     let matchedTotal: number | undefined;
     let rows: ListingEntity[];
     if (query) {
@@ -350,8 +244,6 @@ export class AdminService {
       : [];
     const profileMap = new Map(profiles.map((p) => [p.id, p]));
 
-    // Only the columns the console needs: analysis_result can be large and
-    // nothing here reads it. Newest first, so the first row per type wins.
     const hostRequests = hostIds.length > 0
       ? await this.verificationRequests.find({
           where: hostIds.map((id) => ({ user_id: id })),
@@ -361,8 +253,6 @@ export class AdminService {
             verification_type: true,
             status: true,
             document_path: true,
-            bank_ifsc: true,
-            bank_account_holder_name: true,
             submitted_at: true,
           },
           order: { submitted_at: 'DESC' },
@@ -385,8 +275,7 @@ export class AdminService {
       const profile = profileMap.get(row.host_id) || ({} as Partial<UserEntity>);
       const requests = requestsByHost.get(row.host_id) ?? [];
       const latestRequests = latestRequestByType(requests);
-      const layerStatus = resolveLayerStatuses(row, profile, requests);
-      const latestBank = latestRequests.get('bank');
+      const layerStatus = resolveLayerStatuses(row);
       const verificationCheck = (type: string) => {
         const request = latestRequests.get(type);
         return { status: requestLayerStatus(request), requestId: request?.id ?? null, hasDocument: !!request?.document_path };
@@ -399,11 +288,6 @@ export class AdminService {
         `Mountain Stay (#${row.id.slice(0, 6)})`;
       const town = propStep.town || addressStep.town || addressStep.city || 'Dharamshala';
       const state = addressStep.state || 'Himachal Pradesh';
-      // Rent and deposit come from the same calculation the guest's booking
-      // uses (agreeTerms, for a 30-day stay) so the console, the host
-      // dashboard and the booking agree. `price`/`monthlyRent` are only read
-      // for rows written before dailyBaseRate existed; with neither there is
-      // no figure to show, not a made-up one.
       const dailyBaseRate = typeof propStep.dailyBaseRate === 'number' ? propStep.dailyBaseRate : null;
       const monthlyTerms =
         dailyBaseRate !== null
@@ -418,13 +302,9 @@ export class AdminService {
         : propStep.minMonths
           ? `${propStep.minMonths} mo`
           : '—';
-      // The pin the host dropped (locationSchema lands in property_details).
       const pinLat = typeof propStep.lat === 'number' ? propStep.lat : telemetryStep.coords?.lat;
       const pinLng = typeof propStep.lng === 'number' ? propStep.lng : telemetryStep.coords?.lng;
 
-      // Photos live at draft.property_details.photos (photoSchema entries,
-      // { url, room }), not a top-level draft.photos — see listing-mapper.ts
-      // rowToListing() for the same convention on the public listing side.
       const photos: string[] =
         propStep.photos && propStep.photos.length > 0
           ? propStep.photos.map((p: { url: string } | string) => (typeof p === 'string' ? p : p.url))
@@ -455,28 +335,14 @@ export class AdminService {
         layers: {
           telemetry: {
             status: layerStatus.telemetry,
-            // Two different videos: the host's walkthrough recorded with the
-            // in-app camera (telemetry.walkthroughVideoUrl — this is what the
-            // check judged) and the optional public property video a guest
-            // sees (media.videoUrl, only on listings from before camera
-            // capture; it can no longer be uploaded).
             walkthroughVideoUrl: telemetryStep.walkthroughVideoUrl || undefined,
             videoUrl: mediaStep.videoUrl,
             tourUrl: mediaStep.tourUrl,
-            // What each capture reported, and why the layer is not 'passed'.
-            // Every location in here is device-reported.
             problems: layerStatus.telemetryProblems,
             captures: layerStatus.evidence,
             pin: typeof pinLat === 'number' && typeof pinLng === 'number' ? { lat: pinLat, lng: pinLng } : undefined,
-            // No speed test is ever run or stored; only a host-supplied
-            // value (none today) would appear here.
-            wifiSpeedMbps: telemetryStep.wifiSpeedMbps,
-          },
-          banking: {
-            status: layerStatus.banking,
-            accountName: profile.bank_account_name || latestBank?.bank_account_holder_name || undefined,
-            upiId: profile.bank_upi || undefined,
-            ifsc: latestBank?.bank_ifsc || undefined,
+            wifiSpeedMbps: typeof draft.wifi?.downMbps === 'number' ? draft.wifi.downMbps : undefined,
+            wifi: draft.wifi ?? undefined,
           },
           visit: {
             status: layerStatus.visit,
@@ -485,12 +351,8 @@ export class AdminService {
             notes: draft.visit?.notes,
           },
         },
-        // The host's account-level checks, for the reviewer to cross-check
-        // against; documents open through GET verification/:id/document-url.
         verification: {
           identity: verificationCheck('identity'),
-          pan: verificationCheck('pan'),
-          bank: verificationCheck('bank'),
           selfie: verificationCheck('selfie'),
         },
         reviewNotes: row.review_notes || undefined,
@@ -523,9 +385,6 @@ export class AdminService {
       draft: 0,
     };
 
-    // Counted in SQL regardless of whether `statusParam` filtered the rows
-    // above — this used to re-fetch every listing row into Node (twice, on
-    // the `statusParam` branch) just to tally `status` in a loop.
     const countRows: { status: string; count: string }[] = await this.listings
       .createQueryBuilder('l')
       .select('l.status', 'status')
@@ -542,15 +401,6 @@ export class AdminService {
     return { properties: filtered, counts, total, page, pageSize };
   }
 
-  // --- property review decision --------------------------------------------
-
-  /**
-   * This route was writing `review_notes` and `visit_status` before either
-   * column existed on the original Supabase schema; Postgres rejected the
-   * whole UPDATE on an unknown column, so every decision — `status` included
-   * — was silently discarded. The columns exist on ListingEntity here, and
-   * the body is validated rather than trusted.
-   */
   async reviewProperty(id: string, adminUserId: string, body: unknown) {
     const parsed = reviewSchema.safeParse(body ?? {});
     if (!parsed.success) {
@@ -569,25 +419,9 @@ export class AdminService {
     }
     const previousStatus = before.status;
 
-    // The approval gate. Going live requires the camera-capture and banking
-    // checks to have passed — enforced here, not just by the button, so a
-    // stale tab or a direct API call cannot skip them. There is no field-visit
-    // requirement: in-app camera capture (with the device-reported location
-    // checked against the pin) replaced it. `markVisitPassed` is still
-    // accepted and recorded for clients that send it, but is not consulted
-    // here. The only way past an unmet check is an explicit override with a
-    // reason, which is recorded on the listing (and logged) for later audit.
     let approvalOverride: Record<string, unknown> | undefined;
     if (status === 'live') {
-      const [hostProfile, hostRequests] = await Promise.all([
-        this.profiles.findOne({ where: { id: before.host_id } }),
-        this.verificationRequests.find({
-          where: { user_id: before.host_id },
-          select: { id: true, user_id: true, verification_type: true, status: true, submitted_at: true },
-          order: { submitted_at: 'DESC' },
-        }),
-      ]);
-      const layers = resolveLayerStatuses(before, hostProfile ?? {}, hostRequests);
+      const layers = resolveLayerStatuses(before);
       const blockers = approvalBlockers(layers);
       if (blockers.length > 0) {
         if (!overrideChecks) {
@@ -640,10 +474,6 @@ export class AdminService {
 
     const listingTitle = (data.draft_data as any)?.property_details?.title ?? 'your listing';
     const statusChanged = !!status && status !== previousStatus;
-    // Bumped whenever status actually changes, not just on the -> 'live'
-    // transition below: a listing leaving 'live' (e.g. -> 'paused') must
-    // stop showing in cached search/town-summary results just as promptly
-    // as one arriving in it.
     if (statusChanged && (status === 'live' || previousStatus === 'live')) {
       await this.listingsService.bumpSearchCacheVersion();
     }
@@ -654,9 +484,6 @@ export class AdminService {
         pushBody: `${listingTitle} is now visible to guests on Basera`,
         link: `/host/listings`,
       });
-      // Detect source language now, not on the first guest request — a
-      // freshly-live listing otherwise pays this latency (and a DB write)
-      // on whichever guest happens to load it first.
       void this.listingTranslations.prewarmSourceLocale(data);
     } else if (statusChanged && status === 'changes_needed') {
       this.notifications.notify('listing.changes_needed', data.host_id, {
@@ -672,12 +499,6 @@ export class AdminService {
     return { success: true, listing };
   }
 
-  /**
-   * Short-lived signed URL for the host's walkthrough video — the file the
-   * telemetry check judged. Signed rather than the stored public URL so this
-   * keeps working if the listing-media bucket is made private; the admin
-   * guard on the controller is what makes handing it out safe.
-   */
   async getWalkthroughVideoUrl(id: string) {
     const row = await this.listings.findOne({ where: { id }, select: { id: true, draft_data: true } });
     if (!row) {
@@ -695,19 +516,13 @@ export class AdminService {
     try {
       return { url: await this.storage.createSignedDownloadUrl(LISTING_MEDIA_BUCKET, path, 3600) };
     } catch (err) {
-      // The upload finishes in the background after the check answers, so a
-      // recorded URL does not prove the file landed in storage.
       this.logger.warn(`Walkthrough video for listing ${id} could not be signed: ${(err as Error).message}`);
       throw new NotFoundException('The walkthrough video file was not found in storage. The host may need to re-record it.');
     }
   }
 
-  // --- stats ----------------------------------------------------------------
-
   async getStats() {
-    // Drafts were never submitted, so they say nothing about how often the
-    // checks pass; the two rates below are over listings that were.
-    const [statusCounts, totalUsers, geoLockRow, bankRow] = await Promise.all([
+    const [statusCounts, totalUsers, geoLockRow] = await Promise.all([
       this.listings
         .createQueryBuilder('l')
         .select('l.status', 'status')
@@ -719,20 +534,11 @@ export class AdminService {
         .createQueryBuilder('l')
         .select('COUNT(*)', 'total')
         .addSelect(
-          // Submitted with a walkthrough recorded by the in-app camera, whose
-          // capture the device reported. Legacy GPS-tag-only rows are not counted.
           "COUNT(*) FILTER (WHERE l.draft_data -> 'telemetry' ->> 'walkthroughPassed' = 'true' AND l.draft_data -> 'telemetry' -> 'walkthroughCheck' ->> 'method' IN ('camera_captured', 'unanalysed') AND l.draft_data -> 'telemetry' -> 'walkthroughCheck' -> 'capture' IS NOT NULL)",
           'passed',
         )
         .where("l.status <> 'draft'")
         .getRawOne<{ total: string; passed: string }>(),
-      this.listings
-        .createQueryBuilder('l')
-        .innerJoin(UserEntity, 'u', 'u.id = l.host_id')
-        .select('COUNT(*)', 'total')
-        .addSelect('COUNT(*) FILTER (WHERE u.bank_verified_at IS NOT NULL)', 'verified')
-        .where("l.status <> 'draft'")
-        .getRawOne<{ total: string; verified: string }>(),
     ]);
 
     const byStatus = new Map(statusCounts.map((r) => [r.status, Number(r.count)]));
@@ -751,20 +557,13 @@ export class AdminService {
         draftProperties,
         totalUsers,
         geoLock: { passed: Number(geoLockRow?.passed ?? 0), total: Number(geoLockRow?.total ?? 0) },
-        bankVerified: { verified: Number(bankRow?.verified ?? 0), total: Number(bankRow?.total ?? 0) },
       },
     };
   }
 
-  // --- users ------------------------------------------------------------
-
   async getUsers(roleParam?: string, q?: string, page = 1, pageSize = 20) {
     const query = q?.toLowerCase();
 
-    // `isHost`/role map to real columns, so a role filter (unlike `q`, which
-    // searches `name` — a derived field, see below) can be pushed into SQL,
-    // which means the no-search case can also be paginated in SQL instead of
-    // loading every profile just to slice it in Node.
     const qb = this.profiles.createQueryBuilder('p').orderBy('p.created_at', 'DESC');
     if (roleParam === 'host') {
       qb.andWhere("(p.isHost = true OR p.role = 'host')");
@@ -828,9 +627,6 @@ export class AdminService {
         avatarUrl: p.avatar_url || undefined,
         status: 'active' as const,
         propertiesCount: countMap.get(p.id) || 0,
-        // Reflects the two checks assertKycVerified() gates on (approved
-        // identity + selfie) — this used to read kyc_completed_at, the
-        // legal-verification column, which nothing sets any more.
         kycStatus: (p.selfie_uploaded_at && identityVerified.has(p.id) ? 'verified' : 'not_submitted') as
           | 'verified'
           | 'in_review'
@@ -850,12 +646,6 @@ export class AdminService {
       users = users.slice((page - 1) * pageSize, page * pageSize);
     }
 
-    // Computed over the whole table regardless of the current role filter or
-    // page, same as getProperties()'s status counts — these back the filter
-    // pill badges, which must show the true totals, not this page's slice.
-    // hosts/guests exclude admins even when isHost is also true, matching
-    // resolveIsHost/resolveIsAdmin's original semantics: role classification
-    // treats admin as its own bucket, not overlapping host or guest.
     const [allCount, hostCount, adminCount] = await Promise.all([
       this.profiles.count(),
       this.profiles
@@ -874,17 +664,6 @@ export class AdminService {
     return { users, counts, total, page, pageSize };
   }
 
-  // --- user isHost toggle -------------------------------------------------
-
-  /**
-   * Toggles host capability on an account. That is the whole surface.
-   * trust_tier / trust_score / status are deliberately never written here —
-   * see users/[id]/route.ts's comment: none of those columns exist on the
-   * original profiles table, and re-adding trust_tier/trust_score would give
-   * the one figure the product rests on two competing sources of truth.
-   * Admin is not settable here or anywhere else — manually provisioned via
-   * direct SQL only.
-   */
   async setIsHost(id: string, isHost: unknown) {
     if (typeof isHost !== 'boolean') {
       throw new BadRequestException('isHost must be a boolean');
@@ -897,9 +676,6 @@ export class AdminService {
     return { success: true, user: data };
   }
 
-  // --- payments / disputes --------------------------------
-
-  /** Ops-facing payments ledger, filterable by status. */
   async getPayments(status?: string) {
     const qb = this.payments.createQueryBuilder('p').orderBy('p.created_at', 'DESC');
     if (status) qb.andWhere('p.status = :status', { status });
@@ -929,10 +705,6 @@ export class AdminService {
     return { payments, total: payments.length };
   }
 
-  /** Every disputed booking's case — `open`/`negotiating` show read-only
-   *  (still between guest and host, admin can peek but shouldn't be
-   *  tempted to short-circuit negotiation), `escalated` is the actionable
-   *  queue, `appealed` needs a final look. */
   async getDisputes() {
     const rows = await this.bookings.find({ where: { status: 'disputed' }, order: { updated_at: 'DESC' } });
     if (rows.length === 0) {
@@ -978,36 +750,18 @@ export class AdminService {
     return { disputes, total: disputes.length };
   }
 
-  /** Full case detail for the admin's case-review view — claim, evidence,
-   *  and the whole negotiation/decision timeline, not just the isolated
-   *  claim text `getDisputes` summarizes for the list. */
   async getDisputeCase(bookingId: string) {
     return this.bookingsService.getDisputeCaseForAdmin(bookingId);
   }
 
-  /** Admin resolution of an escalated case, for any amount to the guest —
-   *  0 or the full paid amount reproduces the old binary refund/release.
-   *  amountToGuest/message are validated at the controller boundary by
-   *  DisputeOfferDto, not here — see admin.controller.ts. */
   async resolveDispute(bookingId: string, adminUserId: string, amountToGuest: number, message: string | undefined) {
     return this.bookingsService.resolveDispute(adminUserId, bookingId, amountToGuest, message);
   }
 
-  /** Final say after one appeal — same validation as resolveDispute. */
   async resolveAppeal(bookingId: string, adminUserId: string, amountToGuest: number, message: string | undefined) {
     return this.bookingsService.resolveAppeal(adminUserId, bookingId, amountToGuest, message);
   }
 
-  // --- verification requests ----------------------------------------------
-
-  /**
-   * Full detail for one verification request: everything in the list view
-   * plus the raw analysis_result, a short-lived signed document URL (via
-   * StorageService — omitted when there is no document, e.g. some bank
-   * submissions), the relevant profile fields for cross-check, the user's
-   * older attempts at the same verification_type (resubmission history,
-   * most recent first), and the full audit-log trail for this request.
-   */
   async getVerificationRequestDetail(id: string) {
     const row = await this.verificationRequests.findOne({ where: { id } });
     if (!row) {
@@ -1043,9 +797,6 @@ export class AdminService {
         id: true,
         full_name: true,
         phone: true,
-        bank_upi: true,
-        bank_account_name: true,
-        pan: true,
       },
     });
     const profileById = new Map(profiles.map((p) => [p.id, p]));
@@ -1055,7 +806,6 @@ export class AdminService {
     if (row.document_path) {
       documentUrl = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path, 300);
     }
-    // Aadhaar has a back side too; without it the reviewer sees half the card.
     let documentBackUrl: string | null = null;
     if (row.document_path_back) {
       documentBackUrl = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path_back, 300);
@@ -1087,144 +837,11 @@ export class AdminService {
       analysisResult: row.analysis_result,
       documentUrl,
       documentBackUrl,
-      bank:
-        row.verification_type === 'bank'
-          ? {
-              accountNumber: row.bank_account_number,
-              ifsc: row.bank_ifsc,
-              accountHolderName: row.bank_account_holder_name,
-              bankName: row.bank_name,
-              // Existing profile fields, for the admin to cross-check the
-              // new submission against what's already on file.
-              profileBankUpi: submitterProfile?.bank_upi ?? null,
-              profileBankAccountName: submitterProfile?.bank_account_name ?? null,
-            }
-          : undefined,
       previousAttempts,
       auditLog,
     };
   }
 
-  /**
-   * Admin approve/reject decision on a verification request. Server-side
-   * state machine: only a `pending` request can be reviewed here —
-   * verified/rejected are terminal from this endpoint, the only way back to
-   * pending is the user resubmitting (which creates a new row, never
-   * mutates this one). rejectionReason is required on reject.
-   *
-   * On approve of identity/pan: profiles has no dedicated "identity
-   * verified"/"pan verified" column, and none is invented here — the
-   * verification_requests row itself (status=verified) is the source of
-   * truth for that concept; assertVerified() does not gate on
-   * identity/pan today, so nothing else needs to change for those two
-   * types to reflect approval.
-   *
-   * On approve of bank: profiles.bank_verified_at is set to now() because
-   * assertVerified() gates on exactly that column — approving a bank
-   * request must actually flip the gate the user-facing app already
-   * checks. profiles.bank_account_name is overwritten with the submitted
-   * holder name (the same column the old client-only heuristic check
-   * wrote to), so the profile reflects the newly-verified identity.
-   * profiles.bank_upi is intentionally left untouched: the new bank
-   * verification flow collects accountNumber+IFSC, not a UPI id, so there
-   * is nothing here to write into bank_upi — it stays whatever the user
-   * separately set it to (or null), and is surfaced read-only in
-   * getVerificationRequestDetail for cross-check instead.
-   */
-  async reviewVerificationRequest(id: string, adminId: string, body: unknown) {
-    const parsed = verificationReviewSchema.safeParse(body ?? {});
-    if (!parsed.success) {
-      throw new BadRequestException(parsed.error.issues[0]?.message ?? 'Invalid review payload');
-    }
-    const { decision, rejectionReason } = parsed.data;
-
-    const row = await this.verificationRequests.findOne({ where: { id } });
-    if (!row) {
-      throw new NotFoundException('Verification request not found');
-    }
-    if (row.status !== 'pending') {
-      throw new ConflictException(
-        `This request has already been reviewed (status: ${row.status}). Only pending requests can be reviewed.`,
-      );
-    }
-
-    const newStatus = decision === 'approve' ? 'verified' : 'rejected';
-    const now = new Date();
-
-    await this.verificationRequests.update(
-      { id },
-      {
-        status: newStatus,
-        reviewed_by: adminId,
-        reviewed_at: now,
-        rejection_reason: decision === 'reject' ? rejectionReason! : null,
-        updated_at: now,
-      },
-    );
-
-    if (decision === 'approve' && row.verification_type === 'bank') {
-      await this.profiles.update(
-        { id: row.user_id },
-        {
-          bank_verified_at: now,
-          bank_account_name: row.bank_account_holder_name ?? undefined,
-        },
-      );
-    }
-
-    // On approve of selfie: profiles.selfie_uploaded_at is what
-    // assertVerified() actually gates on. The new flow uploads straight to
-    // verification_requests.document_path (not the old
-    // signed-URL-then-POST-/api/user/verification/selfie path), so nothing
-    // else sets this column for a submission reviewed through here —
-    // approval is what makes it real, same reasoning as bank above.
-    // profiles.selfie_url is intentionally left as whatever the old flow
-    // set it to (or null): the reviewed photo lives in document_path /
-    // the private verification-documents bucket, not duplicated there.
-    if (decision === 'approve' && row.verification_type === 'selfie') {
-      await this.profiles.update({ id: row.user_id }, { selfie_uploaded_at: now });
-    }
-
-    await this.verificationAuditLog.save(
-      this.verificationAuditLog.create({
-        verification_request_id: id,
-        user_id: row.user_id,
-        admin_id: adminId,
-        action: decision === 'approve' ? 'approved' : 'rejected',
-        previous_status: 'pending',
-        new_status: newStatus,
-        rejection_reason: decision === 'reject' ? rejectionReason : null,
-      }),
-    );
-
-    const layerName = VERIFICATION_LAYER_NAME[row.verification_type] ?? row.verification_type;
-    if (decision === 'approve') {
-      this.notifications.notify('verification.layer_passed', row.user_id, {
-        layerName,
-        pushTitle: `${layerName} verification passed`,
-        pushBody: `Your ${layerName} verification was approved`,
-        link: '/account',
-      });
-    } else {
-      this.notifications.notify('verification.layer_failed', row.user_id, {
-        layerName,
-        failReason: rejectionReason,
-        pushTitle: `${layerName} verification needs another look`,
-        pushBody: rejectionReason,
-        link: '/account',
-      });
-    }
-
-    const updated = await this.verificationRequests.findOne({ where: { id } });
-    return { success: true, request: updated };
-  }
-
-  /**
-   * Admin document access — same signed-URL mechanism as the user-facing
-   * route but WITHOUT an ownership check, since AdminGuard already gates
-   * the whole controller and an admin is allowed to view any user's
-   * document. Still a short-lived signed URL, never getPublicUrl().
-   */
   async getVerificationDocumentUrl(id: string) {
     const row = await this.verificationRequests.findOne({ where: { id }, select: { id: true, document_path: true } });
     if (!row) {
@@ -1238,17 +855,6 @@ export class AdminService {
     return { url };
   }
 
-  /**
-   * All of one user's verification requests, grouped by type — the data
-   * behind UserDetailModal's "Verification" section. Replaces the old
-   * standalone cross-user "Verification" admin tab: reviewing verification
-   * is now something an admin does from a user's own profile, not from a
-   * separate global queue. For each of the 5 verification_type values,
-   * returns the most recent row (the "current" one — same convention as
-   * VerificationService.getMyStatus on the user side) plus any older rows
-   * as resubmission history, so nothing about a user's status/history is
-   * lost by dropping the flat table view.
-   */
   async getUserVerificationSummary(userId: string) {
     const rows = await this.verificationRequests.find({
       where: { user_id: userId },

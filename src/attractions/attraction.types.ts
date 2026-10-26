@@ -1,4 +1,3 @@
-/** Kept out of the entity file: entities/index.ts is loaded as a list of entity classes. */
 export const ATTRACTION_CATEGORIES = [
   'trek',
   'temple',

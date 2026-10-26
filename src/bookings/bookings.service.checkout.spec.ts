@@ -35,6 +35,7 @@ function makeService(booking: Record<string, unknown>, env: Record<string, strin
     {} as never,
     {} as never,
     config as never,
+    {} as never,
   );
   return { service, bookingsRepo, notifications, payments };
 }
@@ -55,7 +56,6 @@ describe('BookingsService.checkout', () => {
   });
 
   it('judges move-out by the India calendar day', async () => {
-    // 2026-11-09T19:00Z = 10 Nov 00:30 IST -> move-out day has begun in India.
     at('2026-11-09T19:00:00Z');
     const { service } = makeService({});
     await expect(service.checkout(GUEST, ID)).resolves.toMatchObject({ status: 'checked_out' });
