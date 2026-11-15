@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { HP_DISTRICTS } from './hp-locations';
+import { MIN_STAY_NIGHTS } from '../common/domain';
 
 export const parseRupees = (v: unknown) => {
   if (typeof v === 'number') return Math.round(v);
@@ -142,7 +143,7 @@ export const pricingSchema = z.object({
   ),
   weeklyDiscountPct: z.coerce.number().int().min(0).max(99),
   monthlyDiscountPct: z.coerce.number().int().min(0).max(99),
-  minDays: z.coerce.number().int().min(1).max(365),
+  minDays: z.coerce.number().int().min(MIN_STAY_NIGHTS).max(365),
   availableFrom: z.string().min(10, 'Pick the first date the home is free.'),
   billsIncluded: z.enum(['all', 'electricity_extra', 'none']),
 });

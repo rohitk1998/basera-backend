@@ -97,18 +97,4 @@ export class AdminController {
     return this.adminService.resolveAppeal(bookingId, admin.userId, dto.amountToGuest, dto.message);
   }
 
-  @Get('users/:id/verification')
-  getUserVerificationSummary(@Param('id') id: string) {
-    return this.adminService.getUserVerificationSummary(id);
-  }
-
-  @Get('verification/:id')
-  getVerificationRequestDetail(@Param('id') id: string) {
-    return this.adminService.getVerificationRequestDetail(id);
-  }
-
-  @Get('verification/:id/document-url')
-  getVerificationDocumentUrl(@Param('id') id: string) {
-    return this.adminService.getVerificationDocumentUrl(id);
-  }
 }

@@ -10,7 +10,7 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { UserEntity, VerificationRequestEntity } from '../entities';
+import { UserEntity } from '../entities';
 import { SupabaseProvider } from '../auth/supabase.provider';
 import { ProfilePayloadDto } from './dto/profile-payload.dto';
 
@@ -43,8 +43,6 @@ export class UserService {
   constructor(
     @InjectRepository(UserEntity)
     private readonly profiles: Repository<UserEntity>,
-    @InjectRepository(VerificationRequestEntity)
-    private readonly verificationRequests: Repository<VerificationRequestEntity>,
     private readonly supabase: SupabaseProvider,
   ) {}
 
@@ -87,11 +85,6 @@ export class UserService {
       throw new NotFoundException('Profile not found');
     }
 
-    const latestIdentity = await this.verificationRequests.findOne({
-      where: { user_id: userId, verification_type: 'identity' },
-      order: { submitted_at: 'DESC' },
-      select: { id: true, status: true },
-    });
 
     const welcomeSeenAt = await this.readWelcomeSeenAt(userId);
 
@@ -111,7 +104,7 @@ export class UserService {
         gst: profile.gst || '',
         selfie_url: profile.selfie_url || '',
         selfie_uploaded_at: profile.selfie_uploaded_at ?? null,
-        identity_verified: latestIdentity?.status === 'verified',
+        identity_verified: profile.is_id_verified,
         ...(welcomeSeenAt !== undefined && { welcomeSeenAt }),
       },
       editUnlocksAt: profile.created_at ? editUnlocksAt(profile.created_at).toISOString() : null,

@@ -88,7 +88,7 @@ describe('submit-time sites with the flag', () => {
     new HostListingsService(
       {} as any, {} as any, {} as any,
       { get: async (k: string) => redis.get(k) ?? null, set: async () => true, del: async () => {} } as any,
-      {} as any, {} as any, { locationBypass: bypass } as any,
+      {} as any, { locationBypass: bypass } as any,
     );
   const receiptFor = (url: string) => `capture-receipt:u1:${createHash('sha256').update(url).digest('hex')}`;
 

@@ -29,7 +29,7 @@ const envSchema = z.object({
 
   RESEND_API_KEY: z.string().optional(),
   EMAIL_FROM: z.string().optional(),
-  APP_URL: z.string().default('https://basera.in'),
+  APP_URL: z.string().default('https://www.rhenbasera.online'),
 
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.string().optional(),
@@ -45,12 +45,12 @@ const envSchema = z.object({
   CASHFREE_PG_CLIENT_SECRET: z.string().optional(),
   CASHFREE_PG_API_VERSION: z.string().default('2023-08-01'),
   CASHFREE_ENVIRONMENT: z.enum(['sandbox', 'production']).default('sandbox'),
-  DIDIT_API_KEY: z.string().optional(),
-  DIDIT_WORKFLOW_ID: z.string().optional(),
-  DIDIT_WEBHOOK_SECRET: z.string().optional(),
-  DIDIT_BASE_URL: z.string().url().optional().or(z.literal('')),
-  DIDIT_CALLBACK_URL: z.string().optional(),
-  DIDIT_SANDBOX_SCENARIO: z.string().optional(),
+  // Host verify-and-purge. The pepper keys the ID-number hash that blocks banned users from
+  // re-registering; changing it later orphans every stored hash, so set it once and keep it secret.
+  ID_HASH_PEPPER: z.string().min(32).optional(),
+  // Optional Python worker (InsightFace/DeepFace) that scores ID portrait vs live frames.
+  FACE_MATCH_URL: z.string().url().optional().or(z.literal('')),
+  FACE_MATCH_SECRET: z.string().optional(),
   NOMINATIM_BASE_URL: z.string().url().optional().or(z.literal('')),
   NOMINATIM_MIN_GAP_MS: z.coerce.number().int().min(0).optional(),
   GOOGLE_MAPS_SERVER_KEY: z.string().optional(),

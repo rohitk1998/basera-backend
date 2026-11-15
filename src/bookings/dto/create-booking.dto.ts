@@ -1,4 +1,4 @@
-import { IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min, MinLength } from 'class-validator';
 
 export class CreateBookingDto {
   @IsUUID()
@@ -39,6 +39,9 @@ export class CreateBookingDto {
 
   @IsIn(['upi', 'cash'])
   paymentMethod: 'upi' | 'cash';
+
+  @IsBoolean()
+  idDisclaimerAccepted: boolean;
 
   @IsString()
   @IsOptional()

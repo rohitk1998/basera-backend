@@ -80,6 +80,12 @@ export class BookingsController {
     return this.bookingsService.cancel(user.userId, id);
   }
 
+  @ResponseMessage('Thanks, your confirmation is recorded.')
+  @Post(':id/confirm-stay')
+  confirmStay(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.bookingsService.confirmStay(user.userId, id);
+  }
+
   @ResponseMessage('Payment started.')
   @Post(':id/pay')
   pay(@CurrentUser() user: AuthUser, @Param('id') id: string) {

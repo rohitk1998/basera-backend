@@ -5,13 +5,14 @@ import {
   ListingTranslationEntity,
   UserEntity,
   BookingEntity,
+  PhoneRevealLogEntity,
 } from '../entities';
 import { AuthModule } from '../auth/auth.module';
 import { RedisModule } from '../redis/redis.module';
-import { VerificationModule } from '../verification/verification.module';
 import { ListingsController } from './listings.controller';
 import { HostListingsController } from './host-listings.controller';
 import { ListingsService } from './listings.service';
+import { PhoneRevealService } from './phone-reveal.service';
 import { HostListingsService } from './host-listings.service';
 import { ListingTranslationService } from './listing-translation.service';
 import { CaptureConfigService } from './capture-config.service';
@@ -27,16 +28,17 @@ import { TRANSLATE_PROVIDER } from './providers/translate-provider.token';
       ListingTranslationEntity,
       UserEntity,
       BookingEntity,
+      PhoneRevealLogEntity,
     ]),
     AuthModule,
     RedisModule,
-    VerificationModule,
   ],
   controllers: [ListingsController, HostListingsController, GeocodeController],
   providers: [
     CaptureConfigService,
     GeocodeService,
     ListingsService,
+    PhoneRevealService,
     HostListingsService,
     ListingTranslationService,
     SarvamTranslateProvider,

@@ -67,7 +67,7 @@ export class NotificationsService {
     private readonly notificationLog: Repository<NotificationLogEntity>,
     private readonly config: ConfigService,
   ) {
-    this.appUrl = this.config.get<string>('APP_URL') ?? 'https://basera.in';
+    this.appUrl = this.config.get<string>('APP_URL') ?? 'https://www.rhenbasera.online';
     this.logoIconUrl = `${this.config.get<string>('NEXT_PUBLIC_SUPABASE_URL')}/storage/v1/object/public/brand-assets/email-icon.png`;
   }
 

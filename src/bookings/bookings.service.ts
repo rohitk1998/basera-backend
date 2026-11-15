@@ -12,7 +12,15 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, In, LessThanOrEqual, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  IsNull,
+  LessThan,
+  LessThanOrEqual,
+  Repository,
+} from 'typeorm';
 import { randomInt, randomUUID, timingSafeEqual } from 'crypto';
 import {
   BookingEntity,
@@ -21,20 +29,41 @@ import {
   PaymentEntity,
   UserEntity,
 } from '../entities';
-import { agreeTerms } from '../common/domain';
-import { calendarDayNumber, calendarDayToISO, todayDayNumber, todayDayNumberIST } from '../common/calendar-date.util';
+import { agreeTerms, effectiveMinStay } from '../common/domain';
+import {
+  calendarDayNumber,
+  calendarDayToISO,
+  todayDayNumber,
+  todayDayNumberIST,
+} from '../common/calendar-date.util';
 import { NotificationsService } from '../notifications/notifications.service';
+import { assertVerifiedContact } from '../common/contact-gate.util';
+
+export const ID_DISCLAIMER_VERSION = 'hp-id-v1';
+export const HOLD_TTL_MS = 48 * 60 * 60 * 1000;
+const STAY_CONFIRM_DELAY_MS = 24 * 60 * 60 * 1000;
 import { CashfreeService } from '../payments/cashfree.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SupabaseProvider } from '../auth/supabase.provider';
-import { assertKycVerified } from '../user/verification-gate.util';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { DisputeBookingDto } from './dto/dispute-booking.dto';
-import { ReviewEntity, DisputeCaseEntity, DisputeEventEntity, VerificationRequestEntity } from '../entities';
+import {
+  ReviewEntity,
+  DisputeCaseEntity,
+  DisputeEventEntity,
+} from '../entities';
 
 function splitResolution(payment: PaymentEntity | undefined | null) {
-  if (!payment || payment.status !== 'split' || payment.split_amount_to_guest == null) return null;
-  return { amountToGuest: payment.split_amount_to_guest, amountToHost: payment.amount - payment.split_amount_to_guest };
+  if (
+    !payment ||
+    payment.status !== 'split' ||
+    payment.split_amount_to_guest == null
+  )
+    return null;
+  return {
+    amountToGuest: payment.split_amount_to_guest,
+    amountToHost: payment.amount - payment.split_amount_to_guest,
+  };
 }
 
 type UploadedMulterFile = { buffer: Buffer; mimetype: string; size: number };
@@ -67,7 +96,20 @@ function generateCheckinCode(): string {
   return String(randomInt(0, 10000)).padStart(4, '0');
 }
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const MONTHS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
 
 function formatCalendarDate(iso: string): string {
   const [y, m, d] = iso.split('-').map(Number);
@@ -77,7 +119,10 @@ function formatCalendarDate(iso: string): string {
 @Injectable()
 export class BookingsService {
   private readonly logger = new Logger(BookingsService.name);
-  private readonly checkinFailures = new Map<string, { count: number; lockedUntil: number }>();
+  private readonly checkinFailures = new Map<
+    string,
+    { count: number; lockedUntil: number }
+  >();
 
   constructor(
     @InjectRepository(BookingEntity)
@@ -101,7 +146,7 @@ export class BookingsService {
     private readonly dataSource: DataSource,
     private readonly config: ConfigService,
     private readonly cashfree: CashfreeService,
-  ) { }
+  ) {}
 
   private async recordEvent(
     bookingId: string,
@@ -110,7 +155,9 @@ export class BookingsService {
     actor: string | null,
     manager?: EntityManager,
   ): Promise<void> {
-    const repo = manager ? manager.getRepository(BookingEventEntity) : this.bookingEventsRepo;
+    const repo = manager
+      ? manager.getRepository(BookingEventEntity)
+      : this.bookingEventsRepo;
     await repo.insert({
       booking_id: bookingId,
       from_status: fromStatus,
@@ -128,7 +175,9 @@ export class BookingsService {
       throw new NotFoundException('Listing not found');
     }
     if (listing.status !== 'live') {
-      throw new BadRequestException('This listing is not open for booking requests.');
+      throw new BadRequestException(
+        'This listing is not open for booking requests.',
+      );
     }
 
     if (listing.host_id === userId) {
@@ -136,20 +185,32 @@ export class BookingsService {
     }
 
     if (dto.role === 'host') {
-      throw new ForbiddenException('You must switch to guest mode to book a property.');
+      throw new ForbiddenException(
+        'You must switch to guest mode to book a property.',
+      );
     }
 
-    const [requestingProfile, latestIdentity] = await Promise.all([
-      this.profilesRepo.findOne({ where: { id: userId }, select: { id: true, selfie_uploaded_at: true } }),
-      this.dataSource.getRepository(VerificationRequestEntity).findOne({
-        where: { user_id: userId, verification_type: 'identity' },
-        order: { submitted_at: 'DESC' },
-      }),
-    ]);
-    if (!requestingProfile) {
-      throw new NotFoundException('Profile not found');
+    const guestAccount = await this.profilesRepo.findOne({
+      where: { id: userId },
+      select: { id: true, phone: true, email_verified_at: true, banned_at: true },
+    });
+    assertVerifiedContact(guestAccount);
+
+    if (dto.idDisclaimerAccepted !== true) {
+      throw new BadRequestException(
+        'Please confirm you will show an original government ID at check-in.',
+      );
     }
-    assertKycVerified(requestingProfile, { identity: { status: latestIdentity?.status ?? 'not_started' } });
+
+    const openHold = await this.bookingsRepo.findOne({
+      where: { guest_id: userId, status: 'requested' },
+      select: { id: true },
+    });
+    if (openHold) {
+      throw new ConflictException(
+        'You already have a pending request with a host. Wait for a reply or cancel it first.',
+      );
+    }
 
     const moveInDay = calendarDayNumber(dto.moveIn);
     const moveOutDay = calendarDayNumber(dto.moveOut);
@@ -161,19 +222,34 @@ export class BookingsService {
       throw new BadRequestException('Move-in date cannot be in the past.');
     }
     if (moveOutDay <= moveInDay) {
-      throw new BadRequestException('Move-out date must be after move-in date.');
+      throw new BadRequestException(
+        'Move-out date must be after move-in date.',
+      );
     }
 
     const overlapping = await this.bookingsRepo
       .createQueryBuilder('b')
       .where('b.listing_id = :listingId', { listingId: dto.listingId })
-      .andWhere('b.status IN (:...statuses)', { statuses: ['confirmed', 'approved', 'checked_in', 'disputed', 'completed', 'checked_out'] })
+      .andWhere('b.status IN (:...statuses)', {
+        statuses: [
+          'confirmed',
+          'approved',
+          'checked_in',
+          'disputed',
+          'completed',
+          'checked_out',
+        ],
+      })
       .andWhere('b.move_in < :moveOut', { moveOut: dto.moveOut })
-      .andWhere('COALESCE(b.actual_move_out, b.move_out) > :moveIn', { moveIn: dto.moveIn })
+      .andWhere('COALESCE(b.actual_move_out, b.move_out) > :moveIn', {
+        moveIn: dto.moveIn,
+      })
       .getOne();
 
     if (overlapping) {
-      throw new ConflictException('This property is not available for the selected dates.');
+      throw new ConflictException(
+        'This property is not available for the selected dates.',
+      );
     }
 
     const selfOverlapping = await this.bookingsRepo
@@ -186,16 +262,24 @@ export class BookingsService {
       .getOne();
 
     if (selfOverlapping) {
-      throw new ConflictException('You already have a pending request for this property for these dates.');
+      throw new ConflictException(
+        'You already have a pending request for this property for these dates.',
+      );
     }
 
     const propertyDetails =
       (listing.draft_data as Record<string, any>)?.property_details ?? {};
     const listingTitle = propertyDetails.title ?? 'the listing';
-    const dailyBaseRate = propertyDetails.dailyBaseRate ?? Math.round((propertyDetails.price || propertyDetails.monthlyRent || 12000) / 30);
+    const dailyBaseRate =
+      propertyDetails.dailyBaseRate ??
+      Math.round(
+        (propertyDetails.price || propertyDetails.monthlyRent || 12000) / 30,
+      );
 
     if (typeof dailyBaseRate !== 'number' || isNaN(dailyBaseRate)) {
-      throw new InternalServerErrorException('Listing is missing pricing information');
+      throw new InternalServerErrorException(
+        'Listing is missing pricing information',
+      );
     }
 
     const weeklyDiscountPct = propertyDetails.weeklyDiscountPct ?? 15;
@@ -213,22 +297,30 @@ export class BookingsService {
       );
     }
 
-    const minDays = propertyDetails.minDays;
-    if (typeof minDays === 'number' && dto.days < minDays) {
-      throw new BadRequestException(`This property has a minimum stay of ${minDays} day${minDays === 1 ? '' : 's'}.`);
+    // Nights come from the dates, never from the client-supplied dto.days.
+    const nights = moveOutDay - moveInDay;
+    const minDays = effectiveMinStay(propertyDetails.minDays);
+    if (nights < minDays) {
+      throw new BadRequestException(
+        `This property has a minimum stay of ${minDays} nights.`,
+      );
     }
 
     const terms = agreeTerms(
       dailyBaseRate,
       weeklyDiscountPct,
       monthlyDiscountPct,
-      dto.days,
-      dto.paymentMethod
+      nights,
+      dto.paymentMethod,
     );
 
-    const commissionPercentage = this.config.get<number>('PLATFORM_COMMISSION_PERCENTAGE')!;
+    const commissionPercentage = this.config.get<number>(
+      'PLATFORM_COMMISSION_PERCENTAGE',
+    )!;
     const grossBookingAmount = terms.totalRent;
-    const platformCommission = Math.round(grossBookingAmount * (commissionPercentage / 100));
+    const platformCommission = Math.round(
+      grossBookingAmount * (commissionPercentage / 100),
+    );
     const hostPayoutAmount = grossBookingAmount - platformCommission;
 
     let inserted;
@@ -240,7 +332,7 @@ export class BookingsService {
         status: 'requested',
         move_in: dto.moveIn,
         move_out: dto.moveOut,
-        months: dto.days,
+        months: nights,
         adults,
         children,
         infants,
@@ -252,12 +344,17 @@ export class BookingsService {
         gross_booking_amount: grossBookingAmount,
         platform_commission: platformCommission,
         host_payout_amount: hostPayoutAmount,
+        id_disclaimer_accepted_at: new Date(),
+        id_disclaimer_version: ID_DISCLAIMER_VERSION,
+        hold_expires_at: new Date(Date.now() + HOLD_TTL_MS),
       });
     } catch (e: any) {
       this.logger.error('[create] booking insert failed', e);
-      throw new InternalServerErrorException('Could not create the booking. Please try again.');
+      throw new InternalServerErrorException(
+        'Could not create the booking. Please try again.',
+      );
     }
-    
+
     const bookingId = inserted.identifiers[0]?.id as string;
     if (!bookingId) {
       throw new InternalServerErrorException('Database error');
@@ -302,24 +399,43 @@ export class BookingsService {
       new Set(rows.map((r) => (role === 'host' ? r.guest_id : r.host_id))),
     );
 
-    const [listingRows, profileRows, paymentsByBookingId, reviewsRows] = await Promise.all([
-      listingIds.length
-        ? this.listingsRepo.find({ where: listingIds.map((id) => ({ id })), select: { id: true, draft_data: true } })
-        : Promise.resolve([] as ListingEntity[]),
-      counterpartIds.length
-        ? this.profilesRepo.find({ where: counterpartIds.map((id) => ({ id })), select: { id: true, full_name: true } })
-        : Promise.resolve([] as UserEntity[]),
-      this.payments.getForBookings(rows.map((row) => row.id)),
-      this.reviewsRepo.find({ where: { author_id: userId }, select: { booking_id: true } }),
-    ]);
+    const [listingRows, profileRows, paymentsByBookingId, reviewsRows] =
+      await Promise.all([
+        listingIds.length
+          ? this.listingsRepo.find({
+              where: listingIds.map((id) => ({ id })),
+              select: { id: true, draft_data: true },
+            })
+          : Promise.resolve([] as ListingEntity[]),
+        counterpartIds.length
+          ? this.profilesRepo.find({
+              where: counterpartIds.map((id) => ({ id })),
+              select: { id: true, full_name: true },
+            })
+          : Promise.resolve([] as UserEntity[]),
+        this.payments.getForBookings(rows.map((row) => row.id)),
+        this.reviewsRepo.find({
+          where: { author_id: userId },
+          select: { booking_id: true },
+        }),
+      ]);
 
     const titleById = new Map(
-      listingRows.map((l) => [l.id, (l.draft_data as any)?.property_details?.title ?? 'Listing']),
+      listingRows.map((l) => [
+        l.id,
+        (l.draft_data as any)?.property_details?.title ?? 'Listing',
+      ]),
     );
-    const nameById = new Map(profileRows.map((p) => [p.id, p.full_name ?? 'Basera user']));
+    const nameById = new Map(
+      profileRows.map((p) => [p.id, p.full_name ?? 'Basera user']),
+    );
     const paidByBookingId = new Set(
       Array.from(paymentsByBookingId.values())
-        .filter((p) => (PaymentsService.PAID_STATUSES as readonly string[]).includes(p.status))
+        .filter((p) =>
+          (PaymentsService.PAID_STATUSES as readonly string[]).includes(
+            p.status,
+          ),
+        )
         .map((p) => p.booking_id),
     );
 
@@ -349,8 +465,13 @@ export class BookingsService {
       escrowReleaseTime: row.escrow_release_time,
       rejectionReason: row.rejection_reason,
       isPaid: paidByBookingId.has(row.id),
-      hasReviewed: reviewsRows ? reviewsRows.some((r) => r.booking_id === row.id) : false,
-      counterpartName: nameById.get(role === 'host' ? row.guest_id : row.host_id) ?? 'Basera user',
+      stayConfirmation: this.stayConfirmationState(row, userId),
+      hasReviewed: reviewsRows
+        ? reviewsRows.some((r) => r.booking_id === row.id)
+        : false,
+      counterpartName:
+        nameById.get(role === 'host' ? row.guest_id : row.host_id) ??
+        'Basera user',
       createdAt: row.created_at,
     }));
 
@@ -367,8 +488,14 @@ export class BookingsService {
     }
 
     const [listing, hostProfile] = await Promise.all([
-      this.listingsRepo.findOne({ where: { id: row.listing_id }, select: { draft_data: true } }),
-      this.profilesRepo.findOne({ where: { id: row.host_id }, select: { full_name: true } }),
+      this.listingsRepo.findOne({
+        where: { id: row.listing_id },
+        select: { draft_data: true },
+      }),
+      this.profilesRepo.findOne({
+        where: { id: row.host_id },
+        select: { full_name: true },
+      }),
     ]);
 
     const payment = await this.payments.getForBooking(row.id);
@@ -376,7 +503,8 @@ export class BookingsService {
     const booking = {
       id: row.id,
       listingId: row.listing_id,
-      listingTitle: (listing?.draft_data as any)?.property_details?.title ?? 'Listing',
+      listingTitle:
+        (listing?.draft_data as any)?.property_details?.title ?? 'Listing',
       hostName: hostProfile?.full_name ?? 'Host',
       status: row.status,
       moveIn: row.move_in,
@@ -399,6 +527,7 @@ export class BookingsService {
       checkinCode: row.host_id === userId ? row.checkin_code : null,
       checkinTime: row.checkin_time,
       escrowReleaseTime: row.escrow_release_time,
+      stayConfirmation: this.stayConfirmationState(row, userId),
       paymentStatus: payment?.status ?? null,
     };
 
@@ -408,7 +537,13 @@ export class BookingsService {
   async approve(userId: string, id: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, host_id: true, guest_id: true, listing_id: true, move_in: true },
+      select: {
+        status: true,
+        host_id: true,
+        guest_id: true,
+        listing_id: true,
+        move_in: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -417,7 +552,9 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'requested') {
-      throw new ConflictException(`Cannot approve a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot approve a booking in status "${booking.status}"`,
+      );
     }
 
     const updateRes = await this.bookingsRepo.update(
@@ -430,11 +567,18 @@ export class BookingsService {
     await this.recordEvent(id, 'requested', 'confirmed', userId);
 
     const [listing, hostProfile] = await Promise.all([
-      this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } }),
-      this.profilesRepo.findOne({ where: { id: booking.host_id }, select: { full_name: true } }),
+      this.listingsRepo.findOne({
+        where: { id: booking.listing_id },
+        select: { draft_data: true },
+      }),
+      this.profilesRepo.findOne({
+        where: { id: booking.host_id },
+        select: { full_name: true },
+      }),
     ]);
 
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     const hostName = hostProfile?.full_name ?? 'Your host';
 
     this.notifications.notify('booking.confirmed', booking.guest_id, {
@@ -461,12 +605,14 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'requested') {
-      throw new ConflictException(`Cannot decline a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot decline a booking in status "${booking.status}"`,
+      );
     }
 
     const updateRes = await this.bookingsRepo.update(
       { id, status: 'requested' },
-      { status: 'declined', rejection_reason: reason, updated_at: new Date() }
+      { status: 'declined', rejection_reason: reason, updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
@@ -477,7 +623,8 @@ export class BookingsService {
       where: { id: booking.listing_id },
       select: { draft_data: true },
     });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
 
     this.notifications.notify('booking.declined', booking.guest_id, {
       listingTitle,
@@ -501,11 +648,16 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'requested' && booking.status !== 'confirmed') {
-      throw new ConflictException(`Cannot cancel a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot cancel a booking in status "${booking.status}"`,
+      );
     }
 
     const fromStatus = booking.status;
-    const updateRes = await this.bookingsRepo.update({ id, status: fromStatus }, { status: 'cancelled', updated_at: new Date() });
+    const updateRes = await this.bookingsRepo.update(
+      { id, status: fromStatus },
+      { status: 'cancelled', updated_at: new Date() },
+    );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
     }
@@ -515,8 +667,10 @@ export class BookingsService {
       where: { id: booking.listing_id },
       select: { draft_data: true },
     });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
-    const otherParty = userId === booking.guest_id ? booking.host_id : booking.guest_id;
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const otherParty =
+      userId === booking.guest_id ? booking.host_id : booking.guest_id;
 
     this.notifications.notify('booking.cancelled', otherParty, {
       listingTitle,
@@ -549,22 +703,38 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'confirmed') {
-      throw new ConflictException(`Cannot pay for a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot pay for a booking in status "${booking.status}"`,
+      );
     }
 
     const existing = await this.payments.getForBooking(id);
-    if (existing && existing.status !== 'pending' && existing.status !== 'failed') {
+    if (
+      existing &&
+      existing.status !== 'pending' &&
+      existing.status !== 'failed'
+    ) {
       throw new ConflictException('This booking has already been paid for.');
     }
 
     let attempt = 1;
     if (existing) {
-      const order = await this.cashfree.fetchPgOrder(existing.cashfree_order_id);
+      const order = await this.cashfree.fetchPgOrder(
+        existing.cashfree_order_id,
+      );
       if (order?.status === 'PAID') {
         await this.syncPayment(id);
-        return { success: true, status: 'confirmed' as const, paid: true as const };
+        return {
+          success: true,
+          status: 'confirmed' as const,
+          paid: true as const,
+        };
       }
-      if (existing.status === 'pending' && order?.status === 'ACTIVE' && order.paymentSessionId) {
+      if (
+        existing.status === 'pending' &&
+        order?.status === 'ACTIVE' &&
+        order.paymentSessionId
+      ) {
         return this.checkoutPayload(order.orderId, order.paymentSessionId);
       }
       attempt = existing.attempt + 1;
@@ -576,7 +746,9 @@ export class BookingsService {
     });
     const phone = toIndianMobile(guest?.phone);
     if (!phone) {
-      throw new BadRequestException('Add a mobile number to your profile before paying.');
+      throw new BadRequestException(
+        'Add a mobile number to your profile before paying.',
+      );
     }
 
     const orderId = `bk_${id.replace(/-/g, '')}_${attempt}`;
@@ -585,12 +757,16 @@ export class BookingsService {
       amount: booking.due_at_move_in,
       customerId: userId,
       customerPhone: phone,
-      ...(guest?.email && EMAIL_SHAPE.test(guest.email) ? { customerEmail: guest.email } : {}),
+      ...(guest?.email && EMAIL_SHAPE.test(guest.email)
+        ? { customerEmail: guest.email }
+        : {}),
       returnUrl: `${this.appUrl()}/booking/confirmed?booking=${id}&order_id={order_id}`,
       notifyUrl: this.webhookUrl(),
     });
     if (!order.paymentSessionId) {
-      throw new InternalServerErrorException('Payment service returned no checkout session');
+      throw new InternalServerErrorException(
+        'Payment service returned no checkout session',
+      );
     }
 
     if (existing) {
@@ -622,11 +798,14 @@ export class BookingsService {
 
   private webhookUrl(): string | undefined {
     const base = this.appUrl();
-    if (!base.startsWith('https://') || /localhost|127\.0\.0\.1/.test(base)) return undefined;
+    if (!base.startsWith('https://') || /localhost|127\.0\.0\.1/.test(base))
+      return undefined;
     return `${base}/api/payments/cashfree/webhook`;
   }
 
-  async syncPayment(bookingId: string): Promise<'held' | 'pending' | 'failed' | 'none'> {
+  async syncPayment(
+    bookingId: string,
+  ): Promise<'held' | 'pending' | 'failed' | 'none'> {
     const payment = await this.payments.getForBooking(bookingId);
     if (!payment) return 'none';
     if (payment.status === 'failed') return 'failed';
@@ -642,13 +821,19 @@ export class BookingsService {
         );
         return 'pending';
       }
-      const cfPaymentId = await this.cashfree.fetchSuccessfulPaymentId(order.orderId);
+      const cfPaymentId = await this.cashfree.fetchSuccessfulPaymentId(
+        order.orderId,
+      );
       if (await this.payments.markHeld(bookingId, cfPaymentId)) {
         await this.onPaymentHeld(bookingId);
       }
       return 'held';
     }
-    if (order.status === 'EXPIRED' || order.status === 'TERMINATED' || order.status === 'TERMINATION_REQUESTED') {
+    if (
+      order.status === 'EXPIRED' ||
+      order.status === 'TERMINATED' ||
+      order.status === 'TERMINATION_REQUESTED'
+    ) {
       await this.payments.markFailed(bookingId);
       return 'failed';
     }
@@ -699,7 +884,8 @@ export class BookingsService {
       where: { id: booking.listing_id },
       select: { draft_data: true },
     });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
 
     this.notifications.notify('booking.payment_held', booking.host_id, {
       listingTitle,
@@ -729,7 +915,15 @@ export class BookingsService {
   async checkin(userId: string, id: string, code: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, checkin_code: true, move_in: true, move_out: true },
+      select: {
+        status: true,
+        guest_id: true,
+        host_id: true,
+        listing_id: true,
+        checkin_code: true,
+        move_in: true,
+        move_out: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -738,7 +932,9 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'confirmed') {
-      throw new ConflictException(`Cannot check in a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot check in a booking in status "${booking.status}"`,
+      );
     }
     const payment = await this.payments.getForBooking(id);
     if (!payment || payment.status !== 'held') {
@@ -746,14 +942,20 @@ export class BookingsService {
     }
     const today = todayDayNumberIST();
     if (today < calendarDayNumber(booking.move_in)) {
-      throw new BadRequestException(`Check-in opens on ${formatCalendarDate(booking.move_in)}.`);
+      throw new BadRequestException(
+        `Check-in opens on ${formatCalendarDate(booking.move_in)}.`,
+      );
     }
     if (today > calendarDayNumber(booking.move_out)) {
-      throw new BadRequestException(`Check-in is closed — this stay ended on ${formatCalendarDate(booking.move_out)}.`);
+      throw new BadRequestException(
+        `Check-in is closed — this stay ended on ${formatCalendarDate(booking.move_out)}.`,
+      );
     }
     const failure = this.checkinFailures.get(id);
     if (failure && failure.lockedUntil > Date.now()) {
-      const retryAfterSeconds = Math.ceil((failure.lockedUntil - Date.now()) / 1000);
+      const retryAfterSeconds = Math.ceil(
+        (failure.lockedUntil - Date.now()) / 1000,
+      );
       const minutes = Math.ceil(retryAfterSeconds / 60);
       throw new HttpException(
         {
@@ -764,24 +966,43 @@ export class BookingsService {
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
-    const expected = booking.checkin_code ? Buffer.from(booking.checkin_code) : null;
+    const expected = booking.checkin_code
+      ? Buffer.from(booking.checkin_code)
+      : null;
     const given = Buffer.from(code);
-    if (!expected || expected.length !== given.length || !timingSafeEqual(expected, given)) {
-      const count = (failure && failure.count < CHECKIN_MAX_FAILED_ATTEMPTS ? failure.count : 0) + 1;
+    if (
+      !expected ||
+      expected.length !== given.length ||
+      !timingSafeEqual(expected, given)
+    ) {
+      const count =
+        (failure && failure.count < CHECKIN_MAX_FAILED_ATTEMPTS
+          ? failure.count
+          : 0) + 1;
       this.checkinFailures.set(id, {
         count,
-        lockedUntil: count >= CHECKIN_MAX_FAILED_ATTEMPTS ? Date.now() + CHECKIN_LOCKOUT_MS : 0,
+        lockedUntil:
+          count >= CHECKIN_MAX_FAILED_ATTEMPTS
+            ? Date.now() + CHECKIN_LOCKOUT_MS
+            : 0,
       });
       throw new BadRequestException('That check-in code is incorrect.');
     }
     this.checkinFailures.delete(id);
 
     const now = new Date();
-    const escrowReleaseTime = new Date(now.getTime() + ESCROW_HOLD_HOURS * 60 * 60 * 1000);
+    const escrowReleaseTime = new Date(
+      now.getTime() + ESCROW_HOLD_HOURS * 60 * 60 * 1000,
+    );
 
     const updateRes = await this.bookingsRepo.update(
       { id, status: 'confirmed' },
-      { status: 'checked_in', checkin_time: now, escrow_release_time: escrowReleaseTime, updated_at: now },
+      {
+        status: 'checked_in',
+        checkin_time: now,
+        escrow_release_time: escrowReleaseTime,
+        updated_at: now,
+      },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
@@ -789,10 +1010,17 @@ export class BookingsService {
     await this.recordEvent(id, 'confirmed', 'checked_in', userId);
 
     const [listing, guestProfile] = await Promise.all([
-      this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } }),
-      this.profilesRepo.findOne({ where: { id: booking.guest_id }, select: { full_name: true } }),
+      this.listingsRepo.findOne({
+        where: { id: booking.listing_id },
+        select: { draft_data: true },
+      }),
+      this.profilesRepo.findOne({
+        where: { id: booking.guest_id },
+        select: { full_name: true },
+      }),
     ]);
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     const guestName = guestProfile?.full_name ?? 'Your guest';
 
     this.notifications.notify('booking.checked_in', booking.host_id, {
@@ -818,7 +1046,14 @@ export class BookingsService {
   async dispute(userId: string, id: string, dto: DisputeBookingDto) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, escrow_release_time: true, move_out: true },
+      select: {
+        status: true,
+        guest_id: true,
+        host_id: true,
+        listing_id: true,
+        escrow_release_time: true,
+        move_out: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -827,7 +1062,9 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'checked_in') {
-      throw new ConflictException(`Cannot dispute a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot dispute a booking in status "${booking.status}"`,
+      );
     }
     if (dto.category === 'early_departure') {
       const leavingDay = calendarDayNumber(dto.leavingOn ?? '');
@@ -838,17 +1075,26 @@ export class BookingsService {
         throw new BadRequestException('Leaving date cannot be in the past.');
       }
       if (leavingDay >= calendarDayNumber(booking.move_out)) {
-        throw new BadRequestException('Leaving date must be before the move-out date.');
+        throw new BadRequestException(
+          'Leaving date must be before the move-out date.',
+        );
       }
     }
-    if (booking.escrow_release_time && booking.escrow_release_time.getTime() <= Date.now()) {
-      throw new ConflictException('The dispute window for this booking has closed.');
+    if (
+      booking.escrow_release_time &&
+      booking.escrow_release_time.getTime() <= Date.now()
+    ) {
+      throw new ConflictException(
+        'The dispute window for this booking has closed.',
+      );
     }
 
     const payment = await this.payments.getForBooking(id);
     const requestedAmount = dto.requestedAmount ?? 0;
     if (payment && requestedAmount > payment.amount) {
-      throw new BadRequestException('Requested amount cannot exceed the amount paid.');
+      throw new BadRequestException(
+        'Requested amount cannot exceed the amount paid.',
+      );
     }
 
     const disputeCase = await this.dataSource.transaction(async (manager) => {
@@ -887,10 +1133,17 @@ export class BookingsService {
     });
 
     const [listing, guestProfile] = await Promise.all([
-      this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } }),
-      this.profilesRepo.findOne({ where: { id: booking.guest_id }, select: { full_name: true } }),
+      this.listingsRepo.findOne({
+        where: { id: booking.listing_id },
+        select: { draft_data: true },
+      }),
+      this.profilesRepo.findOne({
+        where: { id: booking.guest_id },
+        select: { full_name: true },
+      }),
     ]);
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     const guestName = guestProfile?.full_name ?? 'Your guest';
 
     this.notifications.notify('booking.disputed', booking.host_id, {
@@ -905,13 +1158,23 @@ export class BookingsService {
       link: '/settings?tab=bookings',
     });
 
-    return { success: true, status: 'disputed' as const, disputeCaseId: disputeCase.id };
+    return {
+      success: true,
+      status: 'disputed' as const,
+      disputeCaseId: disputeCase.id,
+    };
   }
 
   private async requireDisputeCase(userId: string, bookingId: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id: bookingId },
-      select: { guest_id: true, host_id: true, listing_id: true, move_in: true, move_out: true },
+      select: {
+        guest_id: true,
+        host_id: true,
+        listing_id: true,
+        move_in: true,
+        move_out: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -919,24 +1182,44 @@ export class BookingsService {
     if (booking.guest_id !== userId && booking.host_id !== userId) {
       throw new ForbiddenException('Forbidden');
     }
-    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    const disputeCase = await this.disputeCasesRepo.findOne({
+      where: { booking_id: bookingId },
+    });
     if (!disputeCase) {
       throw new NotFoundException('No dispute found for this booking');
     }
-    return { booking, disputeCase, viewerRole: (booking.guest_id === userId ? 'guest' : 'host') as 'guest' | 'host' };
+    return {
+      booking,
+      disputeCase,
+      viewerRole: (booking.guest_id === userId ? 'guest' : 'host') as
+        'guest' | 'host',
+    };
   }
 
   async getDisputeCase(userId: string, bookingId: string) {
-    const { disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
-    return { success: true, viewerRole, ...(await this.loadDisputeTimeline(disputeCase)) };
+    const { disputeCase, viewerRole } = await this.requireDisputeCase(
+      userId,
+      bookingId,
+    );
+    return {
+      success: true,
+      viewerRole,
+      ...(await this.loadDisputeTimeline(disputeCase)),
+    };
   }
 
   async getDisputeCaseForAdmin(bookingId: string) {
-    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    const disputeCase = await this.disputeCasesRepo.findOne({
+      where: { booking_id: bookingId },
+    });
     if (!disputeCase) {
       throw new NotFoundException('No dispute found for this booking');
     }
-    return { success: true, viewerRole: 'admin' as const, ...(await this.loadDisputeTimeline(disputeCase)) };
+    return {
+      success: true,
+      viewerRole: 'admin' as const,
+      ...(await this.loadDisputeTimeline(disputeCase)),
+    };
   }
 
   private async loadDisputeTimeline(disputeCase: DisputeCaseEntity) {
@@ -951,28 +1234,41 @@ export class BookingsService {
           ? disputeCase.updated_at
           : null;
     const responseDeadline = clockStart
-      ? new Date(new Date(clockStart).getTime() + NEGOTIATION_STALE_HOURS * 60 * 60 * 1000).toISOString()
+      ? new Date(
+          new Date(clockStart).getTime() +
+            NEGOTIATION_STALE_HOURS * 60 * 60 * 1000,
+        ).toISOString()
       : null;
     return { case: disputeCase, events, responseDeadline };
   }
 
-  async addDisputeEvidence(userId: string, bookingId: string, files: UploadedMulterFile[]) {
+  async addDisputeEvidence(
+    userId: string,
+    bookingId: string,
+    files: UploadedMulterFile[],
+  ) {
     const { disputeCase } = await this.requireDisputeCase(userId, bookingId);
     if (files.length === 0) {
       throw new BadRequestException('No files provided');
     }
     if (disputeCase.evidence_urls.length + files.length > 6) {
-      throw new BadRequestException('A dispute may have at most 6 evidence files.');
+      throw new BadRequestException(
+        'A dispute may have at most 6 evidence files.',
+      );
     }
 
     const urls: string[] = [];
     for (const file of files) {
       const ext = EVIDENCE_ALLOWED_TYPES[file.mimetype];
       if (!ext) {
-        throw new BadRequestException('Unsupported file type. Use JPEG, PNG or WebP.');
+        throw new BadRequestException(
+          'Unsupported file type. Use JPEG, PNG or WebP.',
+        );
       }
       if (file.size > EVIDENCE_MAX_BYTES) {
-        throw new PayloadTooLargeException('File too large. Maximum size is 5 MB.');
+        throw new PayloadTooLargeException(
+          'File too large. Maximum size is 5 MB.',
+        );
       }
 
       const storagePath = `${bookingId}/${randomUUID()}.${ext}`;
@@ -980,49 +1276,83 @@ export class BookingsService {
         .from('dispute-evidence')
         .upload(storagePath, file.buffer, { contentType: file.mimetype });
       if (uploadError) {
-        throw new InternalServerErrorException('Upload failed. Please try again.');
+        throw new InternalServerErrorException(
+          'Upload failed. Please try again.',
+        );
       }
 
       const {
         data: { publicUrl },
-      } = this.supabase.client.storage.from('dispute-evidence').getPublicUrl(storagePath);
+      } = this.supabase.client.storage
+        .from('dispute-evidence')
+        .getPublicUrl(storagePath);
       urls.push(publicUrl);
     }
 
     await this.disputeCasesRepo.update(
       { id: disputeCase.id },
-      { evidence_urls: [...disputeCase.evidence_urls, ...urls], updated_at: new Date() },
+      {
+        evidence_urls: [...disputeCase.evidence_urls, ...urls],
+        updated_at: new Date(),
+      },
     );
     return { success: true, evidenceUrls: urls };
   }
 
-  async makeDisputeOffer(userId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
-    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
-    if (disputeCase.case_status !== 'open' && disputeCase.case_status !== 'negotiating') {
-      throw new ConflictException(`Cannot make an offer on a case in status "${disputeCase.case_status}"`);
+  async makeDisputeOffer(
+    userId: string,
+    bookingId: string,
+    amountToGuest: number,
+    message: string | undefined,
+  ) {
+    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(
+      userId,
+      bookingId,
+    );
+    if (
+      disputeCase.case_status !== 'open' &&
+      disputeCase.case_status !== 'negotiating'
+    ) {
+      throw new ConflictException(
+        `Cannot make an offer on a case in status "${disputeCase.case_status}"`,
+      );
     }
 
     const payment = await this.payments.getForBooking(bookingId);
     if (payment && (amountToGuest < 0 || amountToGuest > payment.amount)) {
-      throw new BadRequestException('amountToGuest must be between 0 and the amount paid.');
+      throw new BadRequestException(
+        'amountToGuest must be between 0 and the amount paid.',
+      );
     }
     if (disputeCase.negotiation_rounds >= NEGOTIATION_ROUNDS_CAP) {
-      throw new ConflictException('Negotiation rounds are exhausted — escalate to Basera instead.');
+      throw new ConflictException(
+        'Negotiation rounds are exhausted — escalate to Basera instead.',
+      );
     }
 
     const lastEvent = await this.disputeEventsRepo.findOne({
       where: { dispute_case_id: disputeCase.id },
       order: { created_at: 'DESC' },
     });
-    const lastOfferRole = lastEvent?.event_type === 'claim_raised' ? null : lastEvent?.actor_role ?? null;
+    const lastOfferRole =
+      lastEvent?.event_type === 'claim_raised'
+        ? null
+        : (lastEvent?.actor_role ?? null);
     if (lastOfferRole === viewerRole) {
-      throw new ConflictException('Waiting on the other party — not your turn to offer.');
+      throw new ConflictException(
+        'Waiting on the other party — not your turn to offer.',
+      );
     }
     if (viewerRole === 'guest' && lastOfferRole === null) {
       throw new ForbiddenException('Only the host can make the first offer.');
     }
 
-    const eventType = viewerRole === 'host' ? (lastOfferRole === null ? 'host_offer' : 'host_counter') : 'guest_counter';
+    const eventType =
+      viewerRole === 'host'
+        ? lastOfferRole === null
+          ? 'host_offer'
+          : 'host_counter'
+        : 'guest_counter';
 
     await this.disputeEventsRepo.insert({
       dispute_case_id: disputeCase.id,
@@ -1034,25 +1364,47 @@ export class BookingsService {
     });
     await this.disputeCasesRepo.update(
       { id: disputeCase.id },
-      { case_status: 'negotiating', negotiation_rounds: disputeCase.negotiation_rounds + 1, updated_at: new Date() },
+      {
+        case_status: 'negotiating',
+        negotiation_rounds: disputeCase.negotiation_rounds + 1,
+        updated_at: new Date(),
+      },
     );
 
-    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
-    const recipient = viewerRole === 'host' ? booking.guest_id : booking.host_id;
+    const listing = await this.listingsRepo.findOne({
+      where: { id: booking.listing_id },
+      select: { draft_data: true },
+    });
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const recipient =
+      viewerRole === 'host' ? booking.guest_id : booking.host_id;
     this.notifications.notify('dispute.offer_received', recipient, {
       listingTitle,
       offerAmount: amountToGuest,
-      link: viewerRole === 'host' ? '/settings?tab=bookings' : '/host?tab=bookings',
+      link:
+        viewerRole === 'host' ? '/settings?tab=bookings' : '/host?tab=bookings',
     });
 
     return { success: true, caseStatus: 'negotiating' as const };
   }
 
-  async respondToDisputeOffer(userId: string, bookingId: string, action: 'accept' | 'reject' | 'escalate') {
-    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
-    if (disputeCase.case_status !== 'negotiating' && !(action === 'escalate' && disputeCase.case_status === 'open')) {
-      throw new ConflictException(`Cannot respond to a case in status "${disputeCase.case_status}"`);
+  async respondToDisputeOffer(
+    userId: string,
+    bookingId: string,
+    action: 'accept' | 'reject' | 'escalate',
+  ) {
+    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(
+      userId,
+      bookingId,
+    );
+    if (
+      disputeCase.case_status !== 'negotiating' &&
+      !(action === 'escalate' && disputeCase.case_status === 'open')
+    ) {
+      throw new ConflictException(
+        `Cannot respond to a case in status "${disputeCase.case_status}"`,
+      );
     }
 
     if (action === 'accept') {
@@ -1060,14 +1412,26 @@ export class BookingsService {
         where: { dispute_case_id: disputeCase.id },
         order: { created_at: 'DESC' },
       });
-      if (!lastOffer || lastOffer.offer_amount === null || lastOffer.actor_role === viewerRole) {
+      if (
+        !lastOffer ||
+        lastOffer.offer_amount === null ||
+        lastOffer.actor_role === viewerRole
+      ) {
         throw new ConflictException('No standing offer to accept.');
       }
 
       await this.payments.splitRelease(bookingId, lastOffer.offer_amount);
       await this.bookingsRepo.update(
         { id: bookingId, status: 'disputed' },
-        { status: 'completed', actual_move_out: this.resolvedStayEnd(booking.move_in, booking.move_out, disputeCase), updated_at: new Date() },
+        {
+          status: 'completed',
+          actual_move_out: this.resolvedStayEnd(
+            booking.move_in,
+            booking.move_out,
+            disputeCase,
+          ),
+          updated_at: new Date(),
+        },
       );
       await this.recordEvent(bookingId, 'disputed', 'completed', userId);
       await this.disputeEventsRepo.insert({
@@ -1087,11 +1451,20 @@ export class BookingsService {
         },
       );
 
-      const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
-      const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
-      const otherParty = viewerRole === 'guest' ? booking.host_id : booking.guest_id;
-      const amounts = await this.disputeAmounts(bookingId, lastOffer.offer_amount);
-      const linkFor = (role: 'guest' | 'host') => (role === 'host' ? '/host?tab=bookings' : '/settings?tab=bookings');
+      const listing = await this.listingsRepo.findOne({
+        where: { id: booking.listing_id },
+        select: { draft_data: true },
+      });
+      const listingTitle =
+        (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+      const otherParty =
+        viewerRole === 'guest' ? booking.host_id : booking.guest_id;
+      const amounts = await this.disputeAmounts(
+        bookingId,
+        lastOffer.offer_amount,
+      );
+      const linkFor = (role: 'guest' | 'host') =>
+        role === 'host' ? '/host?tab=bookings' : '/settings?tab=bookings';
       this.notifications.notify('dispute.offer_accepted', otherParty, {
         listingTitle,
         ...amounts,
@@ -1114,24 +1487,47 @@ export class BookingsService {
       actor_role: viewerRole,
       event_type: action === 'reject' ? 'rejected' : 'escalated',
     });
-    await this.disputeCasesRepo.update({ id: disputeCase.id }, { case_status: 'escalated', updated_at: new Date() });
+    await this.disputeCasesRepo.update(
+      { id: disputeCase.id },
+      { case_status: 'escalated', updated_at: new Date() },
+    );
 
-    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listing = await this.listingsRepo.findOne({
+      where: { id: booking.listing_id },
+      select: { draft_data: true },
+    });
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     if (action === 'reject') {
-      this.notifications.notify('dispute.offer_rejected', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
-        listingTitle,
-        link: viewerRole === 'guest' ? '/host?tab=bookings' : '/settings?tab=bookings',
-      });
+      this.notifications.notify(
+        'dispute.offer_rejected',
+        booking.guest_id === userId ? booking.host_id : booking.guest_id,
+        {
+          listingTitle,
+          link:
+            viewerRole === 'guest'
+              ? '/host?tab=bookings'
+              : '/settings?tab=bookings',
+        },
+      );
     }
     this.notifyDisputeEscalated(booking, listingTitle);
 
     return { success: true, caseStatus: 'escalated' as const };
   }
 
-  private notifyDisputeEscalated(booking: { guest_id: string; host_id: string }, listingTitle: string): void {
-    this.notifications.notify('dispute.escalated', booking.guest_id, { listingTitle, link: '/settings?tab=bookings' });
-    this.notifications.notify('dispute.escalated', booking.host_id, { listingTitle, link: '/host?tab=bookings' });
+  private notifyDisputeEscalated(
+    booking: { guest_id: string; host_id: string },
+    listingTitle: string,
+  ): void {
+    this.notifications.notify('dispute.escalated', booking.guest_id, {
+      listingTitle,
+      link: '/settings?tab=bookings',
+    });
+    this.notifications.notify('dispute.escalated', booking.host_id, {
+      listingTitle,
+      link: '/host?tab=bookings',
+    });
   }
 
   private async disputeAmounts(bookingId: string, amountToGuest: number) {
@@ -1139,21 +1535,36 @@ export class BookingsService {
     try {
       payment = await this.payments.getForBooking(bookingId);
     } catch (err) {
-      this.logger.warn(`[disputeAmounts] payment lookup failed for booking ${bookingId}: ${String(err)}`);
+      this.logger.warn(
+        `[disputeAmounts] payment lookup failed for booking ${bookingId}: ${String(err)}`,
+      );
     }
     return {
       amountToGuest,
-      amountToHost: payment ? Math.max(0, payment.amount - amountToGuest) : undefined,
+      amountToHost: payment
+        ? Math.max(0, payment.amount - amountToGuest)
+        : undefined,
     };
   }
 
   async escalateStaleNegotiations(): Promise<number> {
-    const staleBefore = new Date(Date.now() - NEGOTIATION_STALE_HOURS * 60 * 60 * 1000);
+    const staleBefore = new Date(
+      Date.now() - NEGOTIATION_STALE_HOURS * 60 * 60 * 1000,
+    );
     const stale = await this.disputeCasesRepo.find({
       where: [{ case_status: 'negotiating' }, { case_status: 'open' }],
-      select: { id: true, booking_id: true, case_status: true, created_at: true, updated_at: true },
+      select: {
+        id: true,
+        booking_id: true,
+        case_status: true,
+        created_at: true,
+        updated_at: true,
+      },
     });
-    const due = stale.filter((c) => (c.case_status === 'open' ? c.created_at : c.updated_at) <= staleBefore);
+    const due = stale.filter(
+      (c) =>
+        (c.case_status === 'open' ? c.created_at : c.updated_at) <= staleBefore,
+    );
     for (const c of due) {
       await this.disputeEventsRepo.insert({
         dispute_case_id: c.id,
@@ -1161,31 +1572,52 @@ export class BookingsService {
         actor_role: 'system',
         event_type: 'escalated',
         message:
-          c.case_status === 'open' ? 'Auto-escalated: the host did not respond in time' : 'Auto-escalated after no activity',
+          c.case_status === 'open'
+            ? 'Auto-escalated: the host did not respond in time'
+            : 'Auto-escalated after no activity',
       });
-      await this.disputeCasesRepo.update({ id: c.id }, { case_status: 'escalated', updated_at: new Date() });
+      await this.disputeCasesRepo.update(
+        { id: c.id },
+        { case_status: 'escalated', updated_at: new Date() },
+      );
       const staleBooking = await this.bookingsRepo.findOne({
         where: { id: c.booking_id },
         select: { guest_id: true, host_id: true, listing_id: true },
       });
       if (staleBooking) {
-        const staleListing = await this.listingsRepo.findOne({ where: { id: staleBooking.listing_id }, select: { draft_data: true } });
-        this.notifyDisputeEscalated(staleBooking, (staleListing?.draft_data as any)?.property_details?.title ?? 'the listing');
+        const staleListing = await this.listingsRepo.findOne({
+          where: { id: staleBooking.listing_id },
+          select: { draft_data: true },
+        });
+        this.notifyDisputeEscalated(
+          staleBooking,
+          (staleListing?.draft_data as any)?.property_details?.title ??
+            'the listing',
+        );
       }
     }
     if (due.length > 0) {
-      this.logger.log(`[escalateStaleNegotiations] escalated ${due.length} stale negotiation(s)`);
+      this.logger.log(
+        `[escalateStaleNegotiations] escalated ${due.length} stale negotiation(s)`,
+      );
     }
     return due.length;
   }
 
   async appealDispute(userId: string, bookingId: string, message: string) {
-    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(userId, bookingId);
+    const { booking, disputeCase, viewerRole } = await this.requireDisputeCase(
+      userId,
+      bookingId,
+    );
     if (disputeCase.case_status !== 'admin_decided') {
-      throw new ConflictException('Only an admin-decided case may be appealed.');
+      throw new ConflictException(
+        'Only an admin-decided case may be appealed.',
+      );
     }
     if (disputeCase.appeal_used) {
-      throw new ConflictException('This dispute has already been appealed once.');
+      throw new ConflictException(
+        'This dispute has already been appealed once.',
+      );
     }
 
     await this.disputeEventsRepo.insert({
@@ -1200,12 +1632,23 @@ export class BookingsService {
       { case_status: 'appealed', appeal_used: true, updated_at: new Date() },
     );
 
-    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
-    this.notifications.notify('dispute.appeal_raised', booking.guest_id === userId ? booking.host_id : booking.guest_id, {
-      listingTitle,
-      link: viewerRole === 'guest' ? '/host?tab=bookings' : '/settings?tab=bookings',
+    const listing = await this.listingsRepo.findOne({
+      where: { id: booking.listing_id },
+      select: { draft_data: true },
     });
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    this.notifications.notify(
+      'dispute.appeal_raised',
+      booking.guest_id === userId ? booking.host_id : booking.guest_id,
+      {
+        listingTitle,
+        link:
+          viewerRole === 'guest'
+            ? '/host?tab=bookings'
+            : '/settings?tab=bookings',
+      },
+    );
 
     return { success: true, caseStatus: 'appealed' as const };
   }
@@ -1215,7 +1658,10 @@ export class BookingsService {
       where: { id },
       select: { status: true, guest_id: true, host_id: true, listing_id: true },
     });
-    if (!booking || (booking.status !== 'checked_in' && booking.status !== 'checked_out')) {
+    if (
+      !booking ||
+      (booking.status !== 'checked_in' && booking.status !== 'checked_out')
+    ) {
       return;
     }
     const fromStatus = booking.status;
@@ -1227,7 +1673,9 @@ export class BookingsService {
       { status: 'completed', updated_at: new Date() },
     );
     if (updateRes.affected === 0) {
-      this.logger.warn(`[releaseHold] booking ${id} status changed during release`);
+      this.logger.warn(
+        `[releaseHold] booking ${id} status changed during release`,
+      );
       return;
     }
     await this.recordEvent(id, fromStatus, 'completed', null);
@@ -1236,7 +1684,8 @@ export class BookingsService {
       where: { id: booking.listing_id },
       select: { draft_data: true },
     });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
 
     this.notifications.notify('booking.completed', booking.guest_id, {
       listingTitle,
@@ -1246,42 +1695,194 @@ export class BookingsService {
     });
   }
 
+  /** A request nobody answered within HOLD_TTL_MS stops blocking the guest's single hold slot. */
+  async expireStaleHolds(): Promise<number> {
+    const stale = await this.bookingsRepo.find({
+      where: { status: 'requested', hold_expires_at: LessThan(new Date()) },
+      select: { id: true, guest_id: true },
+      take: 200,
+    });
+    let expired = 0;
+    for (const booking of stale) {
+      const res = await this.bookingsRepo.update(
+        { id: booking.id, status: 'requested' },
+        { status: 'expired' },
+      );
+      if (!res.affected) continue;
+      expired += 1;
+      await this.recordEvent(booking.id, 'requested', 'expired', null);
+      this.notifications.notify('booking.expired', booking.guest_id, {
+        pushTitle: 'Booking request expired',
+        pushBody: 'The host did not reply in time. You can send a new request.',
+        link: '/account/bookings',
+      });
+    }
+    return expired;
+  }
+
+  private stayConfirmationState(row: BookingEntity, userId: string) {
+    const isGuest = row.guest_id === userId;
+    return {
+      canConfirm: this.isStayConfirmable(row),
+      myConfirmed: Boolean(isGuest ? row.guest_confirmed_stay_at : row.host_confirmed_stay_at),
+      otherConfirmed: Boolean(isGuest ? row.host_confirmed_stay_at : row.guest_confirmed_stay_at),
+      confirmed: Boolean(row.stay_confirmed_at),
+    };
+  }
+
+  private stayStart(booking: Pick<BookingEntity, 'checkin_time' | 'move_in'>): Date {
+    return booking.checkin_time ?? new Date(`${booking.move_in}T00:00:00+05:30`);
+  }
+
+  private isStayConfirmable(booking: BookingEntity, now = new Date()): boolean {
+    if (!['confirmed', 'checked_in', 'checked_out', 'completed'].includes(booking.status)) {
+      return false;
+    }
+    return now.getTime() >= this.stayStart(booking).getTime() + STAY_CONFIRM_DELAY_MS;
+  }
+
+  /** 24h after check-in both sides are asked to confirm the stay happened. */
+  async sendStayConfirmationPrompts(): Promise<number> {
+    const cutoff = new Date(Date.now() - STAY_CONFIRM_DELAY_MS);
+    const cutoffDay = cutoff.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const due = await this.bookingsRepo
+      .createQueryBuilder('b')
+      .where('b.stay_prompt_sent_at IS NULL')
+      .andWhere('b.status IN (:...statuses)', {
+        statuses: ['confirmed', 'checked_in', 'checked_out', 'completed'],
+      })
+      .andWhere(
+        '((b.checkin_time IS NOT NULL AND b.checkin_time <= :cutoff) OR (b.checkin_time IS NULL AND b.move_in <= :cutoffDay))',
+        { cutoff, cutoffDay },
+      )
+      .take(200)
+      .getMany();
+
+    let sent = 0;
+    for (const booking of due) {
+      const res = await this.bookingsRepo.update(
+        { id: booking.id, stay_prompt_sent_at: IsNull() },
+        { stay_prompt_sent_at: new Date() },
+      );
+      if (!res.affected) continue;
+      sent += 1;
+      for (const userId of [booking.guest_id, booking.host_id]) {
+        this.notifications.notify('booking.stay_confirm_prompt', userId, {
+          pushTitle: 'Did the stay happen?',
+          pushBody: 'Confirm it in one tap. Reviews and verified-stay badges unlock once both sides confirm.',
+          link: '/account/bookings',
+        });
+      }
+    }
+    return sent;
+  }
+
+  async confirmStay(userId: string, bookingId: string) {
+    const booking = await this.bookingsRepo.findOne({ where: { id: bookingId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+
+    const isGuest = booking.guest_id === userId;
+    if (!isGuest && booking.host_id !== userId) {
+      throw new ForbiddenException('You are not a party to this booking.');
+    }
+    if (!this.isStayConfirmable(booking)) {
+      throw new BadRequestException('You can confirm a stay 24 hours after check-in.');
+    }
+
+    const now = new Date();
+    const guestAt = isGuest ? (booking.guest_confirmed_stay_at ?? now) : booking.guest_confirmed_stay_at;
+    const hostAt = isGuest ? booking.host_confirmed_stay_at : (booking.host_confirmed_stay_at ?? now);
+    const bothAt = guestAt && hostAt ? (booking.stay_confirmed_at ?? now) : null;
+
+    await this.bookingsRepo.update(
+      { id: bookingId },
+      {
+        guest_confirmed_stay_at: guestAt,
+        host_confirmed_stay_at: hostAt,
+        stay_confirmed_at: bothAt,
+      },
+    );
+
+    return {
+      success: true,
+      guestConfirmed: Boolean(guestAt),
+      hostConfirmed: Boolean(hostAt),
+      stayConfirmed: Boolean(bothAt),
+    };
+  }
+
   async releaseExpiredHolds(): Promise<number> {
     const due = await this.bookingsRepo.find({
-      where: { status: In(['checked_in', 'checked_out']), escrow_release_time: LessThanOrEqual(new Date()) },
+      where: {
+        status: In(['checked_in', 'checked_out']),
+        escrow_release_time: LessThanOrEqual(new Date()),
+      },
       select: { id: true },
     });
     for (const row of due) {
       try {
         await this.releaseHold(row.id);
       } catch (err) {
-        this.logger.error(`[releaseExpiredHolds] booking ${row.id} failed`, err as Error);
+        this.logger.error(
+          `[releaseExpiredHolds] booking ${row.id} failed`,
+          err as Error,
+        );
       }
     }
     if (due.length > 0) {
-      this.logger.log(`[releaseExpiredHolds] released ${due.length} booking(s)`);
+      this.logger.log(
+        `[releaseExpiredHolds] released ${due.length} booking(s)`,
+      );
     }
     return due.length;
   }
 
-  private resolvedStayEnd(moveIn: string, moveOut: string, disputeCase: DisputeCaseEntity): string {
-    const wanted = disputeCase.leaving_on ? calendarDayNumber(disputeCase.leaving_on) : todayDayNumberIST();
-    const end = Math.min(calendarDayNumber(moveOut), Math.max(calendarDayNumber(moveIn), isNaN(wanted) ? todayDayNumberIST() : wanted));
+  private resolvedStayEnd(
+    moveIn: string,
+    moveOut: string,
+    disputeCase: DisputeCaseEntity,
+  ): string {
+    const wanted = disputeCase.leaving_on
+      ? calendarDayNumber(disputeCase.leaving_on)
+      : todayDayNumberIST();
+    const end = Math.min(
+      calendarDayNumber(moveOut),
+      Math.max(
+        calendarDayNumber(moveIn),
+        isNaN(wanted) ? todayDayNumberIST() : wanted,
+      ),
+    );
     return calendarDayToISO(end);
   }
 
-  async resolveDispute(adminUserId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
+  async resolveDispute(
+    adminUserId: string,
+    bookingId: string,
+    amountToGuest: number,
+    message: string | undefined,
+  ) {
     const booking = await this.bookingsRepo.findOne({
       where: { id: bookingId },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, move_in: true, move_out: true },
+      select: {
+        status: true,
+        guest_id: true,
+        host_id: true,
+        listing_id: true,
+        move_in: true,
+        move_out: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
     }
     if (booking.status !== 'disputed') {
-      throw new ConflictException(`Cannot resolve a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot resolve a booking in status "${booking.status}"`,
+      );
     }
-    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    const disputeCase = await this.disputeCasesRepo.findOne({
+      where: { booking_id: bookingId },
+    });
     if (!disputeCase || disputeCase.case_status !== 'escalated') {
       throw new ConflictException('This dispute is not awaiting admin review.');
     }
@@ -1290,7 +1891,15 @@ export class BookingsService {
 
     const updateRes = await this.bookingsRepo.update(
       { id: bookingId, status: 'disputed' },
-      { status: 'completed', actual_move_out: this.resolvedStayEnd(booking.move_in, booking.move_out, disputeCase), updated_at: new Date() },
+      {
+        status: 'completed',
+        actual_move_out: this.resolvedStayEnd(
+          booking.move_in,
+          booking.move_out,
+          disputeCase,
+        ),
+        updated_at: new Date(),
+      },
     );
     if (updateRes.affected === 0) {
       throw new ConflictException('Booking status changed during operation');
@@ -1306,14 +1915,20 @@ export class BookingsService {
     });
     await this.disputeCasesRepo.update(
       { id: disputeCase.id },
-      { case_status: 'admin_decided', resolution_amount_to_guest: amountToGuest, resolved_by: 'admin', updated_at: new Date() },
+      {
+        case_status: 'admin_decided',
+        resolution_amount_to_guest: amountToGuest,
+        resolved_by: 'admin',
+        updated_at: new Date(),
+      },
     );
 
     const listing = await this.listingsRepo.findOne({
       where: { id: booking.listing_id },
       select: { draft_data: true },
     });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
 
     const amounts = await this.disputeAmounts(bookingId, amountToGuest);
     this.notifications.notify('dispute.resolved', booking.guest_id, {
@@ -1334,7 +1949,12 @@ export class BookingsService {
     return { success: true, status: 'completed' as const, amountToGuest };
   }
 
-  async resolveAppeal(adminUserId: string, bookingId: string, amountToGuest: number, message: string | undefined) {
+  async resolveAppeal(
+    adminUserId: string,
+    bookingId: string,
+    amountToGuest: number,
+    message: string | undefined,
+  ) {
     const booking = await this.bookingsRepo.findOne({
       where: { id: bookingId },
       select: { guest_id: true, host_id: true, listing_id: true },
@@ -1342,7 +1962,9 @@ export class BookingsService {
     if (!booking) {
       throw new NotFoundException('Booking not found');
     }
-    const disputeCase = await this.disputeCasesRepo.findOne({ where: { booking_id: bookingId } });
+    const disputeCase = await this.disputeCasesRepo.findOne({
+      where: { booking_id: bookingId },
+    });
     if (!disputeCase || disputeCase.case_status !== 'appealed') {
       throw new ConflictException('This dispute is not under appeal.');
     }
@@ -1358,11 +1980,20 @@ export class BookingsService {
     });
     await this.disputeCasesRepo.update(
       { id: disputeCase.id },
-      { case_status: 'resolved', resolution_amount_to_guest: amountToGuest, resolved_by: 'appeal', updated_at: new Date() },
+      {
+        case_status: 'resolved',
+        resolution_amount_to_guest: amountToGuest,
+        resolved_by: 'appeal',
+        updated_at: new Date(),
+      },
     );
 
-    const listing = await this.listingsRepo.findOne({ where: { id: booking.listing_id }, select: { draft_data: true } });
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listing = await this.listingsRepo.findOne({
+      where: { id: booking.listing_id },
+      select: { draft_data: true },
+    });
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     const amounts = await this.disputeAmounts(bookingId, amountToGuest);
     this.notifications.notify('dispute.resolved', booking.guest_id, {
       listingTitle,
@@ -1383,7 +2014,13 @@ export class BookingsService {
   async checkout(userId: string, id: string) {
     const booking = await this.bookingsRepo.findOne({
       where: { id },
-      select: { status: true, guest_id: true, host_id: true, listing_id: true, move_out: true },
+      select: {
+        status: true,
+        guest_id: true,
+        host_id: true,
+        listing_id: true,
+        move_out: true,
+      },
     });
     if (!booking) {
       throw new NotFoundException('Booking not found');
@@ -1392,7 +2029,9 @@ export class BookingsService {
       throw new ForbiddenException('Forbidden');
     }
     if (booking.status !== 'checked_in') {
-      throw new ConflictException(`Cannot checkout a booking in status "${booking.status}"`);
+      throw new ConflictException(
+        `Cannot checkout a booking in status "${booking.status}"`,
+      );
     }
 
     const listing = await this.listingsRepo.findOne({
@@ -1400,9 +2039,11 @@ export class BookingsService {
       select: { draft_data: true },
     });
 
-    const listingTitle = (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
+    const listingTitle =
+      (listing?.draft_data as any)?.property_details?.title ?? 'the listing';
     const houseRules = (listing?.draft_data as any)?.house_rules;
-    const checkoutTimeStr = houseRules?.check_out ?? houseRules?.checkOut ?? '11:00 AM';
+    const checkoutTimeStr =
+      houseRules?.check_out ?? houseRules?.checkOut ?? '11:00 AM';
 
     const now = new Date();
     const moveOutDate = calendarDayNumber(booking.move_out);
@@ -1410,9 +2051,13 @@ export class BookingsService {
 
     const isGuest = booking.guest_id === userId;
 
-    const dateBypass = ['true', '1'].includes(String(this.config.get('CHECKOUT_DATE_BYPASS')));
+    const dateBypass = ['true', '1'].includes(
+      String(this.config.get('CHECKOUT_DATE_BYPASS')),
+    );
     if (dateBypass) {
-      this.logger.warn(`[checkout] date check bypassed for booking ${id} (CHECKOUT_DATE_BYPASS)`);
+      this.logger.warn(
+        `[checkout] date check bypassed for booking ${id} (CHECKOUT_DATE_BYPASS)`,
+      );
     }
 
     if (dateBypass) {
@@ -1424,7 +2069,9 @@ export class BookingsService {
       }
     } else {
       if (todayDate < moveOutDate) {
-        throw new ConflictException('You cannot check out a guest before their move-out date.');
+        throw new ConflictException(
+          'You cannot check out a guest before their move-out date.',
+        );
       }
 
       if (todayDate === moveOutDate) {
@@ -1442,8 +2089,13 @@ export class BookingsService {
         const currentHour = now.getHours();
         const currentMinute = now.getMinutes();
 
-        if (currentHour < hours || (currentHour === hours && currentMinute < minutes)) {
-          throw new ConflictException(`You can only check out the guest after the official checkout time (${checkoutTimeStr}).`);
+        if (
+          currentHour < hours ||
+          (currentHour === hours && currentMinute < minutes)
+        ) {
+          throw new ConflictException(
+            `You can only check out the guest after the official checkout time (${checkoutTimeStr}).`,
+          );
         }
       }
     }
@@ -1466,12 +2118,16 @@ export class BookingsService {
         ? `Your guest has checked out of ${listingTitle}`
         : `Your host has marked your stay at ${listingTitle} as completed`;
 
-    this.notifications.notify(leftEarly ? 'booking.checked_out_early' : 'booking.checked_out', otherParty, {
-      listingTitle,
-      pushTitle: leftEarly ? 'Guest checked out early' : 'Stay completed',
-      pushBody,
-      link: isGuest ? '/host?tab=bookings' : `/stays/${booking.listing_id}`,
-    });
+    this.notifications.notify(
+      leftEarly ? 'booking.checked_out_early' : 'booking.checked_out',
+      otherParty,
+      {
+        listingTitle,
+        pushTitle: leftEarly ? 'Guest checked out early' : 'Stay completed',
+        pushBody,
+        link: isGuest ? '/host?tab=bookings' : `/stays/${booking.listing_id}`,
+      },
+    );
 
     return { success: true, status: 'checked_out' as const };
   }

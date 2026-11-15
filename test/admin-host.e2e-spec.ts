@@ -23,8 +23,6 @@ import {
   NotificationLogEntity,
   PaymentEntity,
   UserEntity,
-  VerificationAuditLogEntity,
-  VerificationRequestEntity,
 } from '../src/entities';
 import { CaptureConfigService } from '../src/listings/capture-config.service';
 import { HostListingsController } from '../src/listings/host-listings.controller';
@@ -34,7 +32,6 @@ import { ListingsService } from '../src/listings/listings.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
 import { RedisService } from '../src/redis/redis.service';
 import { StorageService } from '../src/storage/storage.service';
-import { VerificationService } from '../src/verification/verification.service';
 
 const JWT_SECRET = 'test-secret';
 const token = (sub: string, opts: jwt.SignOptions = {}) => jwt.sign({ sub }, JWT_SECRET, opts);
@@ -73,9 +70,9 @@ function makeRepo(rows: Row[]) {
 
 const USERS = {
   admin: { id: 'admin1', role: 'admin', full_name: 'Ops Admin', isHost: false },
-  host: { id: 'host1', role: 'host', full_name: 'Hema Host', phone: '+911', email: 'h@x.in', isHost: true, selfie_uploaded_at: new Date(), host_kind: 'individual', gst: null },
+  host: { id: 'host1', role: 'host', full_name: 'Hema Host', phone: '+911', email: 'h@x.in', isHost: true, selfie_uploaded_at: new Date(), is_id_verified: true, banned_at: null, host_kind: 'individual', gst: null },
   guest: { id: 'guest1', role: 'guest', full_name: 'Gita Guest', email: 'g@x.in', isHost: false },
-  other: { id: 'host2', role: 'host', full_name: 'Other Host', isHost: true, selfie_uploaded_at: new Date(), host_kind: 'individual', gst: null },
+  other: { id: 'host2', role: 'host', full_name: 'Other Host', isHost: true, selfie_uploaded_at: new Date(), is_id_verified: false, banned_at: null, host_kind: 'individual', gst: null },
 };
 
 const expectError = (res: request.Response, status: number, message?: string | RegExp) => {
@@ -92,8 +89,6 @@ describe('Admin API (/api/admin)', () => {
   let profiles: Row[];
   let payments: Row[];
   let bookings: Row[];
-  let vreqs: Row[];
-  let vaudit: Row[];
   let notifLog: Row[];
   let notified: any[];
   let cacheBumps: number;
@@ -121,13 +116,6 @@ describe('Admin API (/api/admin)', () => {
       { id: 'B1', status: 'disputed', listing_id: 'L2', guest_id: 'guest1', host_id: 'host2', due_at_move_in: 4000, checkin_time: null, rejection_reason: 'dirty', updated_at: new Date() },
       { id: 'B2', status: 'confirmed', listing_id: 'L2', guest_id: 'guest1', host_id: 'host2', updated_at: new Date() },
     ];
-    vreqs = [
-      { id: 'V1', user_id: 'host1', verification_type: 'identity', status: 'pending', document_path: 'host1/id/a.jpg', document_path_back: null, submitted_at: new Date('2026-02-05'), reviewed_by: null },
-      { id: 'V0', user_id: 'host1', verification_type: 'identity', status: 'rejected', rejection_reason: 'blurry', submitted_at: new Date('2026-02-01'), reviewed_by: 'admin1', document_path: null },
-      { id: 'V2', user_id: 'host1', verification_type: 'selfie', status: 'pending', document_path: 'host1/selfie/s.jpg', submitted_at: new Date('2026-02-03'), reviewed_by: null },
-      { id: 'V3', user_id: 'host1', verification_type: 'selfie', status: 'rejected', rejection_reason: 'dark', document_path: null, submitted_at: new Date('2026-01-15'), reviewed_by: null },
-    ];
-    vaudit = [];
     notifLog = [];
     notified = [];
     cacheBumps = 0;
@@ -217,7 +205,6 @@ describe('Admin API (/api/admin)', () => {
       },
     };
 
-    const auditRepo = { find: async () => vaudit, create: (x: Row) => x, save: async (x: Row) => (vaudit.push({ id: `a${vaudit.length}`, ...x }), x) };
 
     const bookingsService = {
       getDisputeCase: async (adminId: string, id: string) => {
@@ -252,8 +239,6 @@ describe('Admin API (/api/admin)', () => {
         { provide: getRepositoryToken(NotificationLogEntity), useValue: notifRepo },
         { provide: getRepositoryToken(PaymentEntity), useValue: paymentsRepo },
         { provide: getRepositoryToken(DisputeCaseEntity), useValue: makeRepo([]) },
-        { provide: getRepositoryToken(VerificationRequestEntity), useValue: makeRepo(vreqs) },
-        { provide: getRepositoryToken(VerificationAuditLogEntity), useValue: auditRepo },
         { provide: NotificationsService, useValue: { notify: (...a: any[]) => notified.push(a) } },
         { provide: ListingTranslationService, useValue: { prewarmSourceLocale: async () => {} } },
         { provide: ListingsService, useValue: { bumpSearchCacheVersion: async () => void cacheBumps++ } },
@@ -296,9 +281,6 @@ describe('Admin API (/api/admin)', () => {
     ['get', 'GET', '/api/admin/disputes/B1', {}],
     ['patch', 'PATCH', '/api/admin/disputes/B1', { amountToGuest: 1 }],
     ['patch', 'PATCH', '/api/admin/disputes/B1/appeal', { amountToGuest: 1 }],
-    ['get', 'GET', '/api/admin/users/host1/verification', {}],
-    ['get', 'GET', '/api/admin/verification/V1', {}],
-    ['get', 'GET', '/api/admin/verification/V1/document-url', {}],
   ];
 
   describe('authentication and authorisation (all routes)', () => {
@@ -318,7 +300,6 @@ describe('Admin API (/api/admin)', () => {
         const res = await (api() as any)[m](url).set('Cookie', as(who)).send(body);
         expectError(res, 403, 'Admin role required');
       }
-      expect(vaudit).toHaveLength(0);
       expect(profiles.find((p) => p.id === 'guest1')!.isHost).toBe(false);
     });
 
@@ -358,7 +339,7 @@ describe('Admin API (/api/admin)', () => {
       expect(l1.layers.telemetry.status).toBe('passed');
       expect(l1.layers).not.toHaveProperty('banking');
       expect(Object.keys(l1.verification)).toEqual(['identity', 'selfie']);
-      expect(l1.verification.identity).toMatchObject({ requestId: 'V1', hasDocument: true });
+      expect(l1.verification.identity).toMatchObject({ status: 'passed', requestId: null, hasDocument: false });
     });
 
     it('filters by status', async () => {
@@ -493,7 +474,6 @@ describe('Admin API (/api/admin)', () => {
 
   describe('GET /users', () => {
     it('lists users with flags, listing counts, kyc status and counts', async () => {
-      vreqs.push({ id: 'V6', user_id: 'host1', verification_type: 'identity', status: 'verified', submitted_at: new Date('2026-03-01'), reviewed_by: 'admin1' });
       const res = await adm('get', '/api/admin/users').expect(200);
       expect(res.body).toMatchObject({ total: 4, page: 1, pageSize: 20, counts: { all: 4, hosts: 2, admins: 1, guests: 1 } });
       const host = res.body.users.find((u: any) => u.id === 'host1');
@@ -501,9 +481,8 @@ describe('Admin API (/api/admin)', () => {
       expect(res.body.users.find((u: any) => u.id === 'admin1').isAdmin).toBe(true);
       expect(res.body.users.find((u: any) => u.id === 'host2').kycStatus).toBe('not_submitted');
     });
-    it('kycStatus follows the NEWEST identity request, not an older verified one', async () => {
-      vreqs.push({ id: 'V6', user_id: 'host1', verification_type: 'identity', status: 'verified', submitted_at: new Date('2026-03-01'), reviewed_by: 'admin1' });
-      vreqs.push({ id: 'V7', user_id: 'host1', verification_type: 'identity', status: 'rejected', submitted_at: new Date('2026-04-01'), reviewed_by: 'admin1' });
+    it('kycStatus needs both the ID flag and the kept selfie', async () => {
+      profiles.find((p) => p.id === 'host1')!.is_id_verified = false;
       const res = await adm('get', '/api/admin/users').expect(200);
       expect(res.body.users.find((u: any) => u.id === 'host1').kycStatus).toBe('not_submitted');
     });
@@ -595,57 +574,9 @@ describe('Admin API (/api/admin)', () => {
     });
   });
 
-  describe('GET /users/:id/verification', () => {
-    it('groups requests by type with the newest as current and the rest as history', async () => {
-      const res = await adm('get', '/api/admin/users/host1/verification').expect(200);
-      expect(res.body.userId).toBe('host1');
-      expect(res.body.types.map((t: any) => t.type)).toEqual(['identity', 'selfie']);
-      const identity = res.body.types.find((t: any) => t.type === 'identity');
-      expect(identity.current.id).toBe('V1');
-      expect(identity.previousAttempts).toMatchObject([{ id: 'V0', status: 'rejected', rejectionReason: 'blurry', reviewedBy: 'Ops Admin' }]);
-    });
-    it('returns empty slots for a user with no requests', async () => {
-      const res = await adm('get', '/api/admin/users/guest1/verification').expect(200);
-      expect(res.body.types.every((t: any) => t.current === null && t.previousAttempts.length === 0)).toBe(true);
-    });
-  });
-
-  describe('GET /verification/:id', () => {
-    it('returns detail with signed URLs, history and audit log', async () => {
-      vaudit.push({ id: 'a0', admin_id: 'admin1', action: 'rejected', previous_status: 'pending', new_status: 'rejected', created_at: new Date() });
-      const res = await adm('get', '/api/admin/verification/V1').expect(200);
-      expect(res.body).toMatchObject({
-        id: 'V1',
-        userName: 'Hema Host',
-        verificationType: 'identity',
-        status: 'pending',
-        documentUrl: 'https://signed.test/verification-documents/host1/id/a.jpg',
-        documentBackUrl: null,
-        previousAttempts: [{ id: 'V0', status: 'rejected' }],
-        auditLog: [{ adminName: 'Ops Admin', newStatus: 'rejected' }],
-      });
-    });
-    it('has no bank block', async () => {
-      expect((await adm('get', '/api/admin/verification/V1').expect(200)).body).not.toHaveProperty('bank');
-    });
-    it('404 for an unknown request', async () => {
-      expectError(await adm('get', '/api/admin/verification/zzz'), 404, 'Verification request not found');
-    });
-  });
-
-  describe('GET /verification/:id/document-url', () => {
-    it('returns a signed URL', async () => {
-      expect((await adm('get', '/api/admin/verification/V2/document-url').expect(200)).body).toEqual({ url: 'https://signed.test/verification-documents/host1/selfie/s.jpg' });
-    });
-    it('404 for unknown request and for a request without a document', async () => {
-      expectError(await adm('get', '/api/admin/verification/zzz/document-url'), 404, 'Verification request not found');
-      expectError(await adm('get', '/api/admin/verification/V3/document-url'), 404, 'This verification request has no document');
-    });
-  });
-
-  it('POST /verification/:id/review no longer exists', async () => {
+  it('the old verification review routes are gone', async () => {
+    await adm('get', '/api/admin/verification/V1').expect(404);
     await adm('post', '/api/admin/verification/V1/review').send({ decision: 'approve' }).expect(404);
-    expect(vreqs.find((r) => r.id === 'V1')).toMatchObject({ status: 'pending', reviewed_by: null });
   });
 });
 
@@ -655,7 +586,6 @@ describe('Host listings API (/api/host/listings)', () => {
   let profiles: Row[];
   let redisStore: Map<string, string>;
   let versionBumps: number;
-  let verificationStatus: { identity: { status: string } };
   let captureConfig: { locationBypass: boolean };
 
   const PIN = { lat: 32.2701, lng: 77.1755 };
@@ -724,7 +654,6 @@ describe('Host listings API (/api/host/listings)', () => {
     profiles = [{ ...USERS.host }, { ...USERS.other }, { ...USERS.guest }];
     redisStore = new Map();
     versionBumps = 0;
-    verificationStatus = { identity: { status: 'verified' } };
     captureConfig = { locationBypass: false };
 
     const listingsRepo = makeRepo(listings);
@@ -740,7 +669,6 @@ describe('Host listings API (/api/host/listings)', () => {
         { provide: getRepositoryToken(ListingEntity), useValue: listingsRepo },
         { provide: getRepositoryToken(UserEntity), useValue: makeRepo(profiles) },
         { provide: getDataSourceToken(), useValue: { transaction: async (cb: any) => cb({ getRepository: () => listingsRepo }) } },
-        { provide: VerificationService, useValue: { getMyStatus: async () => verificationStatus } },
         { provide: SupabaseProvider, useValue: { client: {} } },
         {
           provide: RedisService,
@@ -1021,13 +949,13 @@ describe('Host listings API (/api/host/listings)', () => {
       expectError(await host('post', `${U}/submit-full`).send(body({ videoUrl: 'https://x.test/v.mp4' })), 400, /property video can no longer be uploaded/);
     });
 
-    it('403 until identity and a live selfie are both verified (same gate as guests)', async () => {
+    it('403 until the host passed the in-house ID check, and for banned hosts', async () => {
       ready();
-      verificationStatus.identity.status = 'pending';
+      profiles[0].is_id_verified = false;
       expectError(await host('post', `${U}/submit-full`).send(body()), 403, /Verify your identity/);
-      verificationStatus.identity.status = 'verified';
-      profiles[0].selfie_uploaded_at = null;
-      expectError(await host('post', `${U}/submit-full`).send(body()), 403, /live selfie/);
+      profiles[0].is_id_verified = true;
+      profiles[0].banned_at = new Date();
+      expectError(await host('post', `${U}/submit-full`).send(body()), 403, /cannot list/);
       expect(listings).toHaveLength(0);
       expect(redisStore.has(`walkthrough-token:host1:${TOKEN}`)).toBe(true);
     });
@@ -1055,7 +983,7 @@ describe('Host listings API (/api/host/listings)', () => {
         captureConfig.locationBypass = true;
         readyAt();
         expectError(await host('post', `${U}/submit-full`).send({ ...mohali(), district: 'Kangra' }), 400, /belongs to Kangra district/);
-        verificationStatus.identity.status = 'pending';
+        profiles[0].is_id_verified = false;
         expectError(await host('post', `${U}/submit-full`).send(mohali()), 403, /Verify your identity/);
       });
     });

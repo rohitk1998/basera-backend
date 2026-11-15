@@ -12,7 +12,7 @@ function makeService(booking: Record<string, unknown> | null, existing: unknown 
   };
   const bookingsRepo = {
     findOne: jest.fn().mockResolvedValue(
-      booking && { id: 'b1', status: 'completed', guest_id: GUEST, host_id: HOST, listing_id: 'l1', ...booking },
+      booking && { id: 'b1', status: 'completed', guest_id: GUEST, host_id: HOST, listing_id: 'l1', stay_confirmed_at: new Date(), ...booking },
     ),
   };
   const service = new ReviewsService(reviewsRepo as never, bookingsRepo as never, {} as never);
@@ -42,8 +42,14 @@ describe('ReviewsService.createReview', () => {
     );
   });
 
+  it('rejects a review until both sides confirmed the stay', async () => {
+    const { service, reviewsRepo } = makeService({ stay_confirmed_at: null });
+    await expect(service.createReview(GUEST, 'b1', { rating: 5, content: 'x' })).rejects.toBeInstanceOf(BadRequestException);
+    expect(reviewsRepo.insert).not.toHaveBeenCalled();
+  });
+
   it('rejects a host review before the stay is complete', async () => {
-    const { service } = makeService({ status: 'checked_in' });
+    const { service } = makeService({ status: 'checked_in', stay_confirmed_at: null });
     await expect(service.createReview(HOST, 'b1', { rating: 4, content: 'x' })).rejects.toBeInstanceOf(BadRequestException);
   });
 

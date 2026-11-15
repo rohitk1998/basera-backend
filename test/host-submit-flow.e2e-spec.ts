@@ -17,7 +17,6 @@ import { CaptureConfigService } from '../src/listings/capture-config.service';
 import { HostListingsController } from '../src/listings/host-listings.controller';
 import { HostListingsService } from '../src/listings/host-listings.service';
 import { RedisService } from '../src/redis/redis.service';
-import { VerificationService } from '../src/verification/verification.service';
 
 const MOHALI = { lat: 30.7046, lng: 76.7179 };
 const ROOMS = ['exterior', 'living', 'bedroom', 'kitchen', 'bath'];
@@ -33,7 +32,6 @@ describe('host listing submission, API only (Mohali pin)', () => {
   let redisStore: Map<string, string>;
   let rows: Row[];
   let captureConfig: { locationBypass: boolean };
-  let status: { identity: { status: string } };
   let profile: Row;
 
   beforeAll(() => {
@@ -49,8 +47,7 @@ describe('host listing submission, API only (Mohali pin)', () => {
     redisStore = new Map();
     rows = [];
     captureConfig = { locationBypass: true };
-    status = { identity: { status: 'verified' } };
-    profile = { id: 'u1', host_kind: 'individual', gst: null, selfie_uploaded_at: new Date() };
+    profile = { id: 'u1', host_kind: 'individual', gst: null, is_id_verified: true, banned_at: null };
 
     const listingsRepo = {
       findOne: async ({ where }: any) => rows.find((r) => Object.entries(where).every(([k, v]) => r[k] === v)) ?? null,
@@ -71,7 +68,6 @@ describe('host listing submission, API only (Mohali pin)', () => {
         { provide: getRepositoryToken(ListingEntity), useValue: listingsRepo },
         { provide: getRepositoryToken(UserEntity), useValue: { findOne: async () => profile } },
         { provide: getDataSourceToken(), useValue: { transaction: async (cb: any) => cb({ getRepository: () => listingsRepo }) } },
-        { provide: VerificationService, useValue: { getMyStatus: async () => status } },
         {
           provide: RedisService,
           useValue: {
@@ -202,21 +198,19 @@ describe('host listing submission, API only (Mohali pin)', () => {
     expect(rows).toHaveLength(1);
   });
 
-  it('the gate is identity + selfie only: either missing is a 403 with nothing stored or spent', async () => {
+  it('the gate is the in-house ID check: unverified or banned hosts get a 403 with nothing stored', async () => {
     const { photos, walk } = await capture();
     const submit = () => api().post(`${U}/submit-full`).set(auth).send(form(photos, walk));
 
-    status.identity.status = 'pending';
+    profile.is_id_verified = false;
     expect((await submit().expect(403)).body.message).toMatch(/Verify your identity/);
-    status.identity.status = 'verified';
+    profile.is_id_verified = true;
 
-    profile.selfie_uploaded_at = null;
-    expect((await submit().expect(403)).body.message).toMatch(/live selfie/);
-    profile.selfie_uploaded_at = new Date();
+    profile.banned_at = new Date();
+    expect((await submit().expect(403)).body.message).toMatch(/cannot list/);
+    profile.banned_at = null;
 
     expect(rows).toHaveLength(0);
-    await submit().expect(201);
-    expect(rows).toHaveLength(1);
   });
 
   it('bypass OFF: a Mohali pin cannot be captured or submitted', async () => {

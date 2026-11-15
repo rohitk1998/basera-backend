@@ -5,6 +5,8 @@ export type NotificationEvent =
   | 'booking.declined'
   | 'booking.confirmed'
   | 'booking.cancelled'
+  | 'booking.expired'
+  | 'booking.stay_confirm_prompt'
   | 'booking.completed'
   | 'booking.payment_held'
   | 'booking.payment_receipt'

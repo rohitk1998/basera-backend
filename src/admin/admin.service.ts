@@ -9,8 +9,6 @@ import {
   NotificationLogEntity,
   PaymentEntity,
   DisputeCaseEntity,
-  VerificationRequestEntity,
-  VerificationAuditLogEntity,
 } from '../entities';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ListingTranslationService } from '../listings/listing-translation.service';
@@ -59,8 +57,6 @@ const reviewSchema = z
 
 export type ReviewDecisionInput = z.infer<typeof reviewSchema>;
 
-const VERIFICATION_TYPES = ['identity', 'selfie'] as const;
-
 function resolveIsHost(p: { isHost?: unknown; role?: unknown }): boolean {
   if (typeof p.isHost === 'boolean') return p.isHost;
   return p.role === 'host';
@@ -72,25 +68,7 @@ function resolveIsAdmin(p: { role?: unknown }): boolean {
 
 type LayerStatus = 'passed' | 'submitted' | 'failed' | 'not_started';
 
-const REQUEST_STATUS_TO_LAYER: Record<string, LayerStatus> = {
-  verified: 'passed',
-  pending: 'submitted',
-  rejected: 'failed',
-};
-
 const LISTING_MEDIA_BUCKET = 'listing-media';
-
-function latestRequestByType(requests: VerificationRequestEntity[]): Map<string, VerificationRequestEntity> {
-  const latest = new Map<string, VerificationRequestEntity>();
-  for (const request of requests) {
-    if (!latest.has(request.verification_type)) latest.set(request.verification_type, request);
-  }
-  return latest;
-}
-
-function requestLayerStatus(request: VerificationRequestEntity | undefined): LayerStatus {
-  return request ? (REQUEST_STATUS_TO_LAYER[request.status] ?? 'not_started') : 'not_started';
-}
 
 function resolveTelemetryStatus(evidence: CaptureEvidence): LayerStatus {
   return evidence.status;
@@ -138,8 +116,6 @@ export class AdminService {
     @InjectRepository(NotificationLogEntity) private readonly notificationLog: Repository<NotificationLogEntity>,
     @InjectRepository(PaymentEntity) private readonly payments: Repository<PaymentEntity>,
     @InjectRepository(DisputeCaseEntity) private readonly disputeCases: Repository<DisputeCaseEntity>,
-    @InjectRepository(VerificationRequestEntity) private readonly verificationRequests: Repository<VerificationRequestEntity>,
-    @InjectRepository(VerificationAuditLogEntity) private readonly verificationAuditLog: Repository<VerificationAuditLogEntity>,
     private readonly notifications: NotificationsService,
     private readonly listingTranslations: ListingTranslationService,
     private readonly listingsService: ListingsService,
@@ -244,27 +220,6 @@ export class AdminService {
       : [];
     const profileMap = new Map(profiles.map((p) => [p.id, p]));
 
-    const hostRequests = hostIds.length > 0
-      ? await this.verificationRequests.find({
-          where: hostIds.map((id) => ({ user_id: id })),
-          select: {
-            id: true,
-            user_id: true,
-            verification_type: true,
-            status: true,
-            document_path: true,
-            submitted_at: true,
-          },
-          order: { submitted_at: 'DESC' },
-        })
-      : [];
-    const requestsByHost = new Map<string, VerificationRequestEntity[]>();
-    for (const request of hostRequests) {
-      const list = requestsByHost.get(request.user_id) ?? [];
-      list.push(request);
-      requestsByHost.set(request.user_id, list);
-    }
-
     const properties = rows.map((row) => {
       const draft = (row.draft_data as any) || {};
       const propStep = draft.property_details || draft.property || draft.basics || {};
@@ -273,13 +228,7 @@ export class AdminService {
       const mediaStep = draft.media || {};
 
       const profile = profileMap.get(row.host_id) || ({} as Partial<UserEntity>);
-      const requests = requestsByHost.get(row.host_id) ?? [];
-      const latestRequests = latestRequestByType(requests);
       const layerStatus = resolveLayerStatuses(row);
-      const verificationCheck = (type: string) => {
-        const request = latestRequests.get(type);
-        return { status: requestLayerStatus(request), requestId: request?.id ?? null, hasDocument: !!request?.document_path };
-      };
 
       const title =
         propStep.title ||
@@ -352,8 +301,8 @@ export class AdminService {
           },
         },
         verification: {
-          identity: verificationCheck('identity'),
-          selfie: verificationCheck('selfie'),
+          identity: { status: profile.is_id_verified ? 'passed' : 'not_started', requestId: null, hasDocument: false },
+          selfie: { status: profile.selfie_uploaded_at ? 'passed' : 'not_started', requestId: null, hasDocument: false },
         },
         reviewNotes: row.review_notes || undefined,
         photos,
@@ -595,21 +544,6 @@ export class AdminService {
 
     const countMap = new Map(listingCountRows.map((r) => [r.host_id, Number(r.count)]));
 
-    const identityRows = hostIds.length > 0
-      ? await this.verificationRequests.find({
-          where: { user_id: In(hostIds), verification_type: 'identity' },
-          select: { id: true, user_id: true, status: true, submitted_at: true },
-          order: { submitted_at: 'DESC' },
-        })
-      : [];
-    const identityVerified = new Set<string>();
-    const seenIdentity = new Set<string>();
-    for (const r of identityRows) {
-      if (seenIdentity.has(r.user_id)) continue;
-      seenIdentity.add(r.user_id);
-      if (r.status === 'verified') identityVerified.add(r.user_id);
-    }
-
     let users = profiles.map((p) => {
       const isHost = resolveIsHost(p);
       const isAdmin = resolveIsAdmin(p);
@@ -627,7 +561,7 @@ export class AdminService {
         avatarUrl: p.avatar_url || undefined,
         status: 'active' as const,
         propertiesCount: countMap.get(p.id) || 0,
-        kycStatus: (p.selfie_uploaded_at && identityVerified.has(p.id) ? 'verified' : 'not_submitted') as
+        kycStatus: (p.selfie_uploaded_at && p.is_id_verified ? 'verified' : 'not_submitted') as
           | 'verified'
           | 'in_review'
           | 'not_submitted',
@@ -760,144 +694,5 @@ export class AdminService {
 
   async resolveAppeal(bookingId: string, adminUserId: string, amountToGuest: number, message: string | undefined) {
     return this.bookingsService.resolveAppeal(adminUserId, bookingId, amountToGuest, message);
-  }
-
-  async getVerificationRequestDetail(id: string) {
-    const row = await this.verificationRequests.findOne({ where: { id } });
-    if (!row) {
-      throw new NotFoundException('Verification request not found');
-    }
-
-    const previousRows = await this.verificationRequests.find({
-      where: { user_id: row.user_id, verification_type: row.verification_type },
-      order: { submitted_at: 'DESC' },
-    });
-    const previousAttempts = previousRows
-      .filter((r) => r.id !== row.id)
-      .map((r) => ({
-        id: r.id,
-        status: r.status,
-        rejectionReason: r.rejection_reason,
-        submittedAt: r.submitted_at,
-        reviewedAt: r.reviewed_at,
-      }));
-
-    const auditLogRows = await this.verificationAuditLog.find({
-      where: { verification_request_id: id },
-      order: { created_at: 'DESC' },
-    });
-
-    const reviewerIds = [row.reviewed_by, ...auditLogRows.map((a) => a.admin_id)].filter(
-      (v): v is string => !!v,
-    );
-    const profileIds = Array.from(new Set([row.user_id, ...reviewerIds]));
-    const profiles = await this.profiles.find({
-      where: profileIds.map((pid) => ({ id: pid })),
-      select: {
-        id: true,
-        full_name: true,
-        phone: true,
-      },
-    });
-    const profileById = new Map(profiles.map((p) => [p.id, p]));
-    const submitterProfile = profileById.get(row.user_id);
-
-    let documentUrl: string | null = null;
-    if (row.document_path) {
-      documentUrl = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path, 300);
-    }
-    let documentBackUrl: string | null = null;
-    if (row.document_path_back) {
-      documentBackUrl = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path_back, 300);
-    }
-
-    const auditLog = auditLogRows.map((a) => ({
-      id: a.id,
-      action: a.action,
-      previousStatus: a.previous_status,
-      newStatus: a.new_status,
-      rejectionReason: a.rejection_reason,
-      adminId: a.admin_id,
-      adminName: a.admin_id ? (profileById.get(a.admin_id)?.full_name ?? null) : null,
-      createdAt: a.created_at,
-    }));
-
-    return {
-      id: row.id,
-      userId: row.user_id,
-      userName: submitterProfile?.full_name ?? 'Basera user',
-      userPhone: submitterProfile?.phone ?? '',
-      verificationType: row.verification_type,
-      documentSubtype: row.document_subtype,
-      status: row.status,
-      submittedAt: row.submitted_at,
-      reviewedAt: row.reviewed_at,
-      reviewedBy: row.reviewed_by ? (profileById.get(row.reviewed_by)?.full_name ?? null) : null,
-      rejectionReason: row.rejection_reason,
-      analysisResult: row.analysis_result,
-      documentUrl,
-      documentBackUrl,
-      previousAttempts,
-      auditLog,
-    };
-  }
-
-  async getVerificationDocumentUrl(id: string) {
-    const row = await this.verificationRequests.findOne({ where: { id }, select: { id: true, document_path: true } });
-    if (!row) {
-      throw new NotFoundException('Verification request not found');
-    }
-    if (!row.document_path) {
-      throw new NotFoundException('This verification request has no document');
-    }
-
-    const url = await this.storage.createSignedDownloadUrl('verification-documents', row.document_path, 300);
-    return { url };
-  }
-
-  async getUserVerificationSummary(userId: string) {
-    const rows = await this.verificationRequests.find({
-      where: { user_id: userId },
-      order: { submitted_at: 'DESC' },
-    });
-
-    const reviewerIds = Array.from(new Set(rows.map((r) => r.reviewed_by).filter((id): id is string => !!id)));
-    const reviewers = reviewerIds.length
-      ? await this.profiles.find({ where: reviewerIds.map((id) => ({ id })), select: { id: true, full_name: true } })
-      : [];
-    const reviewerNameById = new Map(reviewers.map((p) => [p.id, p.full_name ?? 'Admin']));
-
-    const toSummaryRow = (row: VerificationRequestEntity) => {
-      const analysis = row.analysis_result as { errors?: unknown[] } | null;
-      return {
-        id: row.id,
-        documentSubtype: row.document_subtype,
-        status: row.status,
-        submittedAt: row.submitted_at,
-        reviewedAt: row.reviewed_at,
-        reviewedBy: row.reviewed_by ? (reviewerNameById.get(row.reviewed_by) ?? 'Admin') : null,
-        rejectionReason: row.rejection_reason,
-        hasAnalysisErrors: Array.isArray(analysis?.errors) && analysis!.errors!.length > 0,
-      };
-    };
-
-    const byType = new Map<string, VerificationRequestEntity[]>();
-    for (const row of rows) {
-      const list = byType.get(row.verification_type) ?? [];
-      list.push(row);
-      byType.set(row.verification_type, list);
-    }
-
-    const types = VERIFICATION_TYPES.map((type) => {
-      const typeRows = byType.get(type) ?? [];
-      const [current, ...previous] = typeRows;
-      return {
-        type,
-        current: current ? toSummaryRow(current) : null,
-        previousAttempts: previous.map(toSummaryRow),
-      };
-    });
-
-    return { userId, types };
   }
 }

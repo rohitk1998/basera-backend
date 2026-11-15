@@ -1,7 +1,7 @@
 const TIMEOUT_MS = 15_000;
 const RETRIES = 3;
 export const USER_AGENT =
-  'BaseraBot/1.0 (https://basera.in; attractions import)';
+  'BaseraBot/1.0 (https://www.rhenbasera.online; attractions import)';
 
 export class SourceError extends Error {
   constructor(

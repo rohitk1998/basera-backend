@@ -205,6 +205,13 @@ export class AuthService {
       return { isNewUser: true, email };
     }
 
+    // Passing the OTP just proved the inbox: that is what lets an international guest contact hosts.
+    if (!existingProfile.email_verified_at) {
+      const verifiedAt = new Date();
+      await this.profiles.update({ id: existingProfile.id }, { email_verified_at: verifiedAt });
+      existingProfile.email_verified_at = verifiedAt;
+    }
+
     return { isNewUser: !existingProfile.full_name, profile: existingProfile };
   }
 
@@ -273,6 +280,7 @@ export class AuthService {
         await this.profiles.insert({
           id,
           email,
+          email_verified_at: new Date(),
           full_name: dto.name,
           languages: dto.languages,
           isHost: dto.isHost ?? false,

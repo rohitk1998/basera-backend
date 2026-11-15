@@ -85,7 +85,7 @@ class TestController {
 
   @Post('conflict')
   conflict() {
-    throw new ConflictException('Your PAN is already verified.');
+    throw new ConflictException('Your identity is already verified.');
   }
   @Post('bad')
   bad() {
@@ -179,7 +179,7 @@ describe('response contract (HTTP)', () => {
 
     it('409 conflict: real message in both message and error, not "Conflict"', async () => {
       const res = await http().post('/t/conflict').expect(409);
-      shape(res.body, 409, 'Your PAN is already verified.');
+      shape(res.body, 409, 'Your identity is already verified.');
     });
 
     it('400 bad request: real message in both fields, not "Bad Request"', async () => {

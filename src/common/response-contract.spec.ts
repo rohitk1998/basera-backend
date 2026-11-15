@@ -12,7 +12,8 @@ import { PaymentsController } from '../payments/payments.controller';
 import { ReviewsController } from '../reviews/reviews.controller';
 import { StorageController } from '../storage/storage.controller';
 import { UserController } from '../user/user.controller';
-import { VerificationController } from '../verification/verification.controller';
+import { HostVerificationController } from '../host-verification/host-verification.controller';
+import { HostVerificationAdminController } from '../host-verification/host-verification-admin.controller';
 import { RESPONSE_MESSAGE } from './decorators/response-message.decorator';
 
 const CONTROLLERS = [
@@ -28,7 +29,8 @@ const CONTROLLERS = [
   ReviewsController,
   StorageController,
   UserController,
-  VerificationController,
+  HostVerificationController,
+  HostVerificationAdminController,
 ];
 
 const METHOD_NAME = { [RequestMethod.POST]: 'POST', [RequestMethod.PUT]: 'PUT', [RequestMethod.PATCH]: 'PATCH', [RequestMethod.DELETE]: 'DELETE' } as Record<number, string>;

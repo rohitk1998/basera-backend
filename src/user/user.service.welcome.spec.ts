@@ -5,7 +5,7 @@ const SQL = 'update users set welcome_seen_at = now() where id = $1 and welcome_
 
 function makeService(query: jest.Mock) {
   const profiles = { manager: { query } };
-  return new UserService(profiles as never, {} as never, {} as never);
+  return new UserService(profiles as never, {} as never);
 }
 
 describe('UserService.markWelcomeSeen', () => {
@@ -49,8 +49,7 @@ describe('UserService.getProfile welcomeSeenAt', () => {
 
   function make(query: jest.Mock) {
     const profiles = { findOne: jest.fn().mockResolvedValue(row), manager: { query } };
-    const verifs = { findOne: jest.fn().mockResolvedValue(null) };
-    return new UserService(profiles as never, verifs as never, {} as never);
+    return new UserService(profiles as never, {} as never);
   }
 
   it('returns explicit null when never seen', async () => {

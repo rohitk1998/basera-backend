@@ -16,7 +16,6 @@ import { ListingEntity, UserEntity } from '../src/entities';
 import { HostListingsController } from '../src/listings/host-listings.controller';
 import { HostListingsService } from '../src/listings/host-listings.service';
 import { RedisService } from '../src/redis/redis.service';
-import { VerificationService } from '../src/verification/verification.service';
 
 const PIN = { lat: 32.219, lng: 76.3234 };
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'walkthrough-e2e-'));
@@ -82,7 +81,6 @@ describe('POST /api/host/listings/media/walkthrough', () => {
         { provide: getRepositoryToken(ListingEntity), useValue: {} },
         { provide: getRepositoryToken(UserEntity), useValue: {} },
         { provide: getDataSourceToken(), useValue: {} },
-        { provide: VerificationService, useValue: {} },
         { provide: RedisService, useValue: {
             set: async (key: string, value: string) => {
               if (redisFailures > 0) {
@@ -366,7 +364,6 @@ describe('POST /api/host/listings/media/photos', () => {
         { provide: getRepositoryToken(ListingEntity), useValue: {} },
         { provide: getRepositoryToken(UserEntity), useValue: {} },
         { provide: getDataSourceToken(), useValue: {} },
-        { provide: VerificationService, useValue: {} },
         {
           provide: RedisService,
           useValue: {

@@ -41,6 +41,24 @@ export class UserEntity {
   @Column({ type: 'timestamptz', nullable: true })
   selfie_uploaded_at: Date | null;
 
+  @Column({ type: 'timestamptz', nullable: true })
+  email_verified_at: Date | null;
+
+  @Column({ default: false })
+  is_id_verified: boolean;
+
+  @Column({ type: 'text', nullable: true })
+  id_number_salted_hash: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  id_doc_type: string | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  id_verified_at: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  banned_at: Date | null;
+
   @Column({ default: true })
   notif_email: boolean;
 

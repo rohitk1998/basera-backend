@@ -16,6 +16,16 @@ export class BookingReleaseScheduler {
       this.logger.error('[handleExpiredHolds] failed', err as Error);
     }
     try {
+      await this.bookingsService.expireStaleHolds();
+    } catch (err) {
+      this.logger.error('[expireStaleHolds] failed', err as Error);
+    }
+    try {
+      await this.bookingsService.sendStayConfirmationPrompts();
+    } catch (err) {
+      this.logger.error('[sendStayConfirmationPrompts] failed', err as Error);
+    }
+    try {
       await this.bookingsService.escalateStaleNegotiations();
     } catch (err) {
       this.logger.error('[escalateStaleNegotiations] failed', err as Error);

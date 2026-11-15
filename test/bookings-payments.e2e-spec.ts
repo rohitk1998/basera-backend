@@ -28,7 +28,6 @@ import {
   PaymentEntity,
   ReviewEntity,
   UserEntity,
-  VerificationRequestEntity,
 } from '../src/entities';
 
 const SECRET = 'test-jwt-secret';
@@ -95,7 +94,6 @@ function buildStore() {
   const events = makeRepo();
   const listings = makeRepo();
   const profiles = makeRepo();
-  const verifications = makeRepo();
   const reviews = makeRepo();
   const cases = makeRepo([], { idPrefix: 'case' });
   const caseEvents = makeRepo();
@@ -121,7 +119,6 @@ function buildStore() {
   const repoByEntity = new Map<any, any>([
     [BookingEntity, bookings],
     [BookingEventEntity, events],
-    [VerificationRequestEntity, verifications],
     [DisputeCaseEntity, cases],
     [DisputeEventEntity, caseEvents],
   ]);
@@ -189,11 +186,10 @@ function buildStore() {
   };
 
   listings.seed({ id: LISTING_ID, host_id: HOST, status: 'live', draft_data: { property_details: { title: 'Pine Cottage', dailyBaseRate: 1000, maxGuests: 4, minDays: 2 } } });
-  profiles.seed({ id: GUEST, full_name: 'Gita Guest', phone: '+919876543210', selfie_uploaded_at: new Date() });
-  verifications.seed({ user_id: GUEST, verification_type: 'identity', status: 'verified', submitted_at: new Date() });
+  profiles.seed({ id: GUEST, full_name: 'Gita Guest', phone: '+919876543210', email_verified_at: null, banned_at: null });
   profiles.seed({ id: HOST, full_name: 'Hari Host' });
 
-  return { bookings, events, listings, profiles, verifications, reviews, cases, caseEvents, payments, dataSource, supabase, upload, notify, orders, cashfree };
+  return { bookings, events, listings, profiles, reviews, cases, caseEvents, payments, dataSource, supabase, upload, notify, orders, cashfree };
 }
 
 type Store = ReturnType<typeof buildStore>;
@@ -334,7 +330,7 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
   });
 
   describe('POST /api/bookings (create)', () => {
-    const body = (over: Record<string, any> = {}) => ({ listingId: LISTING_ID, moveIn: day(10), moveOut: day(15), days: 5, paymentMethod: 'upi', ...over });
+    const body = (over: Record<string, any> = {}) => ({ listingId: LISTING_ID, moveIn: day(10), moveOut: day(15), days: 5, paymentMethod: 'upi', idDisclaimerAccepted: true, ...over });
     const create = (b: any, user = GUEST) => api().post('/api/bookings').set('Cookie', as(user)).send(b);
 
     it('201: creates a requested booking, prices it server-side, notifies host', async () => {
@@ -440,34 +436,46 @@ describe('Bookings + Payments (HTTP, real controllers/services/AuthGuard, in-mem
       expect(res.body.message).not.toMatch(/secret detail/);
     });
 
-    it('201: books with a verified identity and a live selfie, with no bank or PAN on file', async () => {
-      const res = await create(body());
+    const stay = (over: Record<string, any> = {}) => body({ moveIn: day(10), moveOut: day(18), days: 8, ...over });
+    const guest = () => s.profiles.rows.find((p) => p.id === GUEST)!;
+
+    it('201: a phone-verified guest books with no ID on file, and the disclaimer + 48h hold are stored', async () => {
+      const res = await create(stay());
       expect(res.status).toBe(201);
+      const row = s.bookings.rows[0];
+      expect(row.id_disclaimer_accepted_at).toBeInstanceOf(Date);
+      expect(row.id_disclaimer_version).toBe('hp-id-v1');
+      const hours = (row.hold_expires_at.getTime() - Date.now()) / 3_600_000;
+      expect(hours).toBeGreaterThan(47);
+      expect(hours).toBeLessThanOrEqual(48);
     });
 
-    it('403 when the guest has not taken a live selfie', async () => {
-      Object.assign(s.profiles.rows.find((p) => p.id === GUEST)!, { selfie_uploaded_at: null });
-      const res = await create(body());
-      expectError(res, 403, /live selfie/i);
+    it('201: an international guest with a verified email and no phone can book', async () => {
+      Object.assign(guest(), { phone: null, email_verified_at: new Date() });
+      expect((await create(stay())).status).toBe(201);
     });
 
-    it.each(['pending', 'rejected'])('403 when the latest identity document is %s', async (status) => {
-      s.verifications.rows.length = 0;
-      s.verifications.seed({ user_id: GUEST, verification_type: 'identity', status, submitted_at: new Date() });
-      const res = await create(body());
-      expectError(res, 403, /identity/i);
+    it('403 when the guest verified neither a phone nor an email', async () => {
+      Object.assign(guest(), { phone: null, email_verified_at: null });
+      expectError(await create(stay()), 403, /Verify your mobile number or email/);
+      expect(s.bookings.rows).toHaveLength(0);
     });
 
-    it('403 when no identity document was ever submitted', async () => {
-      s.verifications.rows.length = 0;
-      const res = await create(body());
-      expectError(res, 403, /identity/i);
+    it('403 for a banned guest', async () => {
+      Object.assign(guest(), { banned_at: new Date() });
+      expectError(await create(stay()), 403, /cannot contact hosts/);
     });
 
-    it('uses the NEWEST identity request (an older verified one does not count after a rejected resubmission)', async () => {
-      s.verifications.seed({ user_id: GUEST, verification_type: 'identity', status: 'rejected', submitted_at: new Date(Date.now() + 60_000) });
-      const res = await create(body());
-      expectError(res, 403, /identity/i);
+    it.each([false, undefined])('400 unless the ID-at-check-in disclaimer is accepted (%s)', async (accepted) => {
+      expectError(await create(stay({ idDisclaimerAccepted: accepted })), 400);
+      expect(s.bookings.rows).toHaveLength(0);
+    });
+
+    it('409 on a second request while one is still waiting for a host, even on another listing', async () => {
+      expect((await create(stay())).status).toBe(201);
+      s.listings.seed({ id: '22222222-2222-4222-8222-222222222222', host_id: HOST, status: 'live', draft_data: { property_details: { title: 'Other', dailyBaseRate: 1000, maxGuests: 4, minDays: 2 } } });
+      expectError(await create(stay({ listingId: '22222222-2222-4222-8222-222222222222', moveIn: day(30), moveOut: day(38) })), 409, /already have a pending request/);
+      expect(s.bookings.rows).toHaveLength(1);
     });
   });
 

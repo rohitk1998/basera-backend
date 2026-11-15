@@ -23,6 +23,7 @@ export type BookingStatus =
   | 'requested'
   | 'confirmed'
   | 'checked_in'
+  | 'checked_out'
   | 'disputed'
   | 'completed'
   | 'declined'
@@ -30,6 +31,14 @@ export type BookingStatus =
   | 'expired';
 
 export type PaymentMethod = 'upi' | 'cash';
+
+/** Shortest stay Basera accepts, in nights. Hosts may set a higher per-listing minimum, never a lower one. */
+export const MIN_STAY_NIGHTS = 7;
+
+/** The minimum a guest must book at a listing: the host's own minimum, floored at MIN_STAY_NIGHTS. */
+export function effectiveMinStay(hostMinDays?: number | null): number {
+  return Math.max(MIN_STAY_NIGHTS, typeof hostMinDays === 'number' && Number.isFinite(hostMinDays) ? hostMinDays : 0);
+}
 
 export type AgreedTerms = {
   totalRent: number;

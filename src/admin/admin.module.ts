@@ -7,8 +7,6 @@ import {
   NotificationLogEntity,
   PaymentEntity,
   DisputeCaseEntity,
-  VerificationRequestEntity,
-  VerificationAuditLogEntity,
 } from '../entities';
 import { AuthModule } from '../auth/auth.module';
 import { NotificationsModule } from '../notifications/notifications.module';
@@ -27,8 +25,6 @@ import { AdminService } from './admin.service';
       NotificationLogEntity,
       PaymentEntity,
           DisputeCaseEntity,
-      VerificationRequestEntity,
-      VerificationAuditLogEntity,
     ]),
     AuthModule,
     NotificationsModule,

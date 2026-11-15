@@ -2,7 +2,7 @@ import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nest
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository, SelectQueryBuilder } from 'typeorm';
 import { ListingEntity, UserEntity, BookingEntity } from '../entities';
-import { agreeTerms } from '../common/domain';
+import { MIN_STAY_NIGHTS, agreeTerms } from '../common/domain';
 import { rowToListing } from './listing-mapper';
 import { Listing, Town } from './listing.types';
 import { HP_DISTRICTS, HP_LOCATIONS, tehsilsOf } from './hp-locations';
@@ -17,7 +17,6 @@ import { Semaphore, withTimeout, withTransientRetry } from './db-resilience';
 export type ListingHostInfo = {
   id: string;
   name: string;
-  phone: string;
   avatarUrl?: string;
   joinedYear: number;
   trustScore: number | null;
@@ -260,7 +259,7 @@ export class ListingsService {
 
       if (params.moveOut) {
 
-        qb.andWhere(`(${pd('minDays')})::int <= (:moveOut::date - :moveIn::date)`, {
+        qb.andWhere(`GREATEST(${MIN_STAY_NIGHTS}, COALESCE((${pd('minDays')})::int, 0)) <= (:moveOut::date - :moveIn::date)`, {
           moveIn: params.moveIn,
           moveOut: params.moveOut,
         });
@@ -552,7 +551,6 @@ export class ListingsService {
         id: row.host_id,
 
         name: hostProfile?.full_name || 'Host',
-        phone: hostProfile?.phone || '',
         avatarUrl: hostProfile?.avatar_url || undefined,
         joinedYear: hostProfile?.created_at
           ? new Date(hostProfile.created_at).getFullYear()

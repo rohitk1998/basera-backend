@@ -26,7 +26,7 @@ import { AttractionsImportService } from '../src/attractions/attractions-import.
 import { AttractionImagesService } from '../src/attractions/attraction-images.service';
 import { RedisService } from '../src/redis/redis.service';
 import { AttractionEntity } from '../src/entities/attraction.entity';
-import { EmailOtpEntity, UserEntity, VerificationRequestEntity } from '../src/entities';
+import { EmailOtpEntity, UserEntity } from '../src/entities';
 
 const JWT_SECRET = 'test-secret-for-account-e2e';
 const REFRESH_COOKIE = 'basera_refresh_token';
@@ -47,6 +47,7 @@ function makeProfiles() {
   const repo = {
     insertError: null as any,
     updateError: null as any,
+    manager: { query: async () => [] as unknown[] },
     findOne: async ({ where }: any) => {
       const r = [...rows.values()].find((x) => matches(x, where));
       return r ? { ...r } : null;
@@ -70,20 +71,6 @@ function makeProfiles() {
   };
   const seed = (p: any) => (rows.set(p.id, { full_name: 'Asha Rao', email: `${p.id}@x.in`, role: null, languages: ['en'], isHost: false, created_at: new Date(Date.now() - 60 * DAY), refresh_token_hash: null, refresh_token_expires_at: null, fcm_tokens: [], ...p }), rows.get(p.id));
   return { rows, repo, seed };
-}
-
-function makeVerifications() {
-  const rows: any[] = [];
-  return {
-    rows,
-    repo: {
-      findOne: async ({ where, order }: any) => {
-        const hits = rows.filter((r) => Object.entries(where ?? {}).every(([k, v]) => r[k] === v));
-        if (order?.submitted_at === 'DESC') hits.sort((a, b) => b.submitted_at - a.submitted_at);
-        return hits[0] ?? null;
-      },
-    },
-  };
 }
 
 function makeOtps() {
@@ -162,7 +149,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
   let app: INestApplication;
   let P: ReturnType<typeof makeProfiles>;
   let O: ReturnType<typeof makeOtps>;
-  let V: ReturnType<typeof makeVerifications>;
   let A: ReturnType<typeof makeAttractions>;
   let sentCodes: Array<{ email: string; code: string }>;
   let smtpFails: boolean;
@@ -177,7 +163,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
   beforeEach(async () => {
     P = makeProfiles();
     O = makeOtps();
-    V = makeVerifications();
     A = makeAttractions();
     sentCodes = [];
     smtpFails = false;
@@ -250,7 +235,6 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         { provide: AttractionImagesService, useValue: { copyFromCommons: async () => commonsResult } },
         { provide: getRepositoryToken(UserEntity), useValue: P.repo },
         { provide: getRepositoryToken(EmailOtpEntity), useValue: O.repo },
-        { provide: getRepositoryToken(VerificationRequestEntity), useValue: V.repo },
         { provide: getRepositoryToken(AttractionEntity), useValue: A.repo },
         { provide: ConfigService, useValue: { get: (k: string) => ({ SUPABASE_JWT_SECRET: JWT_SECRET, YOUTUBE_API_KEY: youtubeKey })[k] } },
       ],
@@ -705,25 +689,12 @@ describe('Account, user and attractions (HTTP, real controllers + services + gua
         expect(res.body.editUnlocksAt).toBe(new Date(created.getTime() + 14 * DAY).toISOString());
         expect(res.body.profile.password_hash).toBeUndefined();
       });
-      it('identity_verified is false with no identity request, true once the newest one is verified', async () => {
+      it('identity_verified mirrors the is_id_verified flag set when an admin approves the host', async () => {
         user('u1');
         const get = async () => (await http().get('/api/user/profile').set('Cookie', as('u1')).expect(200)).body.profile.identity_verified;
-        expect(await get()).toBe(false);
-        V.rows.push({ user_id: 'u1', verification_type: 'identity', status: 'pending', submitted_at: new Date(1000) });
-        expect(await get()).toBe(false);
-        V.rows.push({ user_id: 'u1', verification_type: 'identity', status: 'verified', submitted_at: new Date(2000) });
+        expect(await get()).toBeFalsy();
+        user('u1', { is_id_verified: true });
         expect(await get()).toBe(true);
-      });
-      it('identity_verified follows the newest identity row, ignores other types and other users', async () => {
-        user('u1');
-        V.rows.push({ user_id: 'u1', verification_type: 'identity', status: 'verified', submitted_at: new Date(1000) });
-        V.rows.push({ user_id: 'u1', verification_type: 'identity', status: 'rejected', submitted_at: new Date(2000) });
-        const get = async () => (await http().get('/api/user/profile').set('Cookie', as('u1')).expect(200)).body.profile.identity_verified;
-        expect(await get()).toBe(false);
-        V.rows.length = 0;
-        V.rows.push({ user_id: 'u1', verification_type: 'selfie', status: 'verified', submitted_at: new Date(1000) });
-        V.rows.push({ user_id: 'someone-else', verification_type: 'identity', status: 'verified', submitted_at: new Date(1000) });
-        expect(await get()).toBe(false);
       });
       it('falls back to legacy role=host and flags admins', async () => {
         user('h', { isHost: undefined, role: 'host' });

@@ -24,8 +24,8 @@ export class ReviewsService {
       throw new NotFoundException('Booking not found');
     }
 
-    if (booking.status !== 'completed' && booking.status !== 'checked_out') {
-      throw new BadRequestException('You can only review completed or checked out stays');
+    if (!booking.stay_confirmed_at) {
+      throw new BadRequestException('Reviews unlock once both you and the host have confirmed the stay.');
     }
 
     if (booking.guest_id !== userId && booking.host_id !== userId) {

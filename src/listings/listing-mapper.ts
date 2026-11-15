@@ -1,4 +1,5 @@
 import { ListingEntity } from '../entities';
+import { effectiveMinStay } from '../common/domain';
 import { Amenity, AmenityGroup, CategoryId, Listing, Photo, RoomId } from './listing.types';
 import { toFullAddress } from './listing-schema';
 import { isMeasuredYes } from './wifi-test.util';
@@ -105,8 +106,8 @@ export function rowToListing(row: ListingEntity): Listing {
     monthlyDiscountPct: propStep.monthlyDiscountPct ?? 40,
     beds: propStep.beds || (propStep.bedrooms ? `${propStep.bedrooms} BHK` : '1 room · private bath'),
     propertyType: propStep.propertyType || 'cottage',
-    term: propStep.minDays ? `min ${propStep.minDays} days` : 'min 1 day',
-    minDays: propStep.minDays || (propStep.minMonths ? propStep.minMonths * 30 : 1),
+    term: `min ${effectiveMinStay(propStep.minDays || (propStep.minMonths ? propStep.minMonths * 30 : 0))} days`,
+    minDays: effectiveMinStay(propStep.minDays || (propStep.minMonths ? propStep.minMonths * 30 : 0)),
     verified: row.status === 'live',
     trust: draft.trustScore ?? null,
     rating: null,

@@ -85,4 +85,25 @@ export class BookingEntity {
 
   @Column({ type: 'timestamptz', default: () => 'now()' })
   updated_at: Date;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  id_disclaimer_accepted_at: Date | null;
+
+  @Column({ type: 'text', nullable: true })
+  id_disclaimer_version: string | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  hold_expires_at: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  guest_confirmed_stay_at: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  host_confirmed_stay_at: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  stay_confirmed_at: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  stay_prompt_sent_at: Date | null;
 }

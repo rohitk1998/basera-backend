@@ -98,7 +98,7 @@ describe('ListingsService.findLive', () => {
     expect(where.length).toBeGreaterThan(0);
     for (const w of where) expect(w).not.toMatch(/->>'\w+'::/);
     expect(where.some((w) => w.includes(")::date <= :moveIn"))).toBe(true);
-    expect(where.some((w) => w.includes(")::int <= (:moveOut::date - :moveIn::date)"))).toBe(true);
+    expect(where.some((w) => w.includes(", 0)) <= (:moveOut::date - :moveIn::date)"))).toBe(true);
   });
 
   it('ignores an invalid district and category (they never reach the query)', async () => {

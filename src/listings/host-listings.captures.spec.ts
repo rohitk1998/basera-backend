@@ -91,12 +91,12 @@ describe('HostListingsService: camera-captured media at submit', () => {
         id: 'u1',
         host_kind: 'individual',
         gst: '',
-        selfie_uploaded_at: new Date(),
+        is_id_verified: true,
+        banned_at: null,
       }),
     };
-    const verification = { getMyStatus: async () => ({ identity: { status: 'verified' } }) };
     const dataSource = { transaction: async (fn: any) => fn({ getRepository: () => listings }) };
-    service = new HostListingsService(listings as any, profiles as any, {} as any, redisSvc as any, verification as any, dataSource as any);
+    service = new HostListingsService(listings as any, profiles as any, {} as any, redisSvc as any, dataSource as any);
   });
   afterEach(async () => service.onModuleDestroy());
 

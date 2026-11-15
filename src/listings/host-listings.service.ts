@@ -20,11 +20,10 @@ import * as path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { ExifTool, type Tags } from 'exiftool-vendored';
 import { ListingEntity, UserEntity } from '../entities';
-import { assertKycVerified } from '../user/verification-gate.util';
+import { assertHostIdVerified } from '../host-verification/host-id-gate.util';
 import { CaptureConfigService } from './capture-config.service';
 import { SupabaseProvider } from '../auth/supabase.provider';
 import { RedisService } from '../redis/redis.service';
-import { VerificationService } from '../verification/verification.service';
 import { SEARCH_CACHE_VERSION_KEY } from './listings.service';
 import {
   assessWalkthroughMetadata,
@@ -190,7 +189,6 @@ export class HostListingsService implements OnModuleDestroy {
     private readonly profiles: Repository<UserEntity>,
     private readonly supabase: SupabaseProvider,
     private readonly redis: RedisService,
-    private readonly verification: VerificationService,
     @InjectDataSource()
     private readonly dataSource: DataSource,
 
@@ -1040,7 +1038,7 @@ export class HostListingsService implements OnModuleDestroy {
     if (!profile) {
       throw new NotFoundException('Profile not found');
     }
-    assertKycVerified(profile, await this.verification.getMyStatus(userId));
+    assertHostIdVerified(profile);
 
     const parsed = fullOnboardingSchema.safeParse(upgradeLegacyLocation(body));
     if (!parsed.success) {
@@ -1242,8 +1240,7 @@ export class HostListingsService implements OnModuleDestroy {
       throw new NotFoundException('Profile not found');
     }
 
-    const verificationStatus = await this.verification.getMyStatus(userId);
-    assertKycVerified(profile, verificationStatus);
+    assertHostIdVerified(profile);
 
     const parsed = fullOnboardingSchema.safeParse(upgradeLegacyLocation(body));
     if (!parsed.success) {

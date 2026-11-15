@@ -18,8 +18,11 @@ import { StorageModule } from './storage/storage.module';
 import { UserModule } from './user/user.module';
 import { ConversationsModule } from './conversations/conversations.module';
 import { ReviewsModule } from './reviews/reviews.module';
-import { VerificationModule } from './verification/verification.module';
+import { HostVerificationModule } from './host-verification/host-verification.module';
 import { AttractionsModule } from './attractions/attractions.module';
+import { EventsModule } from './events/events.module';
+import { StoriesModule } from './stories/stories.module';
+import { SocialModule } from './social/social.module';
 
 @Module({
   imports: [
@@ -45,6 +48,7 @@ import { AttractionsModule } from './attractions/attractions.module';
           keepAlive: true,
           keepAliveInitialDelayMillis: 10_000,
         },
+        logging: ['query', 'error']
       }),
     }),
     AuthModule,
@@ -57,8 +61,11 @@ import { AttractionsModule } from './attractions/attractions.module';
     UserModule,
     ConversationsModule,
     ReviewsModule,
-    VerificationModule,
+    HostVerificationModule,
     AttractionsModule,
+    EventsModule,
+    StoriesModule,
+    SocialModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
