@@ -4,6 +4,8 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/types';
 import { DisputeOfferDto } from '../bookings/dto/dispute-offer.dto';
 import { AdminService } from './admin.service';
+import { BadRequestException } from '@nestjs/common';
+import { parseActivityRange } from './activity.util';
 import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
 @Controller('api/admin')
@@ -37,6 +39,13 @@ export class AdminController {
   @Patch('properties/:id')
   reviewProperty(@Param('id') id: string, @CurrentUser() admin: AuthUser, @Body() body: unknown) {
     return this.adminService.reviewProperty(id, admin.userId, body);
+  }
+
+  @Get('activity')
+  getActivity(@Query('range') range?: string) {
+    const parsed = parseActivityRange(range ?? '7d');
+    if (!parsed) throw new BadRequestException('range must be one of 7d, 30d, 90d, 1y');
+    return this.adminService.getActivity(parsed);
   }
 
   @Get('stats')

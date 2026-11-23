@@ -7,7 +7,7 @@ import {
   fetchCommonsImage,
 } from './external-sources';
 
-const BUCKET = 'basera_assets';
+const BUCKET = 'RhenBasera_assets';
 const PREFIX = 'attractions';
 const EXT: Record<string, string> = {
   'image/jpeg': 'jpg',

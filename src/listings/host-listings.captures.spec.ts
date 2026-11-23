@@ -43,7 +43,7 @@ function body(over: Record<string, unknown> = {}) {
     weeklyDiscountPct: 10,
     monthlyDiscountPct: 20,
     minDays: 7,
-    availableFrom: '2026-10-15',
+    availableFrom: new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10),
     billsIncluded: 'all',
     checkIn: '12:00 pm',
     checkOut: '11:00 am',

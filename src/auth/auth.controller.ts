@@ -39,7 +39,7 @@ const WEEK_SECONDS = 60 * 60 * 24 * 7;
 const YEAR_SECONDS = 60 * 60 * 24 * 365;
 const REFRESH_TOKEN_SECONDS = YEAR_SECONDS / 12;
 
-const REFRESH_COOKIE = 'basera_refresh_token';
+const REFRESH_COOKIE = 'RhenBasera_refresh_token';
 
 @Controller('api/auth')
 export class AuthController {

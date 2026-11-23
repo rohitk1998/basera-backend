@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { HostVerificationCaseEntity, UserEntity, VerificationAuditEntity } from '../entities';
 import { AuthModule } from '../auth/auth.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { StorageModule } from '../storage/storage.module';
 import { FaceMatchService } from './face-match.service';
 import { HostVerificationAdminController } from './host-verification-admin.controller';
@@ -14,6 +15,7 @@ import { HostVerificationService } from './host-verification.service';
     TypeOrmModule.forFeature([HostVerificationCaseEntity, UserEntity, VerificationAuditEntity]),
     AuthModule,
     StorageModule,
+    NotificationsModule,
   ],
   controllers: [HostVerificationController, HostVerificationAdminController],
   providers: [HostVerificationService, FaceMatchService, HostVerificationScheduler],

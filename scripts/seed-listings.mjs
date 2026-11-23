@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Seeds N live listings, owned by the seed-verified-users.mjs accounts
-// (seed-verified-%@basera.test) — round-robins host_id across whichever of
+// (seed-verified-%@RhenBasera.test) — round-robins host_id across whichever of
 // those profiles already exist, so run seed-verified-users.mjs first (or
 // with a high enough count) if this reports 0 host candidates.
 //

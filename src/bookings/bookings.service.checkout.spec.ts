@@ -1,5 +1,7 @@
 import { ConflictException } from '@nestjs/common';
 import { BookingsService } from './bookings.service';
+import { BookingEntity } from '../entities';
+import { fakeDataSource } from './bookings.test-utils';
 
 const ID = 'b1';
 const GUEST = 'g1';
@@ -22,6 +24,7 @@ function makeService(booking: Record<string, unknown>, env: Record<string, strin
   const stub = { findOne: jest.fn().mockResolvedValue(null), insert: jest.fn() };
   const notifications = { notify: jest.fn() };
   const config = { get: jest.fn((k: string) => env[k]) };
+  const { dataSource } = fakeDataSource(new Map([[BookingEntity, bookingsRepo as never]]));
   const service = new BookingsService(
     bookingsRepo as never,
     stub as never,
@@ -33,8 +36,9 @@ function makeService(booking: Record<string, unknown>, env: Record<string, strin
     notifications as never,
     payments as never,
     {} as never,
-    {} as never,
+    dataSource as never,
     config as never,
+    {} as never,
     {} as never,
   );
   return { service, bookingsRepo, notifications, payments };
@@ -107,7 +111,7 @@ describe('BookingsService.releaseHold after checkout', () => {
   it('releases a checked_out booking and records the checked_out -> completed event', async () => {
     const { service, bookingsRepo, payments } = makeService({ status: 'checked_out' });
     await service.releaseHold(ID);
-    expect(payments.release).toHaveBeenCalledWith(ID);
+    expect(payments.release).toHaveBeenCalledWith(ID, expect.anything());
     expect(bookingsRepo.update).toHaveBeenCalledWith({ id: ID, status: 'checked_out' }, expect.objectContaining({ status: 'completed' }));
   });
 

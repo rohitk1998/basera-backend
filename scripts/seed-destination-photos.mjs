@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Downloads one Unsplash photo per Himachal Pradesh destination (the same
 // list as web/components/DistrictFilter.tsx's PLACES) and uploads it to the
-// public "basera_assets" Supabase Storage bucket, so the homepage's circular
+// public "RhenBasera_assets" Supabase Storage bucket, so the homepage's circular
 // place-filter thumbnails can point at a permanent URL instead of Unsplash's
 // own (rate-limited, non-cached) source or picsum placeholders.
 //
@@ -26,7 +26,7 @@ import * as dotenv from 'dotenv';
 dotenv.config();
 
 const FORCE = process.argv.includes('--force');
-const BUCKET = 'basera_assets';
+const BUCKET = 'RhenBasera_assets';
 const DEST_PREFIX = 'destinations';
 
 const PLACES = [

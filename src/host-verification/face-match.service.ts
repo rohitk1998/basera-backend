@@ -16,8 +16,29 @@ export class FaceMatchService {
 
   constructor(private readonly config: ConfigService) {}
 
-  async score(idImage: Buffer, frames: Buffer[]): Promise<FaceMatchResult> {
+  /** The worker URL, or null when none is configured or it is plain http in production. */
+  private workerUrl(): string | null {
     const url = this.config.get<string>('FACE_MATCH_URL');
+    if (!url) return null;
+    if (this.config.get<string>('NODE_ENV') === 'production' && !/^https:\/\//i.test(url)) {
+      if (!this.warnedInsecure) {
+        this.warnedInsecure = true;
+        this.logger.error('FACE_MATCH_URL must be https in production; face matching is disabled');
+      }
+      return null;
+    }
+    return url;
+  }
+
+  private warnedInsecure = false;
+
+  /** False means "never scored automatically": the admin compares by eye. */
+  isConfigured(): boolean {
+    return this.workerUrl() !== null;
+  }
+
+  async score(idImage: Buffer, frames: Buffer[]): Promise<FaceMatchResult> {
+    const url = this.workerUrl();
     if (!url) return { status: 'unavailable' };
 
     try {

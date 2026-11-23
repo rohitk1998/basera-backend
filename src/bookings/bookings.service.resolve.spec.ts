@@ -1,4 +1,6 @@
 import { BookingsService } from './bookings.service';
+import { BookingEntity, DisputeCaseEntity, DisputeEventEntity } from '../entities';
+import { fakeDataSource } from './bookings.test-utils';
 
 const ID = 'b1';
 const ADMIN = 'a1';
@@ -23,6 +25,13 @@ function makeService(disputeCase: Record<string, unknown> = {}) {
   const stub = { findOne: jest.fn().mockResolvedValue(null), insert: jest.fn() };
   const payments = { splitRelease: jest.fn().mockResolvedValue(undefined) };
   const notifications = { notify: jest.fn() };
+  const { dataSource } = fakeDataSource(
+    new Map<unknown, never>([
+      [BookingEntity, bookingsRepo as never],
+      [DisputeCaseEntity, disputeCasesRepo as never],
+      [DisputeEventEntity, disputeEventsRepo as never],
+    ]),
+  );
   const service = new BookingsService(
     bookingsRepo as never,
     stub as never,
@@ -34,6 +43,7 @@ function makeService(disputeCase: Record<string, unknown> = {}) {
     notifications as never,
     payments as never,
     {} as never,
+    dataSource as never,
     {} as never,
     {} as never,
     {} as never,
@@ -47,7 +57,7 @@ describe('BookingsService.resolveDispute', () => {
   it('splits the payment by the admin amount, records it, and completes the booking', async () => {
     const { service, payments, bookingsRepo, disputeCasesRepo } = makeService();
     await service.resolveDispute(ADMIN, ID, 7500, undefined);
-    expect(payments.splitRelease).toHaveBeenCalledWith(ID, 7500);
+    expect(payments.splitRelease).toHaveBeenCalledWith(ID, 7500, expect.anything());
     expect(disputeCasesRepo.update).toHaveBeenCalledWith({ id: 'c1' }, expect.objectContaining({ resolution_amount_to_guest: 7500 }));
     expect(bookingsRepo.update).toHaveBeenCalledWith(
       { id: ID, status: 'disputed' },

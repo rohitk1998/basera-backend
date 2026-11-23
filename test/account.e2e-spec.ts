@@ -29,7 +29,7 @@ import { AttractionEntity } from '../src/entities/attraction.entity';
 import { EmailOtpEntity, UserEntity } from '../src/entities';
 
 const JWT_SECRET = 'test-secret-for-account-e2e';
-const REFRESH_COOKIE = 'basera_refresh_token';
+const REFRESH_COOKIE = 'RhenBasera_refresh_token';
 const DAY = 24 * 60 * 60 * 1000;
 
 const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');

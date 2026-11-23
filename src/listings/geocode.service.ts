@@ -53,7 +53,7 @@ const LOOKUP_TIMEOUT_MS = 8000;
 const GOOGLE_TIMEOUT_MS = 6000;
 const GOOGLE_BREAKER_MS = 5 * 60 * 1000;
 const GOOGLE_DEFAULT_BASE = 'https://maps.googleapis.com';
-const OSM_USER_AGENT = 'Basera/1.0 (verified long-stay rentals in Himachal Pradesh; host listing form)';
+const OSM_USER_AGENT = 'RhenBasera/1.0 (verified long-stay rentals in Himachal Pradesh; host listing form)';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 500;
 
@@ -91,7 +91,10 @@ export class GeocodeService {
 
     const gap = Number(this.config.get<string>('NOMINATIM_MIN_GAP_MS'));
     this.minGapMs = this.config.get<string>('NOMINATIM_BASE_URL') && Number.isFinite(gap) ? gap : DEFAULT_GAP_BETWEEN_LOOKUPS_MS;
-    this.googleKey = (this.config.get<string>('GOOGLE_MAPS_SERVER_KEY') ?? '').trim();
+    // Google geocoding is switched off for now, so lookups use OpenStreetMap (Nominatim) only.
+    // To bring Google back, swap in the commented line.
+    this.googleKey = '';
+    // this.googleKey = (this.config.get<string>('GOOGLE_MAPS_SERVER_KEY') ?? '').trim();
 
     this.googleBase = (this.config.get<string>('GOOGLE_GEOCODE_BASE_URL') || GOOGLE_DEFAULT_BASE).replace(/\/$/, '');
   }

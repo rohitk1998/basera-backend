@@ -14,6 +14,9 @@ import { StorageController } from '../storage/storage.controller';
 import { UserController } from '../user/user.controller';
 import { HostVerificationController } from '../host-verification/host-verification.controller';
 import { HostVerificationAdminController } from '../host-verification/host-verification-admin.controller';
+import { AdminBlogController } from '../blog/admin-blog.controller';
+import { BlogMediaController } from '../blog/blog-media.controller';
+import { DiscoveryController } from '../discovery/discovery.controller';
 import { RESPONSE_MESSAGE } from './decorators/response-message.decorator';
 
 const CONTROLLERS = [
@@ -31,6 +34,9 @@ const CONTROLLERS = [
   UserController,
   HostVerificationController,
   HostVerificationAdminController,
+  AdminBlogController,
+  BlogMediaController,
+  DiscoveryController,
 ];
 
 const METHOD_NAME = { [RequestMethod.POST]: 'POST', [RequestMethod.PUT]: 'PUT', [RequestMethod.PATCH]: 'PATCH', [RequestMethod.DELETE]: 'DELETE' } as Record<number, string>;

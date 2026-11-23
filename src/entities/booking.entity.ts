@@ -65,6 +65,13 @@ export class BookingEntity {
   @Column('int')
   host_payout_amount: number;
 
+  // Snapshot of the commission rate/agreement in force when the booking was created.
+  @Column({ type: 'int', nullable: true })
+  commission_rate_bps: number | null;
+
+  @Column({ type: 'uuid', nullable: true })
+  commission_agreement_id: string | null;
+
   @Column({ type: 'text', nullable: true })
   rejection_reason: string | null;
 
@@ -73,6 +80,13 @@ export class BookingEntity {
 
   @Column({ type: 'timestamptz', nullable: true })
   checkin_time: Date | null;
+
+  // Host attestation that they checked the guest's ID in person. Type only, never a number.
+  @Column({ type: 'timestamptz', nullable: true })
+  host_id_checked_at: Date | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  host_id_checked_doc_type: string | null;
 
   @Column({ type: 'timestamptz', nullable: true })
   escrow_release_time: Date | null;
@@ -106,4 +120,16 @@ export class BookingEntity {
 
   @Column({ type: 'timestamptz', nullable: true })
   stay_prompt_sent_at: Date | null;
+
+  // Short human-readable id, e.g. RB-7K3M2Q. Unique (bookings_reference_key).
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  reference: string | null;
+
+  // Client-supplied Idempotency-Key; unique per guest (bookings_guest_idempotency_key_uq).
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  idempotency_key: string | null;
+
+  // Set at approve(): an unpaid confirmed booking is expired after this.
+  @Column({ type: 'timestamptz', nullable: true })
+  pay_by_at: Date | null;
 }

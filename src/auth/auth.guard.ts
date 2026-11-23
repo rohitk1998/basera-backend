@@ -41,7 +41,7 @@ export class AuthGuard implements CanActivate {
 
       if (!decoded.sub) throw new Error('No user ID in token');
 
-      return { userId: decoded.sub, phone: decoded.phone_number as string | undefined };
+      return { userId: decoded.sub, phone: (decoded.phone_number ?? decoded.phone) as string | undefined };
     } catch (err) {
       if (err instanceof jwt.TokenExpiredError) {
         throw new UnauthorizedException({ code: 'session_expired', message: 'Session expired' });

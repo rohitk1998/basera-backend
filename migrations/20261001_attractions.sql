@@ -9,7 +9,7 @@
 --   source = 'manual'       created by an admin (treks, mostly)
 -- Guests only ever see status = 'published'.
 --
--- Images are copied into the public basera_assets bucket at import time, so
+-- Images are copied into the public RhenBasera_assets bucket at import time, so
 -- a guest request never reaches Wikimedia. image_credit is shown under every
 -- photo and must not be dropped.
 create table if not exists attractions (

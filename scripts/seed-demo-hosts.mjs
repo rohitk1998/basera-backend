@@ -28,7 +28,7 @@ const VERIFICATION_TYPES = ['identity', 'pan', 'bank', 'legal', 'selfie'];
 
 const HOSTS = [
   {
-    email: 'basera.demo.host1@gmail.com',
+    email: 'RhenBasera.demo.host1@gmail.com',
     fullName: 'Ananya Rawat',
     phone: '+919812340001',
     pan: 'ABCDE1234F',
@@ -45,7 +45,7 @@ const HOSTS = [
     },
   },
   {
-    email: 'basera.demo.host2@gmail.com',
+    email: 'RhenBasera.demo.host2@gmail.com',
     fullName: 'Karan Thakur',
     phone: '+919812340002',
     pan: 'ABCDE5678F',

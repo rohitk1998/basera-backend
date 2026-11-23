@@ -1,16 +1,4 @@
-import {
-  BadRequestException,
-  Body,
-  Controller,
-  Get,
-  Param,
-  ParseUUIDPipe,
-  Post,
-  Query,
-  UploadedFiles,
-  UseGuards,
-  UseInterceptors,
-} from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UploadedFiles, UseGuards, UseInterceptors, Headers } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { Throttle } from '@nestjs/throttler';
 import { AuthGuard } from '../auth/auth.guard';
@@ -20,6 +8,7 @@ import { BookingsService } from './bookings.service';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { ListBookingsQueryDto } from './dto/list-bookings-query.dto';
 import { CheckinBookingDto } from './dto/checkin-booking.dto';
+import { HostIdCheckDto } from './dto/host-id-check.dto';
 import { DisputeBookingDto } from './dto/dispute-booking.dto';
 import { DisputeOfferDto } from './dto/dispute-offer.dto';
 import { DisputeRespondDto } from './dto/dispute-respond.dto';
@@ -41,8 +30,12 @@ export class BookingsController {
 
   @ResponseMessage('Booking request sent to the host.')
   @Post()
-  create(@CurrentUser() user: AuthUser, @Body() dto: CreateBookingDto) {
-    return this.bookingsService.create(user.userId, dto);
+  create(
+    @CurrentUser() user: AuthUser,
+    @Body() dto: CreateBookingDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.bookingsService.create(user.userId, dto, idempotencyKey);
   }
 
   @Get()
@@ -103,6 +96,12 @@ export class BookingsController {
   @Post(':id/checkin')
   checkin(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: CheckinBookingDto) {
     return this.bookingsService.checkin(user.userId, id, dto.code);
+  }
+
+  @ResponseMessage('Recorded.')
+  @Post(':id/host-id-check')
+  hostIdCheck(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: HostIdCheckDto) {
+    return this.bookingsService.hostIdCheck(user.userId, id, dto.docType ?? null);
   }
 
   @ResponseMessage('Dispute raised. We will look into it.')

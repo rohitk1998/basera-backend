@@ -7,7 +7,7 @@
 //
 // Usage:
 //   BASE_URL=http://localhost:4000 node scripts/loadtest.mjs
-//   BASE_URL=https://staging.basera.in node scripts/loadtest.mjs --connections 100 --duration 20
+//   BASE_URL=https://staging.RhenBasera.in node scripts/loadtest.mjs --connections 100 --duration 20
 //
 // Targets public, DB-backed, unauthenticated endpoints — no login needed,
 // and representative of real traffic (search is the hottest path in the app).

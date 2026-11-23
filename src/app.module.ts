@@ -19,15 +19,35 @@ import { UserModule } from './user/user.module';
 import { ConversationsModule } from './conversations/conversations.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { HostVerificationModule } from './host-verification/host-verification.module';
+import { ClaimsModule } from './claims/claims.module';
 import { AttractionsModule } from './attractions/attractions.module';
 import { EventsModule } from './events/events.module';
+import { BlogModule } from './blog/blog.module';
 import { StoriesModule } from './stories/stories.module';
 import { SocialModule } from './social/social.module';
+import { CalendarSyncModule } from './calendar-sync/calendar-sync.module';
+import { HostVettingModule } from './host-vetting/host-vetting.module';
+import { GuidebookModule } from './guidebook/guidebook.module';
+import { BookingAgreementModule } from './booking-agreement/booking-agreement.module';
+import { WhatsappModule } from './whatsapp/whatsapp.module';
+import { CrmModule } from './crm/crm.module';
+import { QueueModule } from './queue/queue.module';
+import { DiscoveryModule } from './discovery/discovery.module';
+import { AdminBookingsModule } from './admin-bookings/admin-bookings.module';
+import { AdminLookupsModule } from './admin-lookups/admin-lookups.module';
+import { HealthModule } from './health/health.module';
+import { FinanceAdminModule } from './finance/finance-admin.module';
+import { InquiriesModule } from './inquiries/inquiries.module';
+import { AutomationModule } from './automation/automation.module';
+import { AnalyticsModule } from './analytics/analytics.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
     ScheduleModule.forRoot(),
+    // NOTE: counters are in-process memory (per instance, reset on restart). A shared Redis store
+    // needs a storage package (e.g. @nest-lab/throttler-storage-redis) which is not a dependency,
+    // so with N replicas the effective limit is N x 60/min. Add that package to fix.
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 60 }]),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
@@ -40,7 +60,7 @@ import { SocialModule } from './social/social.module';
         database: config.get<string>('SUPABASE_DB_NAME'),
         entities: Object.values(entities),
         synchronize: false,
-        ssl: config.get<string>('DB_SSL') === 'false' ? false : { rejectUnauthorized: false },
+        ssl: config.get<boolean>('DB_SSL') === false ? false : { rejectUnauthorized: false },
         extra: {
           max: config.get<number>('DB_POOL_MAX') ?? 10,
           idleTimeoutMillis: 10_000,
@@ -48,7 +68,9 @@ import { SocialModule } from './social/social.module';
           keepAlive: true,
           keepAliveInitialDelayMillis: 10_000,
         },
-        logging: ['query', 'error']
+        // Query logging dumps every SQL statement (with PII in parameters) into the logs; opt-in only.
+        logging: (config.get<boolean>('DB_LOG_QUERIES') ? ['query', 'error']
+          : ['error']) as ('query' | 'error')[],
       }),
     }),
     AuthModule,
@@ -62,10 +84,27 @@ import { SocialModule } from './social/social.module';
     ConversationsModule,
     ReviewsModule,
     HostVerificationModule,
+    ClaimsModule,
     AttractionsModule,
     EventsModule,
+    BlogModule,
     StoriesModule,
     SocialModule,
+    CalendarSyncModule,
+    HostVettingModule,
+    GuidebookModule,
+    BookingAgreementModule,
+    WhatsappModule,
+    CrmModule,
+    HealthModule,
+    QueueModule,
+    DiscoveryModule,
+    InquiriesModule,
+    AutomationModule,
+    AnalyticsModule,
+    AdminBookingsModule,
+    FinanceAdminModule,
+    AdminLookupsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

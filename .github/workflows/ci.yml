@@ -1,0 +1,34 @@
+name: backend-ci
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - name: Migration lint + runner unit tests
+        run: |
+          node scripts/lint-migrations.mjs
+          node --test scripts/migrate.test.mjs
+      - name: Unit tests
+        run: npx jest --ci
+      # e2e: skips anything needing live third-party secrets. Suites that need a database
+      # will fail without SUPABASE_DB_* secrets configured for the repo; see OPERATIONS_RUNBOOK.md.
+      - name: E2E tests
+        run: npx jest --config ./test/jest-e2e.json --ci --testPathIgnorePatterns 'test/cashfree-sandbox' 'test/geocode-google'
+        env:
+          NODE_ENV: test
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # non-blocking at first; flip once the baseline is clean
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm audit --omit=dev --audit-level=high

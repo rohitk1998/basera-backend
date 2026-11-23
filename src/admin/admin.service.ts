@@ -1,7 +1,8 @@
-import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { z } from 'zod';
+import { ListingHistoryService } from '../listings/listing-history.service';
 import {
   ListingEntity,
   UserEntity,
@@ -17,6 +18,7 @@ import { BookingsService } from '../bookings/bookings.service';
 import { StorageService } from '../storage/storage.service';
 import { agreeTerms } from '../common/domain';
 import { evaluateCaptureEvidence, type CaptureEvidence } from '../listings/capture-evidence.util';
+import { activityWindowStart, buildActivityPoints, istDayStart, type ActivityRange } from './activity.util';
 
 type AuditEvent = {
   id: string;
@@ -121,6 +123,7 @@ export class AdminService {
     private readonly listingsService: ListingsService,
     private readonly bookingsService: BookingsService,
     private readonly storage: StorageService,
+    @Optional() private readonly history?: ListingHistoryService,
   ) {}
 
   async getAudits(): Promise<{ audits: AuditEvent[]; total: number }> {
@@ -148,7 +151,7 @@ export class AdminService {
             payload.notes ||
             payload.message ||
             `Automated ${kind} check completed for listing ${payload.listing_id || '—'}.`,
-          actor: payload.actor || 'Basera System',
+          actor: payload.actor || 'RhenBasera System',
           time: new Date(row.sent_at).toLocaleString('en-IN', {
             day: 'numeric',
             month: 'short',
@@ -190,7 +193,7 @@ export class AdminService {
             typeof capture?.distanceFromPinM === 'number'
               ? `Walkthrough recorded with the in-app camera; the device reported ${capture.distanceFromPinM} m from the pin (device-reported, not verified).`
               : 'Walkthrough submitted before camera capture, or without capture data.',
-          actor: 'Basera Capture Check',
+          actor: 'RhenBasera Capture Check',
           time: when,
         });
       }
@@ -202,7 +205,8 @@ export class AdminService {
   async getProperties(statusParam?: string, q?: string, page = 1, pageSize = 20) {
     const query = q?.toLowerCase();
 
-    const qb = this.listings.createQueryBuilder('l').orderBy('l.created_at', 'DESC');
+    // Discovered (Google, unclaimed) rows are empty stubs with their own Discovery tab; they are not host submissions to review.
+    const qb = this.listings.createQueryBuilder('l').where('l.is_discovered = false').orderBy('l.created_at', 'DESC');
     if (statusParam) qb.andWhere('l.status = :status', { status: statusParam });
 
     let matchedTotal: number | undefined;
@@ -304,6 +308,11 @@ export class AdminService {
           identity: { status: profile.is_id_verified ? 'passed' : 'not_started', requestId: null, hasDocument: false },
           selfie: { status: profile.selfie_uploaded_at ? 'passed' : 'not_started', requestId: null, hasDocument: false },
         },
+        hostVerification: {
+          isIdVerified: Boolean(profile.is_id_verified),
+          verifiedAt: profile.id_verified_at ? profile.id_verified_at.toISOString() : null,
+          selfieOnFile: Boolean(profile.selfie_uploaded_at),
+        },
         reviewNotes: row.review_notes || undefined,
         photos,
         amenities: propStep.amenities || [],
@@ -316,6 +325,7 @@ export class AdminService {
     if (query) {
       filtered = filtered.filter(
         (p) =>
+          p.id.toLowerCase() === query ||
           p.title.toLowerCase().includes(query) ||
           p.town.toLowerCase().includes(query) ||
           p.hostName.toLowerCase().includes(query),
@@ -338,6 +348,7 @@ export class AdminService {
       .createQueryBuilder('l')
       .select('l.status', 'status')
       .addSelect('COUNT(*)', 'count')
+      .where('l.is_discovered = false')
       .groupBy('l.status')
       .getRawMany();
 
@@ -414,7 +425,22 @@ export class AdminService {
       updates.draft_data = { ...draft, approval_overrides: [...(draft.approval_overrides ?? []), approvalOverride] };
     }
 
+    // NOTE: approving never touches booking_eligible; an admin enables it separately.
     await this.listings.update({ id }, updates);
+
+    if (status && status !== previousStatus) {
+      try {
+        await this.history?.record({
+          listingId: id,
+          from: previousStatus,
+          to: status,
+          actorId: adminUserId,
+          reason: reviewNotes ?? reviewReasonCategory ?? overrideReason ?? undefined,
+        });
+      } catch (err) {
+        this.logger.warn(`Listing ${id}: status history not recorded: ${(err as Error).message}`);
+      }
+    }
 
     const data = await this.listings.findOne({ where: { id } });
     if (!data) {
@@ -430,7 +456,7 @@ export class AdminService {
       this.notifications.notify('listing.live', data.host_id, {
         listingTitle,
         pushTitle: 'Your listing is live',
-        pushBody: `${listingTitle} is now visible to guests on Basera`,
+        pushBody: `${listingTitle} is now visible to guests on RhenBasera`,
         link: `/host/listings`,
       });
       void this.listingTranslations.prewarmSourceLocale(data);
@@ -470,12 +496,34 @@ export class AdminService {
     }
   }
 
+  async getActivity(range: ActivityRange) {
+    const now = new Date();
+    const since = istDayStart(activityWindowStart(range, now));
+    const perDay = async (repo: Repository<UserEntity> | Repository<ListingEntity> | Repository<BookingEntity>) => {
+      const rows = await repo
+        .createQueryBuilder('t')
+        .select("to_char(t.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD')", 'day')
+        .addSelect('COUNT(*)', 'count')
+        .where('t.created_at >= :since', { since })
+        .groupBy('day')
+        .getRawMany<{ day: string; count: string }>();
+      return rows.map((r) => ({ day: r.day, count: Number(r.count) }));
+    };
+    const [users, listings, bookings] = await Promise.all([
+      perDay(this.profiles),
+      perDay(this.listings),
+      perDay(this.bookings),
+    ]);
+    return { success: true, range, points: buildActivityPoints(range, now, { users, listings, bookings }) };
+  }
+
   async getStats() {
     const [statusCounts, totalUsers, geoLockRow] = await Promise.all([
       this.listings
         .createQueryBuilder('l')
         .select('l.status', 'status')
         .addSelect('COUNT(*)', 'count')
+        .where('l.is_discovered = false')
         .groupBy('l.status')
         .getRawMany<{ status: string; count: string }>(),
       this.profiles.count(),
@@ -513,13 +561,15 @@ export class AdminService {
   async getUsers(roleParam?: string, q?: string, page = 1, pageSize = 20) {
     const query = q?.toLowerCase();
 
-    const qb = this.profiles.createQueryBuilder('p').orderBy('p.created_at', 'DESC');
+    // Staff accounts are never listed here: the console shows guests and hosts only.
+    const qb = this.profiles
+      .createQueryBuilder('p')
+      .where("COALESCE(p.role, '') != 'admin'")
+      .orderBy('p.created_at', 'DESC');
     if (roleParam === 'host') {
       qb.andWhere("(p.isHost = true OR p.role = 'host')");
-    } else if (roleParam === 'admin') {
-      qb.andWhere("p.role = 'admin'");
     } else if (roleParam === 'guest') {
-      qb.andWhere("(p.isHost IS NOT TRUE AND p.role != 'host') AND p.role != 'admin'");
+      qb.andWhere("(p.isHost IS NOT TRUE AND COALESCE(p.role, '') != 'host')");
     }
 
     let matchedTotal: number | undefined;
@@ -581,7 +631,7 @@ export class AdminService {
     }
 
     const [allCount, hostCount, adminCount] = await Promise.all([
-      this.profiles.count(),
+      this.profiles.createQueryBuilder('p').where("COALESCE(p.role, '') != 'admin'").getCount(),
       this.profiles
         .createQueryBuilder('p')
         .where("(p.isHost = true OR p.role = 'host') AND p.role != 'admin'")
@@ -592,7 +642,7 @@ export class AdminService {
       all: allCount,
       hosts: hostCount,
       admins: adminCount,
-      guests: allCount - hostCount - adminCount,
+      guests: allCount - hostCount,
     };
 
     return { users, counts, total, page, pageSize };
@@ -658,7 +708,7 @@ export class AdminService {
     const titleById = new Map(
       listingRows.map((l) => [l.id, (l.draft_data as any)?.property_details?.title ?? 'Listing']),
     );
-    const nameById = new Map(profileRows.map((p) => [p.id, p.full_name ?? 'Basera user']));
+    const nameById = new Map(profileRows.map((p) => [p.id, p.full_name ?? 'RhenBasera user']));
     const paymentByBookingId = new Map(paymentRows.map((p) => [p.booking_id, p]));
     const caseByBookingId = new Map(caseRows.map((c) => [c.booking_id, c]));
 
@@ -668,8 +718,8 @@ export class AdminService {
         bookingId: row.id,
         listingId: row.listing_id,
         listingTitle: titleById.get(row.listing_id) ?? 'Listing',
-        guestName: nameById.get(row.guest_id) ?? 'Basera user',
-        hostName: nameById.get(row.host_id) ?? 'Basera user',
+        guestName: nameById.get(row.guest_id) ?? 'RhenBasera user',
+        hostName: nameById.get(row.host_id) ?? 'RhenBasera user',
         category: disputeCase?.category ?? null,
         reason: disputeCase?.description ?? row.rejection_reason,
         requestedAmount: disputeCase?.requested_amount ?? null,

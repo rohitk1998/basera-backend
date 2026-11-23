@@ -80,4 +80,11 @@ export class StorageService {
       throw new InternalServerErrorException(`Delete failed: ${error.message}`);
     }
   }
+
+  /** Lists one level under a prefix. Folders come back with isFolder = true. */
+  async list(bucket: string, prefix: string, limit = 1000): Promise<{ name: string; isFolder: boolean }[]> {
+    const { data, error } = await this.supabase.client.storage.from(bucket).list(prefix, { limit });
+    if (error) throw new InternalServerErrorException(`List failed: ${error.message}`);
+    return (data ?? []).map((o) => ({ name: o.name, isFolder: o.id === null }));
+  }
 }

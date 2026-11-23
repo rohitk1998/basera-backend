@@ -118,20 +118,20 @@ describe('OTP email (auth.otp_code)', () => {
   it('signup wording asks to verify the email and finish creating the account', () => {
     const { subject, html } = render({ purpose: 'signup' });
     expect(subject).toContain('verification code');
-    expect(html).toContain('verify your email and finish creating your Basera account');
+    expect(html).toContain('verify your email and finish creating your RhenBasera account');
     expect(html).toContain('expires in 10 minutes');
-    expect(html).not.toContain('sign in to Basera');
+    expect(html).not.toContain('sign in to RhenBasera');
   });
 
   it('login wording keeps "sign in"', () => {
     const { subject, html } = render({ purpose: 'login' });
-    expect(subject).toBe('123456 is your Basera code');
-    expect(html).toContain('sign in to Basera');
+    expect(subject).toBe('123456 is your RhenBasera code');
+    expect(html).toContain('sign in to RhenBasera');
     expect(html).not.toContain('finish creating');
   });
 
   it('defaults to the login wording when no purpose is given', () => {
-    expect(render().html).toContain('sign in to Basera');
+    expect(render().html).toContain('sign in to RhenBasera');
   });
 
   it('escapes the code and expiry', () => {
@@ -147,7 +147,7 @@ describe('welcome email (user.welcome)', () => {
 
   it('guest: points to browsing stays', () => {
     const { subject, html } = render();
-    expect(subject).toBe('Welcome to Basera, Jane');
+    expect(subject).toBe('Welcome to RhenBasera, Jane');
     expect(html).toContain('browse stays');
     expect(html).toContain('https://app.test/stays');
   });

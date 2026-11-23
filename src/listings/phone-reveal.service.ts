@@ -5,6 +5,8 @@ import { createHash } from 'crypto';
 import { DataSource, Repository } from 'typeorm';
 import { ListingEntity, PhoneRevealLogEntity, UserEntity } from '../entities';
 import { assertVerifiedContact } from '../common/contact-gate.util';
+import { buildWhatsappUrl } from '../common/whatsapp-link.util';
+import { rowToListing } from './listing-mapper';
 
 export const MAX_UNIQUE_REVEALS_PER_DAY = 3;
 const WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -27,9 +29,9 @@ export class PhoneRevealService {
 
     const listing = await this.listings.findOne({
       where: { id: listingId },
-      select: { id: true, host_id: true, status: true },
+      select: { id: true, host_id: true, status: true, is_discovered: true, draft_data: true },
     });
-    if (!listing || listing.status !== 'live') {
+    if (!listing || listing.status !== 'live' || listing.is_discovered || !listing.host_id) {
       throw new NotFoundException('Listing not found');
     }
     if (listing.host_id === userId) {
@@ -72,6 +74,10 @@ export class PhoneRevealService {
       });
     });
 
-    return { success: true, phone: host.phone };
+    return {
+      success: true,
+      phone: host.phone,
+      whatsappUrl: buildWhatsappUrl(host.phone, rowToListing(listing).title),
+    };
   }
 }

@@ -149,9 +149,11 @@ describe('CAPTURE_LOCATION_BYPASS env validation', () => {
     expect(() => validateEnv({ ...base, CAPTURE_LOCATION_BYPASS: 'yes please' })).toThrow();
   });
   it('refuses to boot when enabled in production', () => {
-    expect(() => validateEnv({ ...base, CAPTURE_LOCATION_BYPASS: 'true', NODE_ENV: 'production' })).toThrow(
+    // Production also requires the Cashfree credentials, so the fixture supplies them.
+    const prod = { ...base, NODE_ENV: 'production', CASHFREE_PG_CLIENT_ID: 'id', CASHFREE_PG_CLIENT_SECRET: 'secret', ID_HASH_PEPPER: 'x'.repeat(32) };
+    expect(() => validateEnv({ ...prod, CAPTURE_LOCATION_BYPASS: 'true' })).toThrow(
       'CAPTURE_LOCATION_BYPASS must never be enabled in production',
     );
-    expect(validateEnv({ ...base, CAPTURE_LOCATION_BYPASS: 'false', NODE_ENV: 'production' }).CAPTURE_LOCATION_BYPASS).toBe(false);
+    expect(validateEnv({ ...prod, CAPTURE_LOCATION_BYPASS: 'false' }).CAPTURE_LOCATION_BYPASS).toBe(false);
   });
 });

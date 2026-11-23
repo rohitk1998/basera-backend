@@ -32,7 +32,7 @@ export type BookingStatus =
 
 export type PaymentMethod = 'upi' | 'cash';
 
-/** Shortest stay Basera accepts, in nights. Hosts may set a higher per-listing minimum, never a lower one. */
+/** Shortest stay RhenBasera accepts, in nights. Hosts may set a higher per-listing minimum, never a lower one. */
 export const MIN_STAY_NIGHTS = 7;
 
 /** The minimum a guest must book at a listing: the host's own minimum, floored at MIN_STAY_NIGHTS. */

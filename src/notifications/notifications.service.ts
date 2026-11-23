@@ -35,7 +35,7 @@ const SMTP_EMAIL_EVENTS = new Set([
 export interface NotificationListItem {
   id: string;
   event: string;
-  channel: 'email' | 'push';
+  channel: 'in_app' | 'email' | 'push';
   status: 'sent' | 'failed' | 'skipped';
   title: string;
   body: string;
@@ -44,10 +44,41 @@ export interface NotificationListItem {
   readAt: string | null;
 }
 
-interface DispatchResult {
+export interface DispatchResult {
   channel: string;
   status: 'sent' | 'failed' | 'skipped';
   error?: string;
+  reason?: string;
+}
+
+/** Typed outcome of one email send attempt (or of the bounded retry around it). */
+export interface EmailSendResult {
+  ok: boolean;
+  retryable: boolean;
+  error?: string;
+  /** True when nothing was attempted (no template / no provider key). */
+  skipped?: boolean;
+}
+
+export interface NotifyOptions {
+  /** Same (user, event, dedupeKey) is delivered at most once. */
+  dedupeKey?: string;
+}
+
+/** Events that are not transactional: they get List-Unsubscribe + a footer link. Everything else is critical. */
+export const NON_TRANSACTIONAL_EVENTS = new Set<string>(['user.registered', 'user.welcome']);
+
+const EMAIL_MAX_RETRIES = 2;
+const RETRYABLE_NET_CODES = new Set(['ECONNECTION', 'ETIMEDOUT', 'ECONNRESET', 'ESOCKET', 'EDNS', 'ECONNREFUSED', 'EAI_AGAIN']);
+
+function jitterDelayMs(attempt: number): number {
+  const base = 250 * 2 ** attempt;
+  return base + Math.floor(Math.random() * base);
+}
+
+function maskEmail(e: string): string {
+  const [u, d] = String(e ?? '').split('@');
+  return d ? `${u.slice(0, 1)}***@${d}` : '***';
 }
 
 @Injectable()
@@ -80,7 +111,7 @@ export class NotificationsService {
     const qb = this.notificationLog
       .createQueryBuilder('n')
       .where('n.user_id = :userId', { userId })
-      .andWhere("n.channel = 'push'")
+      .andWhere("n.channel = 'in_app'")
       .orderBy('n.sent_at', 'DESC')
       .addOrderBy('n.id', 'DESC')
       .limit(PAGE_SIZE + 1);
@@ -103,7 +134,7 @@ export class NotificationsService {
       return {
         id: row.id,
         event: row.event,
-        channel: row.channel as 'email' | 'push',
+        channel: row.channel as NotificationListItem['channel'],
         status: row.status as 'sent' | 'failed' | 'skipped',
         title,
         body,
@@ -132,6 +163,7 @@ export class NotificationsService {
       .update(NotificationLogEntity)
       .set({ read_at: new Date() })
       .where('user_id = :userId', { userId })
+      .andWhere("channel = 'in_app'")
       .andWhere('read_at IS NULL');
 
     if (hasId) {
@@ -142,7 +174,7 @@ export class NotificationsService {
   }
 
   async unreadCount(userId: string): Promise<number> {
-    return this.notificationLog.count({ where: { user_id: userId, read_at: IsNull(), channel: 'push' } });
+    return this.notificationLog.count({ where: { user_id: userId, read_at: IsNull(), channel: 'in_app' } });
   }
 
   private absoluteLink(link: unknown): string {
@@ -150,13 +182,18 @@ export class NotificationsService {
     return /^https?:\/\//.test(path) ? path : `${this.appUrl}${path.startsWith('/') ? '' : '/'}${path}`;
   }
 
-  notify(event: NotificationEvent, userId: string, data: NotificationData): void {
-    this.dispatch(event, userId, data).catch((err) => {
+  notify(event: NotificationEvent, userId: string, data: NotificationData, opts?: NotifyOptions): void {
+    this.dispatch(event, userId, data, opts).catch((err) => {
       this.logger.error(`[notify] dispatch failed for event=${event} userId=${userId}`, err);
     });
   }
 
-  private async dispatch(event: NotificationEvent, userId: string, data: NotificationData): Promise<void> {
+  async dispatch(
+    event: NotificationEvent,
+    userId: string,
+    data: NotificationData,
+    opts: NotifyOptions = {},
+  ): Promise<DispatchResult[]> {
     const profile = await this.profiles.findOne({
       where: { id: userId },
       select: {
@@ -172,58 +209,90 @@ export class NotificationsService {
 
     if (!profile) {
       this.logger.warn(`[notify] profile not found for userId=${userId}, event=${event}`);
-      return;
+      return [];
     }
 
-    const allResults: DispatchResult[] = [];
+    const payload = data as Record<string, unknown>;
 
-    await this.notificationLog.save(
-      this.notificationLog.create({
+    // In-app feed row. ON CONFLICT DO NOTHING on the (user_id, event, dedupe_key) partial unique index makes
+    // concurrent duplicate sends safe: exactly one caller inserts, the rest see zero returned rows.
+    const inserted = await this.notificationLog
+      .createQueryBuilder()
+      .insert()
+      .into(NotificationLogEntity)
+      .values({
         user_id: userId,
         event,
-        channel: 'push',
+        channel: 'in_app',
         status: 'sent',
         error: null,
-        payload: data as Record<string, unknown>,
-      }),
-    );
+        payload: payload as any,
+        dedupe_key: opts.dedupeKey ?? null,
+      })
+      .orIgnore()
+      .returning('id')
+      .execute();
+    const wasInserted = Array.isArray(inserted.raw) ? inserted.raw.length > 0 : true;
+    if (!wasInserted) {
+      this.logger.log(`[notify] duplicate skipped event=${event} userId=${userId}`);
+      return [{ channel: 'in_app', status: 'skipped', reason: 'duplicate' }];
+    }
+
+    const allResults: DispatchResult[] = [{ channel: 'in_app', status: 'sent' }];
+    const deliveryResults: DispatchResult[] = [];
 
     if (profile.notif_email && profile.email) {
-      allResults.push(await this.sendEmail(profile.email, event, data));
+      deliveryResults.push(await this.sendEmail(profile.email, event, data));
     }
 
     if (profile.notif_push && profile.fcm_tokens?.length) {
-      const { title, body } = notificationCopy(event, data as Record<string, unknown>, profile.preferred_locale ?? undefined);
+      const { title, body } = notificationCopy(event, payload, profile.preferred_locale ?? undefined);
       const { results: pushResults, staleTokens } = await this.sendPush(profile.fcm_tokens, title, body, data.link);
+      deliveryResults.push(...pushResults);
       if (staleTokens.length) {
         await this.pruneTokens(userId, staleTokens);
       }
     }
 
-    if (allResults.length > 0) {
-      const rows = allResults.map((r) =>
-        this.notificationLog.create({
-          user_id: userId,
-          event,
-          channel: r.channel,
-          status: r.status,
-          error: r.error ?? null,
-        }),
+    if (deliveryResults.length > 0) {
+      await this.notificationLog.save(
+        deliveryResults.map((r) =>
+          this.notificationLog.create({
+            user_id: userId,
+            event,
+            channel: r.channel,
+            status: r.status,
+            error: r.error ?? r.reason ?? null,
+            payload,
+          }),
+        ),
       );
-      rows.forEach((row) => {
-        row.payload = data as Record<string, unknown>;
-      });
-      await this.notificationLog.save(rows);
+    }
+    allResults.push(...deliveryResults);
+    return allResults;
+  }
+
+  /** Best-effort email to a raw address (guests without an account). Never throws. */
+  async sendEmailToAddress(to: string, event: NotificationEvent, data: Record<string, unknown>): Promise<'sent' | 'skipped' | 'failed'> {
+    try {
+      const r = await this.sendEmailWithRetry(to, event, data);
+      if (r.skipped) return 'skipped';
+      if (r.ok) return 'sent';
+      this.logger.warn(`[email] failed event=${event} to=${maskEmail(to)}: ${r.error ?? 'unknown'}`);
+      return 'failed';
+    } catch (err) {
+      this.logger.warn(`[email] failed event=${event} to=${maskEmail(to)}: ${(err as Error)?.message ?? 'unknown'}`);
+      return 'failed';
     }
   }
 
   async sendEmailNow(to: string, event: string, data: Record<string, unknown>): Promise<void> {
-    const result = await this.sendEmail(to, event, data);
-    if (result.status === 'failed') {
-      throw new Error(result.error ?? `Failed to send email for event=${event}`);
-    }
-    if (result.status === 'skipped') {
+    const result = await this.sendEmailWithRetry(to, event, data);
+    if (result.skipped) {
       throw new Error(`Email skipped for event=${event} — missing template or RESEND_API_KEY`);
+    }
+    if (!result.ok) {
+      throw new Error(result.error ?? `Failed to send email for event=${event}`);
     }
   }
 
@@ -260,7 +329,7 @@ export class NotificationsService {
     });
 
     const transporter = this.getSmtpTransporter();
-    const from = this.config.get<string>('SMTP_FROM') ?? `Basera <${this.config.get<string>('SMTP_USER')!}>`;
+    const from = this.config.get<string>('SMTP_FROM') ?? `RhenBasera <${this.config.get<string>('SMTP_USER')!}>`;
 
     try {
       await transporter.sendMail({ from, to, subject, html });
@@ -269,35 +338,61 @@ export class NotificationsService {
     }
   }
 
-  private async sendEmail(
-    to: string,
-    event: string,
-    data: Record<string, unknown>,
-  ): Promise<DispatchResult> {
-    const template = EMAIL_TEMPLATES[event];
-    if (!template) return { channel: 'email', status: 'skipped' };
+  private async sendEmail(to: string, event: string, data: Record<string, unknown>): Promise<DispatchResult> {
+    const r = await this.sendEmailWithRetry(to, event, data);
+    if (r.skipped) return { channel: 'email', status: 'skipped' };
+    return r.ok ? { channel: 'email', status: 'sent' } : { channel: 'email', status: 'failed', error: r.error };
+  }
 
-    const { subject, html } = template(data, {
+  private async sendEmailWithRetry(to: string, event: string, data: Record<string, unknown>): Promise<EmailSendResult> {
+    let result = await this.sendEmailOnce(to, event, data);
+    for (let attempt = 0; attempt < EMAIL_MAX_RETRIES && !result.ok && result.retryable; attempt++) {
+      await new Promise((r) => setTimeout(r, jitterDelayMs(attempt)));
+      result = await this.sendEmailOnce(to, event, data);
+    }
+    return result;
+  }
+
+  private unsubscribeUrl(): string {
+    return `${this.appUrl}/settings`;
+  }
+
+  async sendEmailOnce(to: string, event: string, data: Record<string, unknown>): Promise<EmailSendResult> {
+    const template = EMAIL_TEMPLATES[event];
+    if (!template) return { ok: false, retryable: false, skipped: true };
+
+    const rendered = template(data, {
       absoluteLink: (link) => this.absoluteLink(link),
       appUrl: this.appUrl,
       logoIconUrl: this.logoIconUrl,
     });
+    const subject = rendered.subject;
+    let html = rendered.html;
+    const headers: Record<string, string> = {};
+    if (NON_TRANSACTIONAL_EVENTS.has(event)) {
+      const url = this.unsubscribeUrl();
+      headers['List-Unsubscribe'] = `<${url}>`;
+      const footer = `<p style="font-size:12px;color:#6b7280;text-align:center;margin:16px 0">Don't want these emails? <a href="${url}">Manage notification settings</a>.</p>`;
+      html = html.includes('</body>') ? html.replace('</body>', `${footer}</body>`) : html + footer;
+    }
 
     if (SMTP_EMAIL_EVENTS.has(event)) {
       try {
-        const from = this.config.get<string>('SMTP_FROM') ?? `Basera <${this.config.get<string>('SMTP_USER')}>`;
-        await this.getSmtpTransporter().sendMail({ from, to, subject, html });
-        return { channel: 'email', status: 'sent' };
+        const from = this.config.get<string>('SMTP_FROM') ?? `RhenBasera <${this.config.get<string>('SMTP_USER')}>`;
+        await this.getSmtpTransporter().sendMail({ from, to, subject, html, headers });
+        return { ok: true, retryable: false };
       } catch (e: any) {
         this.logger.error(`[email] SMTP send failed for event=${event}: ${e?.message ?? e}`);
-        return { channel: 'email', status: 'failed', error: e?.message ?? String(e) };
+        const code = Number(e?.responseCode);
+        const retryable = RETRYABLE_NET_CODES.has(e?.code) || (code >= 400 && code < 500);
+        return { ok: false, retryable, error: e?.message ?? String(e) };
       }
     }
 
     const resendKey = this.config.get<string>('RESEND_API_KEY');
-    if (!resendKey) return { channel: 'email', status: 'skipped' };
+    if (!resendKey) return { ok: false, retryable: false, skipped: true };
 
-    const from = this.config.get<string>('EMAIL_FROM') ?? 'Basera <onboarding@resend.dev>';
+    const from = this.config.get<string>('EMAIL_FROM') ?? 'RhenBasera <onboarding@resend.dev>';
 
     try {
       const res = await fetch('https://api.resend.com/emails', {
@@ -306,16 +401,16 @@ export class NotificationsService {
           Authorization: `Bearer ${resendKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ from, to, subject, html }),
+        body: JSON.stringify({ from, to, subject, html, ...(Object.keys(headers).length ? { headers } : {}) }),
       });
 
       if (!res.ok) {
         const err = await res.text();
-        return { channel: 'email', status: 'failed', error: err };
+        return { ok: false, retryable: res.status >= 500 || res.status === 429, error: err };
       }
-      return { channel: 'email', status: 'sent' };
+      return { ok: true, retryable: false };
     } catch (e: any) {
-      return { channel: 'email', status: 'failed', error: e.message };
+      return { ok: false, retryable: true, error: e?.message ?? String(e) };
     }
   }
 

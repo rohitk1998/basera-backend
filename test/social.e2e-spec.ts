@@ -279,7 +279,7 @@ describe('Social endpoints: conversations, reviews, notifications, storage (HTTP
       const asGuest = await http().get('/api/conversations').set('Cookie', cookie(GUEST)).expect(200);
       expect(asGuest.body.map((c: any) => c.id)).toEqual(['c-new', 'c-old']);
       expect(asGuest.body[1]).toMatchObject({ listingId: LISTING, listingTitle: 'Sea View Flat', otherPartyName: 'Hari Host', role: 'guest' });
-      expect(asGuest.body[0]).toMatchObject({ role: 'host', otherPartyName: 'Basera user' });
+      expect(asGuest.body[0]).toMatchObject({ role: 'host', otherPartyName: 'RhenBasera user' });
 
       const asHost = await http().get('/api/conversations').set('Cookie', cookie(HOST)).expect(200);
       expect(asHost.body.map((c: any) => c.id).sort()).toEqual(['c-old', 'c-other']);

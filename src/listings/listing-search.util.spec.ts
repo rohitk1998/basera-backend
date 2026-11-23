@@ -157,3 +157,27 @@ describe('buildTextCondition', () => {
     expect(Object.keys(buildTextCondition('cottage')!.params)).toEqual(['qs0', 'qw0']);
   });
 });
+
+describe('discovered / hydrate parsing', () => {
+  it.each(['1', 'true', ['1', '0'], 1, true])('discovered=%p turns includeDiscovered on', (v) => {
+    expect(normalizeListingSearch({ discovered: v }).includeDiscovered).toBe(true);
+  });
+
+  it.each([undefined, '', '0', 'false', 'yes', 'TRUE ', 'junk', 2, {}, []])('discovered=%p stays off', (v) => {
+    expect(normalizeListingSearch({ discovered: v }).includeDiscovered).toBeFalsy();
+  });
+
+  it('hydrate defaults to true and is only turned off by 0/false', () => {
+    expect(normalizeListingSearch({}).hydrate ?? true).toBe(true);
+    expect(normalizeListingSearch({ hydrate: 'junk' }).hydrate ?? true).toBe(true);
+    expect(normalizeListingSearch({ hydrate: '1' }).hydrate ?? true).toBe(true);
+    expect(normalizeListingSearch({ hydrate: '0' }).hydrate).toBe(false);
+    expect(normalizeListingSearch({ hydrate: 'false' }).hydrate).toBe(false);
+    expect(normalizeListingSearch({ hydrate: false }).hydrate).toBe(false);
+  });
+
+  it('an owner-only query does not gain a truthy includeDiscovered', () => {
+    const p = normalizeListingSearch({ q: 'kasol', facets: '1' });
+    expect(p.includeDiscovered).toBeFalsy();
+  });
+});

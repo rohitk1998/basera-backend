@@ -68,13 +68,23 @@ export class HostVerificationController {
   submit(
     @CurrentUser() user: AuthUser,
     @Param('id', new ParseUUIDPipe({ errorHttpStatusCode: 404 })) id: string,
-    @Body() body: { docType?: string; idNumber?: string; challenges?: unknown },
+    @Body() body: {
+      docType?: string;
+      idNumber?: string;
+      aadhaarLast4?: string;
+      nameOnId?: string;
+      livenessToken?: string;
+      challenges?: unknown;
+    },
     @UploadedFiles() files: SubmitFiles,
   ) {
     if (typeof body.docType !== 'string') throw new BadRequestException('Choose the type of ID.');
     return this.service.submit(user.userId, id, {
       docType: body.docType,
       idNumber: typeof body.idNumber === 'string' ? body.idNumber : undefined,
+      aadhaarLast4: typeof body.aadhaarLast4 === 'string' ? body.aadhaarLast4 : undefined,
+      nameOnId: typeof body.nameOnId === 'string' ? body.nameOnId.slice(0, 120) : undefined,
+      livenessToken: typeof body.livenessToken === 'string' ? body.livenessToken.slice(0, 200) : undefined,
       challenges: parseChallenges(body.challenges),
       document: files?.document?.[0] ? toImage(files.document[0]) : undefined,
       frames: (files?.frames ?? []).map(toImage),

@@ -253,7 +253,7 @@ export class StoriesService {
         !url.password &&
         this.isOwnStoryMedia(url.pathname, authorId);
       if (!ok) {
-        throw new BadRequestException('Media must be uploaded through Basera');
+        throw new BadRequestException('Media must be uploaded through RhenBasera');
       }
       return url.toString();
     });

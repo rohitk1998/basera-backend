@@ -136,6 +136,21 @@ export const photosSchema = z.object({
   photos: z.array(photoSchema).min(5, 'Add at least 5 photographs of the property.'),
 });
 
+/** Blank / missing -> undefined; otherwise whole rupees (never a float). */
+const optionalRupees = (max: number, label: string) =>
+  z.preprocess(
+    (v) => (v === '' || v === null || v === undefined ? undefined : parseRupees(v)),
+    z
+      .number({ message: `Enter ${label} as a whole number of rupees.` })
+      .int()
+      .min(0, `${label} cannot be negative.`)
+      .max(max, `${label} cannot be more than ₹${max.toLocaleString('en-IN')}.`)
+      .optional(),
+  );
+
+export const UTILITIES = ['water', 'electricity', 'wifi', 'gas', 'housekeeping'] as const;
+export const ELECTRICITY_MODES = ['included', 'per_unit', 'flat'] as const;
+
 export const pricingSchema = z.object({
   dailyBaseRate: z.preprocess(
     parseRupees,
@@ -146,6 +161,25 @@ export const pricingSchema = z.object({
   minDays: z.coerce.number().int().min(MIN_STAY_NIGHTS).max(365),
   availableFrom: z.string().min(10, 'Pick the first date the home is free.'),
   billsIncluded: z.enum(['all', 'electricity_extra', 'none']),
+
+  // Long-stay absolute prices (integer rupees). Optional; the discount percentages stay for back-compat.
+  weeklyPrice: optionalRupees(700000, 'The weekly price'),
+  monthlyPrice: optionalRupees(3000000, 'The monthly price'),
+  securityDeposit: optionalRupees(500000, 'The security deposit'),
+  electricityMode: z.enum(ELECTRICITY_MODES).optional(),
+  electricityCharge: optionalRupees(10000, 'The electricity charge'),
+  cleaningCharge: optionalRupees(20000, 'The cleaning charge'),
+  extraGuestFee: optionalRupees(10000, 'The extra guest fee'),
+  includedGuests: z.preprocess(
+    (v) => (v === '' || v === null || v === undefined ? undefined : v),
+    z.coerce.number().int().min(1, 'At least one guest is included.').max(20).optional(),
+  ),
+  utilitiesIncluded: z
+    .array(z.enum(UTILITIES, { message: 'Unknown utility.' }))
+    .max(UTILITIES.length)
+    .refine((a) => new Set(a).size === a.length, 'List each utility once.')
+    .default([]),
+  bufferDays: z.coerce.number().int().min(0, 'Buffer is 0 to 3 days.').max(3, 'Buffer is 0 to 3 days.').default(0),
 });
 
 const BEDROOMS_FOR_SIZE: Record<string, number> = { Studio: 0, '1BHK': 1, '2BHK': 2, '3BHK': 3 };
@@ -168,10 +202,63 @@ export function listingIssues(
     weeklyDiscountPct?: number | string;
     monthlyDiscountPct?: number | string;
     availableFrom?: string;
+    dailyBaseRate?: number | string;
+    weeklyPrice?: number | string;
+    monthlyPrice?: number | string;
+    electricityMode?: string;
+    electricityCharge?: number | string;
+    includedGuests?: number | string;
+    maxGuests?: number | string;
   },
   opts: { timeZone?: string } = {},
-): Partial<Record<'bedrooms' | 'weeklyDiscountPct' | 'availableFrom', string>> {
-  const issues: Partial<Record<'bedrooms' | 'weeklyDiscountPct' | 'availableFrom', string>> = {};
+): Partial<
+  Record<
+    | 'bedrooms'
+    | 'weeklyDiscountPct'
+    | 'availableFrom'
+    | 'weeklyPrice'
+    | 'monthlyPrice'
+    | 'electricityCharge'
+    | 'includedGuests',
+    string
+  >
+> {
+  const issues: Partial<
+    Record<
+      | 'bedrooms'
+      | 'weeklyDiscountPct'
+      | 'availableFrom'
+      | 'weeklyPrice'
+      | 'monthlyPrice'
+      | 'electricityCharge'
+      | 'includedGuests',
+      string
+    >
+  > = {};
+  const num = (v: unknown) => (v === undefined || v === null || v === '' ? undefined : Number(v));
+  const daily = num(d.dailyBaseRate);
+  const wp = num(d.weeklyPrice);
+  const mp = num(d.monthlyPrice);
+  if (daily !== undefined && Number.isFinite(daily)) {
+    if (wp !== undefined && wp > daily * 7) {
+      issues.weeklyPrice = `The weekly price cannot be more than 7 days at the daily rate (₹${(daily * 7).toLocaleString('en-IN')}).`;
+    }
+    if (mp !== undefined && mp > daily * 30) {
+      issues.monthlyPrice = `The monthly price cannot be more than 30 days at the daily rate (₹${(daily * 30).toLocaleString('en-IN')}).`;
+    }
+  }
+  if (!issues.monthlyPrice && wp !== undefined && mp !== undefined && mp / 30 > wp / 7) {
+    issues.monthlyPrice = 'The monthly price per day cannot be higher than the weekly price per day.';
+  }
+  const ec = num(d.electricityCharge);
+  if ((d.electricityMode === 'per_unit' || d.electricityMode === 'flat') && !(ec !== undefined && ec > 0)) {
+    issues.electricityCharge = 'Enter the electricity charge, or choose "Included in the rent".';
+  }
+  const ig = num(d.includedGuests);
+  const mg = num(d.maxGuests);
+  if (ig !== undefined && mg !== undefined && ig > mg) {
+    issues.includedGuests = 'Included guests cannot be more than the maximum guests.';
+  }
   const expected = d.beds ? BEDROOMS_FOR_SIZE[d.beds] : undefined;
   if (expected !== undefined && d.bedrooms !== undefined && d.bedrooms !== '' && Number(d.bedrooms) !== expected) {
     issues.bedrooms =

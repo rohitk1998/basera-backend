@@ -90,7 +90,7 @@ export function emailShell(opts: EmailShellOpts): string {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Basera</title>
+    <title>RhenBasera</title>
   </head>
   <body style="margin: 0; padding: 0; background: ${SURFACE_2}; font-family: ${FONT_STACK};">
     <!-- Preheader: shows in the inbox preview line, hidden in the rendered body -->
@@ -107,7 +107,7 @@ export function emailShell(opts: EmailShellOpts): string {
                     <td style="padding-right: 10px;">
                       <img src="${logoIconUrl}" width="28" height="28" alt="" style="display: block; border-radius: 7px;" />
                     </td>
-                    <td style="font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: ${INK}; vertical-align: middle;">basera</td>
+                    <td style="font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: ${INK}; vertical-align: middle;">RhenBasera</td>
                   </tr>
                 </table>
               </td>
@@ -127,7 +127,7 @@ export function emailShell(opts: EmailShellOpts): string {
             <tr>
               <td style="padding: 20px 32px 28px; border-top: 1px solid ${LINE};">
                 <p style="margin: 0; font-size: 12.5px; line-height: 1.6; color: ${MUTED};">
-                  Basera is a long-stay marketplace and direct-booking platform, offering a zero-fee experience for users and a trusted framework for both hosts and users.
+                  RhenBasera is a long-stay marketplace and direct-booking platform, offering a zero-fee experience for users and a trusted framework for both hosts and users.
                 </p>
                 <p style="margin: 12px 0 0; font-size: 12.5px; color: ${MUTED};">
                   <a href="${appUrl}/account" style="color: ${MUTED}; text-decoration: underline;">Manage notification preferences</a>
@@ -147,18 +147,97 @@ export type Template = (
   ctx: { absoluteLink: (link: unknown) => string; appUrl: string; logoIconUrl: string },
 ) => { subject: string; html: string };
 
-export const EMAIL_TEMPLATES: Record<string, Template> = {
-  'user.registered': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `Welcome to Basera${d.userName ? `, ${d.userName}` : ''}`,
+const verificationEmail = (
+  subject: string,
+  paragraphs: string[],
+  ctaLabel: string,
+): Template => (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+  subject,
+  html: emailShell({
+    preheader: subject,
+    bodyHtml: paragraphs.map((p) => `<p style="margin: 0 0 12px;">${p}</p>`).join('')
+      + (typeof d.reason === 'string' && d.reason ? `<p style="margin: 0;"><strong>Reason:</strong> ${escapeHtml(d.reason)}</p>` : ''),
+    ctaLabel,
+    ctaLink: absoluteLink(d.link ?? '/account?verify=1'),
+    appUrl,
+    logoIconUrl,
+  }),
+});
+
+const inquiryPlace = (d: Record<string, unknown>) =>
+  typeof d.town === 'string' && d.town.trim() ? `, ${escapeHtml(d.town)}` : '';
+const inquiryDates = (d: Record<string, unknown>) =>
+  `${escapeHtml(formatCalendarDate(d.checkIn) || d.checkIn)} to ${escapeHtml(formatCalendarDate(d.checkOut) || d.checkOut)}`;
+const inquiryRef = (d: Record<string, unknown>) =>
+  typeof d.ref === 'string' && d.ref ? ` Reference ${escapeHtml(d.ref)}.` : '';
+const inquiryHasLink = (d: Record<string, unknown>) => typeof d.link === 'string' && d.link.length > 0;
+
+const INQUIRY_TEMPLATES: Record<string, Template> = {
+  'inquiry.guest_received': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `We got your stay request for ${d.propertyName}`,
     html: emailShell({
-      preheader: `Welcome to Basera`,
+      preheader: `We received your stay request for ${escapeHtml(d.propertyName)}`,
+      bodyHtml: `<p style="margin: 0;">Hi ${escapeHtml(d.guestName ?? 'there')}, we received your request to stay at <strong>${escapeHtml(d.propertyName)}</strong>${inquiryPlace(d)} from ${inquiryDates(d)} for ${escapeHtml(d.guests)} guests. We are getting in touch with the owner and will update you as soon as we hear back.${inquiryRef(d)}</p>`,
+      ...(inquiryHasLink(d) ? { ctaLabel: 'View your request', ctaLink: absoluteLink(d.link) } : {}),
+      appUrl,
+      logoIconUrl,
+    }),
+  }),
+  'inquiry.new': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `New stay request: ${d.propertyName}`,
+    html: emailShell({
+      preheader: `${escapeHtml(d.guestName ?? 'A guest')} requested ${escapeHtml(d.propertyName)}`,
+      bodyHtml: `<p style="margin: 0;"><strong>${escapeHtml(d.guestName ?? 'A guest')}</strong> requested <strong>${escapeHtml(d.propertyName)}</strong>${inquiryPlace(d)}, ${inquiryDates(d)}, ${escapeHtml(d.guests)} guests.${inquiryRef(d)} Call the owner and update the request.</p>`,
+      ctaLabel: 'Open the request',
+      ctaLink: absoluteLink(d.link ?? '/admin'),
+      appUrl,
+      logoIconUrl,
+    }),
+  }),
+  'inquiry.request_sent': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `Your request was sent to the owner of ${d.propertyName}`,
+    html: emailShell({
+      preheader: `Your request for ${escapeHtml(d.propertyName)} is with the owner`,
+      bodyHtml: `<p style="margin: 0;">Good news. The owner joined RhenBasera and we sent your request for ${inquiryDates(d)} to them. They will approve or decline it, and you will hear from us either way. You pay only after they approve.</p>`,
+      ctaLabel: 'View your booking request',
+      ctaLink: absoluteLink(d.link),
+      appUrl,
+      logoIconUrl,
+    }),
+  }),
+  'inquiry.dates_unavailable': (d, { absoluteLink, appUrl, logoIconUrl }) => {
+    const town = typeof d.town === 'string' ? d.town.trim() : '';
+    return {
+      subject: `${d.propertyName} is not available for your dates`,
+      html: emailShell({
+        preheader: `${escapeHtml(d.propertyName)} is not available for your dates`,
+        bodyHtml: `<p style="margin: 0;">Hi ${escapeHtml(d.guestName ?? 'there')}, sorry, <strong>${escapeHtml(d.propertyName)}</strong> is not available from ${inquiryDates(d)}. It is unavailable for these dates, or it has already been booked by someone else. Here are verified stays ${town ? `in ${escapeHtml(town)} ` : ''}you can book instead.</p>`,
+        ctaLabel: town ? `See verified stays in ${escapeHtml(town)}` : 'See verified stays',
+        ctaLink: absoluteLink(d.link ?? '/stays'),
+        appUrl,
+        logoIconUrl,
+      }),
+    };
+  },
+};
+
+export const EMAIL_TEMPLATES: Record<string, Template> = {
+  ...INQUIRY_TEMPLATES,
+  'verification.approved': verificationEmail('You are verified on RhenBasera', ['Your identity check was approved. You can now submit listings.'], 'Start listing'),
+  'verification.rejected': verificationEmail('Your identity check was not approved', ['We could not approve your identity check. You can fix the issue and try again from Account &amp; Profile.'], 'Try again'),
+  'verification.expired': verificationEmail('Your identity check expired', ['Your identity check expired before it was finished. Please start again when you are ready.'], 'Start again'),
+  'verification.revoked': verificationEmail('Your identity verification was removed', ['Your identity verification was removed by our team. You will need to verify again before listing.'], 'Review'),
+  'user.registered': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
+    subject: `Welcome to RhenBasera${d.userName ? `, ${d.userName}` : ''}`,
+    html: emailShell({
+      preheader: `Welcome to RhenBasera`,
       bodyHtml: d.isHost
         ? `
-          <p style="margin: 0 0 12px;">Welcome to Basera${d.userName ? `, ${d.userName}` : ''}. You're set up as a host.</p>
+          <p style="margin: 0 0 12px;">Welcome to RhenBasera${d.userName ? `, ${d.userName}` : ''}. You're set up as a host.</p>
           <p style="margin: 0;">Before your first listing can go live, complete identity verification in Account &amp; Profile — it's a one-time step that covers every property you list afterwards.</p>
         `
         : `
-          <p style="margin: 0 0 12px;">Welcome to Basera${d.userName ? `, ${d.userName}` : ''}.</p>
+          <p style="margin: 0 0 12px;">Welcome to RhenBasera${d.userName ? `, ${d.userName}` : ''}.</p>
           <p style="margin: 0;">Complete your KYC to explore stays and services offered by our hosts and enjoy a smooth booking experience.</p>
         `,
       ctaLabel: d.isHost ? 'Complete verification' : 'Browse stays',
@@ -170,16 +249,16 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
   'user.welcome': (d, { absoluteLink, appUrl, logoIconUrl }) => {
     const name = d.userName ? `, ${escapeHtml(d.userName)}` : '';
     return {
-      subject: `Welcome to Basera${d.userName ? `, ${d.userName}` : ''}`,
+      subject: `Welcome to RhenBasera${d.userName ? `, ${d.userName}` : ''}`,
       html: emailShell({
-        preheader: `Your Basera account is ready`,
+        preheader: `Your RhenBasera account is ready`,
         bodyHtml: d.isHost
           ? `
-          <p style="margin: 0 0 12px;">Welcome to Basera${name}. Your account is ready and you're set up as a host.</p>
+          <p style="margin: 0 0 12px;">Welcome to RhenBasera${name}. Your account is ready and you're set up as a host.</p>
           <p style="margin: 0;">Next step: start your first listing so guests can find your place.</p>
         `
           : `
-          <p style="margin: 0 0 12px;">Welcome to Basera${name}. Your account is ready.</p>
+          <p style="margin: 0 0 12px;">Welcome to RhenBasera${name}. Your account is ready.</p>
           <p style="margin: 0;">Next step: browse stays and find a place that feels like home.</p>
         `,
         ctaLabel: d.isHost ? 'Start listing' : 'Browse stays',
@@ -229,7 +308,7 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
         bodyHtml: `
         <p style="margin: 0 0 12px;">We received your payment for <strong>${escapeHtml(d.listingTitle)}</strong>.</p>
         <p style="margin: 0 0 12px;">${moveIn && moveOut ? `Stay: ${escapeHtml(moveIn)} to ${escapeHtml(moveOut)}<br />` : ''}${amount ? `Amount paid: <strong>${escapeHtml(amount)}</strong>` : ''}</p>
-        <p style="margin: 0;">Basera holds this payment until 24 hours after you check in, then releases it to the host unless you report a problem before then.</p>
+        <p style="margin: 0;">RhenBasera holds this payment until 24 hours after you check in, then releases it to the host unless you report a problem before then.</p>
       `,
         ctaLabel: 'View your booking',
         ctaLink: absoluteLink(d.link),
@@ -247,8 +326,8 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
         preheader: `Check-in confirmed for ${escapeHtml(d.listingTitle)}`,
         bodyHtml: `
         <p style="margin: 0 0 12px;">Your check-in at <strong>${escapeHtml(d.listingTitle)}</strong> is confirmed${checkedInAt ? ` (${escapeHtml(checkedInAt)})` : ''}.</p>
-        <p style="margin: 0 0 12px;">${releaseAt ? `Your payment stays held by Basera until <strong>${escapeHtml(releaseAt)}</strong>, then is released to the host.` : 'Your payment stays held by Basera for 24 hours after check-in, then is released to the host.'}</p>
-        <p style="margin: 0;">If something isn't right with the stay, report a problem from your booking before then and the payment will stay on hold while Basera reviews it.</p>
+        <p style="margin: 0 0 12px;">${releaseAt ? `Your payment stays held by RhenBasera until <strong>${escapeHtml(releaseAt)}</strong>, then is released to the host.` : 'Your payment stays held by RhenBasera for 24 hours after check-in, then is released to the host.'}</p>
+        <p style="margin: 0;">If something isn't right with the stay, report a problem from your booking before then and the payment will stay on hold while RhenBasera reviews it.</p>
       `,
         ctaLabel: 'View your booking',
         ctaLink: absoluteLink(d.link),
@@ -279,7 +358,7 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
     html: emailShell({
       preheader: `Your guest has paid for ${escapeHtml(d.listingTitle)}`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">Your guest has paid for <strong>${escapeHtml(d.listingTitle)}</strong>. Basera is holding the payment.</p>
+        <p style="margin: 0 0 12px;">Your guest has paid for <strong>${escapeHtml(d.listingTitle)}</strong>. RhenBasera is holding the payment.</p>
         <p style="margin: 0;">It is released to you 24 hours after check-in, unless the guest reports a problem. Open your bookings in the app to get ready for their arrival.</p>
       `,
       ctaLabel: 'View the booking',
@@ -294,7 +373,7 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       preheader: `Guest check-in confirmed for ${escapeHtml(d.listingTitle)}`,
       bodyHtml: `
         <p style="margin: 0 0 12px;"><strong>${escapeHtml(d.guestName ?? 'Your guest')}</strong> checked in at <strong>${escapeHtml(d.listingTitle)}</strong>.</p>
-        <p style="margin: 0;">Basera releases the held payment to you 24 hours after check-in, unless the guest reports a problem before then.</p>
+        <p style="margin: 0;">RhenBasera releases the held payment to you 24 hours after check-in, unless the guest reports a problem before then.</p>
       `,
       ctaLabel: 'View the booking',
       ctaLink: absoluteLink(d.link),
@@ -308,7 +387,7 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       preheader: `Your dispute for ${escapeHtml(d.listingTitle)} is open`,
       bodyHtml: `
         <p style="margin: 0 0 12px;">Your dispute for <strong>${escapeHtml(d.listingTitle)}</strong> has been sent to the host.</p>
-        <p style="margin: 0;">The held payment stays on hold while the host responds. If you can't agree, Basera will review the case.</p>
+        <p style="margin: 0;">The held payment stays on hold while the host responds. If you can't agree, RhenBasera will review the case.</p>
       `,
       ctaLabel: 'View the case',
       ctaLink: absoluteLink(d.link),
@@ -333,10 +412,10 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
   'dispute.offer_rejected': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
     subject: `Your offer was rejected for ${d.listingTitle}`,
     html: emailShell({
-      preheader: `The dispute for ${escapeHtml(d.listingTitle)} goes to Basera`,
+      preheader: `The dispute for ${escapeHtml(d.listingTitle)} goes to RhenBasera`,
       bodyHtml: `
         <p style="margin: 0 0 12px;">The other party rejected the offer on the dispute for <strong>${escapeHtml(d.listingTitle)}</strong>.</p>
-        <p style="margin: 0;">The case has been sent to Basera for review. The held payment stays on hold until it is decided.</p>
+        <p style="margin: 0;">The case has been sent to RhenBasera for review. The held payment stays on hold until it is decided.</p>
       `,
       ctaLabel: 'View the case',
       ctaLink: absoluteLink(d.link),
@@ -349,7 +428,7 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
     html: emailShell({
       preheader: `The dispute for ${escapeHtml(d.listingTitle)} has been resolved`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">${d.decidedBy === 'negotiation' ? 'The dispute was settled directly' : 'Basera has made a decision on the dispute'} for <strong>${escapeHtml(d.listingTitle)}</strong>.</p>
+        <p style="margin: 0 0 12px;">${d.decidedBy === 'negotiation' ? 'The dispute was settled directly' : 'RhenBasera has made a decision on the dispute'} for <strong>${escapeHtml(d.listingTitle)}</strong>.</p>
         ${resolutionLines(d)}
         ${d.appealable ? '<p style="margin: 0;">Either side can appeal this decision once.</p>' : ''}
       `,
@@ -362,10 +441,10 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
   'booking.disputed': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
     subject: `A dispute was raised for ${d.listingTitle}`,
     html: emailShell({
-      preheader: `Basera is reviewing a dispute for ${escapeHtml(d.listingTitle)}`,
+      preheader: `RhenBasera is reviewing a dispute for ${escapeHtml(d.listingTitle)}`,
       bodyHtml: `
         <p style="margin: 0 0 12px;"><strong>${escapeHtml(d.guestName ?? 'Your guest')}</strong> raised a dispute for
-        <strong>${escapeHtml(d.listingTitle)}</strong>. The held payment stays with Basera until this is resolved.</p>
+        <strong>${escapeHtml(d.listingTitle)}</strong>. The held payment stays with RhenBasera until this is resolved.</p>
         <p style="margin: 0;">Review the details and respond — this affects when the payment is released.</p>
       `,
       ctaLabel: 'Review the dispute',
@@ -381,7 +460,7 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       bodyHtml: `
         <p style="margin: 0 0 12px;">The other party made an offer to settle the dispute for
         <strong>${escapeHtml(d.listingTitle)}</strong>${amountToGuest(d)}.</p>
-        <p style="margin: 0;">Accept, counter, or escalate to Basera — the held payment isn't released until this is settled.</p>
+        <p style="margin: 0;">Accept, counter, or escalate to RhenBasera — the held payment isn't released until this is settled.</p>
       `,
       ctaLabel: 'Respond to the offer',
       ctaLink: absoluteLink(d.link),
@@ -390,11 +469,11 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
     }),
   }),
   'dispute.escalated': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
-    subject: `Dispute for ${d.listingTitle} escalated to Basera`,
+    subject: `Dispute for ${d.listingTitle} escalated to RhenBasera`,
     html: emailShell({
-      preheader: `Basera will now review this dispute directly`,
+      preheader: `RhenBasera will now review this dispute directly`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">The dispute for <strong>${escapeHtml(d.listingTitle)}</strong> couldn't be settled directly and has been escalated to Basera for review.</p>
+        <p style="margin: 0 0 12px;">The dispute for <strong>${escapeHtml(d.listingTitle)}</strong> couldn't be settled directly and has been escalated to RhenBasera for review.</p>
         <p style="margin: 0;">You'll hear back once a decision is made — no action is needed from you right now.</p>
       `,
       ctaLabel: 'View the case',
@@ -408,13 +487,13 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
     const minutes = escapeHtml(d.expiresInMinutes);
     if (d.purpose === 'signup') {
       return {
-        subject: `${d.code} is your Basera verification code`,
+        subject: `${d.code} is your RhenBasera verification code`,
         html: emailShell({
-          preheader: `Verify your email to finish creating your Basera account`,
+          preheader: `Verify your email to finish creating your RhenBasera account`,
           bodyHtml: `
-        <p style="margin: 0 0 16px;">Use this code to verify your email and finish creating your Basera account. It expires in ${minutes} minutes.</p>
+        <p style="margin: 0 0 16px;">Use this code to verify your email and finish creating your RhenBasera account. It expires in ${minutes} minutes.</p>
         <p style="margin: 0; font-size: 32px; font-weight: 700; letter-spacing: 0.3em; color: #1f2937;">${code}</p>
-        <p style="margin: 16px 0 0; color: #6b7280;">If you didn't try to create a Basera account, you can ignore this email.</p>
+        <p style="margin: 16px 0 0; color: #6b7280;">If you didn't try to create a RhenBasera account, you can ignore this email.</p>
       `,
           appUrl,
           logoIconUrl,
@@ -422,11 +501,11 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
       };
     }
     return {
-      subject: `${d.code} is your Basera code`,
+      subject: `${d.code} is your RhenBasera code`,
       html: emailShell({
-        preheader: `Your Basera sign-in code is ${code}`,
+        preheader: `Your RhenBasera sign-in code is ${code}`,
         bodyHtml: `
-        <p style="margin: 0 0 16px;">Use this code to sign in to Basera. It expires in ${minutes} minutes.</p>
+        <p style="margin: 0 0 16px;">Use this code to sign in to RhenBasera. It expires in ${minutes} minutes.</p>
         <p style="margin: 0; font-size: 32px; font-weight: 700; letter-spacing: 0.3em; color: #1f2937;">${code}</p>
         <p style="margin: 16px 0 0; color: #6b7280;">If you didn't request this, you can ignore this email.</p>
       `,
@@ -438,11 +517,11 @@ export const EMAIL_TEMPLATES: Record<string, Template> = {
   'dispute.appeal_raised': (d, { absoluteLink, appUrl, logoIconUrl }) => ({
     subject: `An appeal was raised on ${d.listingTitle}`,
     html: emailShell({
-      preheader: `The other party appealed Basera's decision`,
+      preheader: `The other party appealed RhenBasera's decision`,
       bodyHtml: `
-        <p style="margin: 0 0 12px;">The other party appealed Basera's decision on the dispute for
+        <p style="margin: 0 0 12px;">The other party appealed RhenBasera's decision on the dispute for
         <strong>${escapeHtml(d.listingTitle)}</strong>. This is the one appeal either side gets on this case.</p>
-        <p style="margin: 0;">Basera will take a final look and let you know the outcome.</p>
+        <p style="margin: 0;">RhenBasera will take a final look and let you know the outcome.</p>
       `,
       ctaLabel: 'View the case',
       ctaLink: absoluteLink(d.link),

@@ -198,6 +198,7 @@ export class HostListingsController {
     return { success: true, ...result };
   }
 
+  @ResponseMessage('Speed test started.')
   @Post('speedtest/start')
   async startSpeedtest(@CurrentUser() user: AuthUser) {
     const { testId } = await this.hostListingsService.startSpeedtest(user.userId);
@@ -264,6 +265,7 @@ export class HostListingsController {
   }
 
   @Throttle(SPEEDTEST_THROTTLE)
+  @ResponseMessage('Speed test upload received.')
   @Post('speedtest/upload')
   async speedtestUpload(
     @CurrentUser() user: AuthUser,

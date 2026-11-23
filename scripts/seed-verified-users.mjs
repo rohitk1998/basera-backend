@@ -36,7 +36,7 @@ const seedPasswordHash = await bcrypt.hash(SEED_PASSWORD, 12);
 
 const EMAIL_PREFIX = 'seed-verified-';
 // yopmail.com: a real, publicly-checkable disposable inbox (unlike the
-// unroutable basera.test domain this replaced) — every seeded account's
+// unroutable RhenBasera.test domain this replaced) — every seeded account's
 // inbox at yopmail.com/?seed-verified-NNNN is actually viewable, useful for
 // manually spot-checking auth/notification emails during a load test.
 const EMAIL_DOMAIN = 'yopmail.com';

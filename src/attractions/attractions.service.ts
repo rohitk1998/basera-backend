@@ -123,6 +123,39 @@ export class AttractionsService {
     return result;
   }
 
+  /** Published attractions closest to a point (a stay), nearest first. `awayKm` is straight-line distance. */
+  async nearby(
+    lat: number,
+    lng: number,
+    opts: { radiusKm?: number; limit?: number } = {},
+  ): Promise<Array<PublicAttraction & { awayKm: number }>> {
+    const radiusKm = Math.min(Math.max(opts.radiusKm ?? 50, 1), 150);
+    const limit = Math.min(Math.max(opts.limit ?? 8, 1), 24);
+    const dLat = radiusKm / 111;
+    const dLng = radiusKm / (111 * Math.max(0.01, Math.cos((lat * Math.PI) / 180)));
+    const rows = await this.repo
+      .createQueryBuilder('a')
+      .where('a.status = :status', { status: 'published' })
+      .andWhere('a.lat BETWEEN :minLat AND :maxLat', { minLat: lat - dLat, maxLat: lat + dLat })
+      .andWhere('a.lng BETWEEN :minLng AND :maxLng', { minLng: lng - dLng, maxLng: lng + dLng })
+      .orderBy('a.popularity', 'DESC')
+      .take(200)
+      .getMany();
+    const rad = (d: number) => (d * Math.PI) / 180;
+    const km = (a: AttractionEntity) => {
+      const h =
+        Math.sin(rad(a.lat - lat) / 2) ** 2 +
+        Math.cos(rad(lat)) * Math.cos(rad(a.lat)) * Math.sin(rad(a.lng - lng) / 2) ** 2;
+      return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
+    };
+    return rows
+      .map((a) => ({ a, d: km(a) }))
+      .filter((x) => x.d <= radiusKm)
+      .sort((x, y) => x.d - y.d)
+      .slice(0, limit)
+      .map((x) => ({ ...toPublicAttraction(x.a), awayKm: Math.round(x.d * 10) / 10 }));
+  }
+
   async invalidateCache(): Promise<void> {
     await this.redis.incrementVersion(CACHE_VERSION_KEY);
   }

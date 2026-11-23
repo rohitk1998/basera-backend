@@ -2,6 +2,7 @@ import { Controller, Get, Logger, Param, Post, Query, Req, UseGuards } from '@ne
 import { Throttle } from '@nestjs/throttler';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import type { Listing } from './listing.types';
 import type { Request } from 'express';
 import { ListingsService } from './listings.service';
 import { normalizeListingSearch } from './listing-search.util';
@@ -10,6 +11,7 @@ import { AuthGuard } from '../auth/auth.guard';
 import { UserEntity } from '../entities';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/types';
+import { DiscoveredDetailsService } from '../discovery/discovered-details.service';
 import { PhoneRevealService } from './phone-reveal.service';
 import { ResponseMessage } from '../common/decorators/response-message.decorator';
 
@@ -24,6 +26,7 @@ export class ListingsController {
     private readonly listingsService: ListingsService,
     private readonly authGuard: AuthGuard,
     private readonly phoneReveal: PhoneRevealService,
+    private readonly discoveredDetails: DiscoveredDetailsService,
     @InjectRepository(UserEntity)
     private readonly profiles: Repository<UserEntity>,
   ) {}
@@ -34,10 +37,23 @@ export class ListingsController {
     const startedAt = Date.now();
     const params = normalizeListingSearch(query ?? {});
     const { locale } = params;
-    const result = await this.listingsService.findLive({
+    const found = await this.listingsService.findLive({
       ...params,
       locale: isSupportedLocale(locale) ? locale : undefined,
     });
+
+    // Hydrate COPIES after the (possibly cached/coalesced) result: Google fields never reach Redis. Skipped entirely
+    // unless the caller opted into discovered stays.
+    const foundListings = (found as { listings?: Listing[] }).listings;
+    const result = Array.isArray(foundListings)
+      ? {
+          ...found,
+          listings: await this.discoveredDetails.hydrateListings(foundListings, {
+            // Page 1 only: deeper pages (easy to enumerate) show fallback titles instead of spending the daily Google budget.
+            hydrate: params.includeDiscovered === true && params.hydrate !== false && (params.page ?? 1) <= 1,
+          }),
+        }
+      : found;
 
     const { listings, total, facets } = result as { listings?: unknown[]; total?: number; facets?: unknown };
     // Magenta, so search traffic stands out from Nest's green/yellow lines.

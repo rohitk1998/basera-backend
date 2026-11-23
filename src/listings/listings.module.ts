@@ -8,6 +8,7 @@ import {
   PhoneRevealLogEntity,
 } from '../entities';
 import { AuthModule } from '../auth/auth.module';
+import { DiscoveryModule } from '../discovery/discovery.module';
 import { RedisModule } from '../redis/redis.module';
 import { ListingsController } from './listings.controller';
 import { HostListingsController } from './host-listings.controller';
@@ -16,6 +17,10 @@ import { PhoneRevealService } from './phone-reveal.service';
 import { HostListingsService } from './host-listings.service';
 import { ListingTranslationService } from './listing-translation.service';
 import { CaptureConfigService } from './capture-config.service';
+import { ListingsAdminController } from './listings-admin.controller';
+import { BookingEligibilityService } from './booking-eligibility.service';
+import { ListingHistoryService } from './listing-history.service';
+import { AdminGuard } from '../auth/admin.guard';
 import { GeocodeController } from './geocode.controller';
 import { GeocodeService } from './geocode.service';
 import { SarvamTranslateProvider } from './providers/sarvam-translate.provider';
@@ -32,10 +37,14 @@ import { TRANSLATE_PROVIDER } from './providers/translate-provider.token';
     ]),
     AuthModule,
     RedisModule,
+    DiscoveryModule,
   ],
-  controllers: [ListingsController, HostListingsController, GeocodeController],
+  controllers: [ListingsController, HostListingsController, GeocodeController, ListingsAdminController],
   providers: [
     CaptureConfigService,
+    AdminGuard,
+    BookingEligibilityService,
+    ListingHistoryService,
     GeocodeService,
     ListingsService,
     PhoneRevealService,
@@ -49,6 +58,7 @@ import { TRANSLATE_PROVIDER } from './providers/translate-provider.token';
     HostListingsService,
     ListingTranslationService,
     GeocodeService,
+    ListingHistoryService,
   ],
 })
 export class ListingsModule {}

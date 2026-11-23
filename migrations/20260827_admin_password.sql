@@ -4,7 +4,7 @@
 -- Next.js app's supabase/migrations/*.sql files targeted).
 --
 -- Every guest/host account authenticates via Firebase phone-OTP
--- (see basera-backend/src/auth/auth.controller.ts) and has no
+-- (see RhenBasera-backend/src/auth/auth.controller.ts) and has no
 -- password. Admins are the one exception: role = 'admin' is already
 -- manually provisioned via direct SQL (see profiles.role in
 -- ProfileEntity), so a password credential for that same manually-

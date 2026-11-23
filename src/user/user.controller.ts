@@ -52,7 +52,7 @@ export class UserController {
       this.notifications.notify('user.registered', user.userId, {
         userName: dto.name,
         isHost: dto.isHost ?? false,
-        pushTitle: 'Welcome to Basera',
+        pushTitle: 'Welcome to RhenBasera',
         pushBody: dto.isHost
           ? 'Complete verification to list your first property'
           : 'Complete your KYC to explore stays and services offered by our hosts and enjoy a smooth booking experience.',

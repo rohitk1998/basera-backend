@@ -233,7 +233,7 @@ describe('AuthController', () => {
       await expect(
         controller.refresh(
           req({
-            basera_refresh_token: 'raw-refresh-token',
+            RhenBasera_refresh_token: 'raw-refresh-token',
             'sb-dkmlkbhwzvexwdgxpexg-auth-token': JSON.stringify({ access_token: noSubToken }),
           }),
           mockResponse(),
@@ -248,7 +248,7 @@ describe('AuthController', () => {
 
       const result = await controller.refresh(
         req({
-          basera_refresh_token: 'raw-refresh-token',
+          RhenBasera_refresh_token: 'raw-refresh-token',
           'sb-dkmlkbhwzvexwdgxpexg-auth-token': JSON.stringify({ access_token: accessToken }),
         }),
         res,
@@ -266,7 +266,7 @@ describe('AuthController', () => {
       await expect(
         controller.refresh(
           req({
-            basera_refresh_token: 'raw-refresh-token',
+            RhenBasera_refresh_token: 'raw-refresh-token',
             'sb-dkmlkbhwzvexwdgxpexg-auth-token': JSON.stringify({ access_token: accessToken }),
           }),
           mockResponse(),

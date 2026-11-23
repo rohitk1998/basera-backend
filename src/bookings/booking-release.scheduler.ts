@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { runExclusive } from '../common/leader-lock';
 import { BookingsService } from './bookings.service';
 
 @Injectable()
@@ -10,6 +11,10 @@ export class BookingReleaseScheduler {
 
   @Cron(CronExpression.EVERY_MINUTE)
   async handleExpiredHolds(): Promise<void> {
+    await runExclusive('cron:booking-release', 55_000, () => this.runAll());
+  }
+
+  private async runAll(): Promise<void> {
     try {
       await this.bookingsService.releaseExpiredHolds();
     } catch (err) {

@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 export interface PgOrder {
@@ -10,7 +10,16 @@ export interface PgOrder {
   paymentSessionId: string | null;
 }
 
+export interface PgRefund {
+  refundId: string;
+  cfRefundId: string | null;
+  status: string;
+  amount: number;
+}
+
 const PG_TIMEOUT_MS = 15_000;
+/** Webhooks whose x-webhook-timestamp is older (or further in the future) than this are rejected as replays. */
+export const WEBHOOK_MAX_AGE_MS = 10 * 60 * 1000;
 
 @Injectable()
 export class CashfreeService {
@@ -57,7 +66,7 @@ export class CashfreeService {
     };
   }
 
-  private async pgRequest(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; data: any }> {
+  private async pgRequest(method: 'GET' | 'POST' | 'PATCH', path: string, body?: unknown): Promise<{ status: number; data: any }> {
     const attempt = async () => {
       const res = await fetch(`${this.getPgBaseUrl()}${path}`, {
         method,
@@ -108,7 +117,13 @@ export class CashfreeService {
     if (status === 200 || status === 201) return this.toPgOrder(data);
     if (status === 409) {
       const existing = await this.fetchPgOrder(params.orderId);
-      if (existing) return existing;
+      if (existing) {
+        // A reused order id with a different amount must never be treated as "the same order".
+        if (existing.amount !== params.amount) {
+          throw new ConflictException('A payment order with a different amount already exists for this booking.');
+        }
+        return existing;
+      }
     }
     this.logger.error(`[Cashfree] create order -> ${status} ${data?.code ?? ''} ${data?.message ?? ''}`);
     throw new ServiceUnavailableException('Could not start the payment. Please try again.');
@@ -135,13 +150,86 @@ export class CashfreeService {
     }
   }
 
-  verifyWebhookSignature(rawBody: Buffer | string, signature: string | undefined, timestamp: string | undefined): boolean {
-    if (!this.pgClientSecret || !signature || !timestamp) return false;
-    const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
-    const given = Buffer.from(signature);
-    return [`${timestamp}${body}`, `${timestamp}.${body}`].some((data) => {
-      const expected = Buffer.from(createHmac('sha256', this.pgClientSecret!).update(data).digest('base64'));
-      return expected.length === given.length && timingSafeEqual(expected, given);
+  /**
+   * Close an order so it can no longer be paid (cancel / expiry). Idempotent: an order that is
+   * already terminal (PAID, EXPIRED, TERMINATED) or unknown is reported, not thrown.
+   * Returns the order status after the call, or null when Cashfree does not know the order.
+   */
+  async terminateOrder(orderId: string): Promise<string | null> {
+    const { status, data } = await this.pgRequest('PATCH', `/orders/${encodeURIComponent(orderId)}`, {
+      order_status: 'TERMINATED',
     });
+    if (status === 200) return String(data?.order_status ?? 'TERMINATED');
+    if (status === 404) return null;
+    // 400 = order already PAID/EXPIRED/TERMINATED (cannot be terminated); report real state.
+    const current = await this.fetchPgOrder(orderId).catch(() => null);
+    if (current) return current.status;
+    this.logger.error(`[Cashfree] terminate order -> ${status} ${data?.code ?? ''} ${data?.message ?? ''}`);
+    throw new ServiceUnavailableException('Could not close the payment order.');
+  }
+
+  private toPgRefund(d: any): PgRefund {
+    return {
+      refundId: String(d.refund_id),
+      cfRefundId: d.cf_refund_id != null ? String(d.cf_refund_id) : null,
+      status: String(d.refund_status ?? 'PENDING'),
+      amount: Number(d.refund_amount),
+    };
+  }
+
+  /** POST /orders/{order_id}/refunds. refund_id is the idempotency key: a replay returns the existing refund. */
+  async createRefund(orderId: string, refundId: string, amount: number, note?: string): Promise<PgRefund> {
+    const { status, data } = await this.pgRequest('POST', `/orders/${encodeURIComponent(orderId)}/refunds`, {
+      refund_amount: amount,
+      refund_id: refundId,
+      refund_note: (note ?? 'Refund').slice(0, 100),
+      refund_speed: 'STANDARD',
+    });
+    if (status === 200 || status === 201) return this.toPgRefund(data);
+    if (status === 409 || data?.code === 'refund_id_already_exists') {
+      const existing = await this.getRefund(orderId, refundId);
+      if (existing) return existing;
+    }
+    this.logger.error(`[Cashfree] create refund -> ${status} ${data?.code ?? ''} ${data?.message ?? ''}`);
+    const err: any = new ServiceUnavailableException(data?.message ?? 'Refund could not be created.');
+    err.cashfreeCode = data?.code;
+    err.cashfreeStatus = status;
+    throw err;
+  }
+
+  async getRefund(orderId: string, refundId: string): Promise<PgRefund | null> {
+    const { status, data } = await this.pgRequest(
+      'GET',
+      `/orders/${encodeURIComponent(orderId)}/refunds/${encodeURIComponent(refundId)}`,
+    );
+    if (status === 404) return null;
+    if (status !== 200) throw new ServiceUnavailableException('Could not check the refund.');
+    return this.toPgRefund(data);
+  }
+
+  /**
+   * Cashfree's documented scheme: base64(HMAC-SHA256(secret, timestamp + rawBody)), compared in
+   * constant time. `now` is injectable for tests. Timestamp must be epoch ms (or seconds) within
+   * WEBHOOK_MAX_AGE_MS of now, in either direction.
+   */
+  verifyWebhookSignature(
+    rawBody: Buffer | string,
+    signature: string | undefined,
+    timestamp: string | undefined,
+    now: number = Date.now(),
+  ): boolean {
+    if (!this.pgClientSecret || !signature || !timestamp) return false;
+    if (!this.isFreshTimestamp(timestamp, now)) return false;
+    const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
+    const expected = Buffer.from(createHmac('sha256', this.pgClientSecret).update(`${timestamp}${body}`).digest('base64'));
+    const given = Buffer.from(signature);
+    return expected.length === given.length && timingSafeEqual(expected, given);
+  }
+
+  isFreshTimestamp(timestamp: string, now: number = Date.now()): boolean {
+    if (!/^\d{9,16}$/.test(timestamp)) return false;
+    let ms = Number(timestamp);
+    if (ms < 1e11) ms *= 1000; // seconds -> ms
+    return Math.abs(now - ms) <= WEBHOOK_MAX_AGE_MS;
   }
 }

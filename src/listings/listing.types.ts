@@ -66,7 +66,33 @@ export type Listing = {
   coords: { lat: number; lng: number } | null;
   categories: CategoryId[];
 
+  /** Admin-enabled; when false the web shows "Enquire" instead of "Request to book". */
+  bookingEligible?: boolean;
+  /** Long-stay terms, absolute integer rupees. Absent when the host did not set them. */
+  pricing?: {
+    weeklyPrice?: number;
+    monthlyPrice?: number;
+    securityDeposit?: number;
+    electricityMode?: 'included' | 'per_unit' | 'flat';
+    electricityCharge?: number;
+    cleaningCharge?: number;
+    extraGuestFee?: number;
+    includedGuests?: number;
+    utilitiesIncluded: string[];
+    bufferDays: number;
+  };
+
   wifiMeasured?: { downMbps: number; upMbps: number; testedAt: string };
+
+  /** True only for Google-discovered, unclaimed stays shown on the unified grid. Check before using price/bed/availability. */
+  discovered?: boolean;
+  /** True while `title` is our generic "Homestay in <place>" rather than a live Google name. */
+  titleIsFallback?: boolean;
+  /** Internal: Google place id used for hydration. Stripped before the response leaves the controller. */
+  placeId?: string;
+  /** Discovered stubs only: our own derived district and tehsil. */
+  district?: string;
+  tehsil?: string;
 };
 
 export type Town = {

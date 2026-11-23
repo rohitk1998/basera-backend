@@ -1,4 +1,4 @@
-import { InternalServerErrorException } from '@nestjs/common';
+import { ConflictException, InternalServerErrorException } from '@nestjs/common';
 import { PaymentsService } from './payments.service';
 
 function makeService(payment: Record<string, unknown> | null, rawRows: Record<string, unknown>[] = []) {
@@ -18,7 +18,7 @@ describe('PaymentsService.splitRelease', () => {
     const { service, paymentsRepo } = makeService({ id: 'p1', amount: 10500, status: 'held' });
     await service.splitRelease('b1', 7500);
     expect(paymentsRepo.update).toHaveBeenCalledWith(
-      { id: 'p1' },
+      { booking_id: 'b1', status: expect.anything() },
       expect.objectContaining({ status: 'split', split_amount_to_guest: 7500 }),
     );
   });
@@ -90,5 +90,61 @@ describe('PaymentsService.markHeld / markFailed', () => {
     const { service, paymentsRepo } = makeService(null);
     await service.markFailed('b1');
     expect(paymentsRepo.update).toHaveBeenCalledWith({ booking_id: 'b1', status: 'pending' }, expect.objectContaining({ status: 'failed' }));
+  });
+});
+
+describe('PaymentsService status-guarded release / refund / split', () => {
+  it('release updates only a held row', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    await service.release('b1');
+    const [where, patch] = paymentsRepo.update.mock.calls[0];
+    expect(where.booking_id).toBe('b1');
+    expect(where.status._value).toEqual(['held']);
+    expect(patch).toMatchObject({ status: 'released_to_host' });
+  });
+
+  it('release throws 409 when nothing was held any more (a dispute or refund won)', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    paymentsRepo.update.mockResolvedValue({ affected: 0 });
+    await expect(service.release('b1')).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('refund throws 409 when the payment was already released', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    paymentsRepo.update.mockResolvedValue({ affected: 0 });
+    await expect(service.refund('b1')).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('refund marks a held payment refunded', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    await service.refund('b1');
+    expect(paymentsRepo.update.mock.calls[0][1]).toMatchObject({ status: 'refunded' });
+  });
+
+  it('of release and refund racing against one held row, exactly one succeeds', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    let status = 'held';
+    paymentsRepo.update.mockImplementation(async (where: any, patch: any) => {
+      if (!where.status._value.includes(status)) return { affected: 0 };
+      status = patch.status;
+      return { affected: 1 };
+    });
+    const results = await Promise.allSettled([service.release('b1'), service.refund('b1')]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+  });
+
+  it('uses the supplied transaction manager repository', async () => {
+    const { service, paymentsRepo } = makeService(null);
+    const txRepo = { update: jest.fn().mockResolvedValue({ affected: 1 }) };
+    await service.release('b1', { getRepository: () => txRepo } as never);
+    expect(txRepo.update).toHaveBeenCalled();
+    expect(paymentsRepo.update).not.toHaveBeenCalled();
+  });
+
+  it('splitRelease can re-decide an already split payment for an appeal', async () => {
+    const { service, paymentsRepo } = makeService({ id: 'p1', amount: 10000, status: 'split' });
+    await service.splitRelease('b1', 100, undefined, ['split']);
+    expect(paymentsRepo.update.mock.calls[0][0].status._value).toEqual(['split']);
   });
 });

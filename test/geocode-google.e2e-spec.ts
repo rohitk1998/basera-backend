@@ -324,7 +324,7 @@ describe('GET /api/geocode with Google as the primary provider', () => {
       });
       expect(osm.calls[0].params.get('addressdetails')).toBe('1');
       expect(osm.calls[0].path).toBe('/reverse');
-      expect(osm.calls[0].ua).toMatch(/^Basera\//);
+      expect(osm.calls[0].ua).toMatch(/^RhenBasera\//);
       expect(osm.calls[0].params.get('format')).toBe('jsonv2');
       expect(osm.calls[0].params.get('lat')).toBe('32.2701');
       expect(osm.calls[0].params.get('lon')).toBe('77.1755');

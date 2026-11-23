@@ -89,21 +89,29 @@ export class ConversationsService {
         id: r.id,
         listingId: r.listing_id,
         listingTitle: draft.property_details?.title ?? 'Listing',
-        otherPartyName: nameById.get(otherPartyId) ?? 'Basera user',
+        otherPartyName: nameById.get(otherPartyId) ?? 'RhenBasera user',
         role: r.guest_id === userId ? ('guest' as const) : ('host' as const),
         lastMessageAt: r.last_message_at,
       };
     });
   }
 
+  /** Only live, non-discovered listings can receive new messages; existing threads stay readable. */
+  private assertListingMessageable(listing: { status?: string | null; is_discovered?: boolean | null }): void {
+    if (listing.status !== 'live' || listing.is_discovered) {
+      throw new NotFoundException('Listing not found');
+    }
+  }
+
   async getOrCreate(userId: string, dto: CreateConversationDto) {
     const listing = await this.listings.findOne({
       where: { id: dto.listingId },
-      select: { id: true, host_id: true },
+      select: { id: true, host_id: true, status: true, is_discovered: true },
     });
     if (!listing) {
       throw new NotFoundException('Listing not found');
     }
+    this.assertListingMessageable(listing);
     if (listing.host_id === userId) {
       throw new BadRequestException('You cannot message yourself about your own listing.');
     }
@@ -136,6 +144,15 @@ export class ConversationsService {
 
   async sendMessage(userId: string, conversationId: string, dto: SendMessageDto) {
     const conversation = await this.requireParticipant(userId, conversationId);
+
+    const listing = await this.listings.findOne({
+      where: { id: conversation.listing_id },
+      select: { id: true, status: true, is_discovered: true },
+    });
+    if (!listing) {
+      throw new NotFoundException('Listing not found');
+    }
+    this.assertListingMessageable(listing);
 
     const message = this.messages.create({
       conversation_id: conversationId,
@@ -180,7 +197,7 @@ export class ConversationsService {
       senderName: caller?.full_name ?? 'Someone',
       link: `/messages/${conversationId}`,
       pushTitle: 'Incoming call',
-      pushBody: `${caller?.full_name ?? 'Someone'} is calling you on Basera`,
+      pushBody: `${caller?.full_name ?? 'Someone'} is calling you on RhenBasera`,
     });
 
     return { success: true, id: saved.id, kind: saved.kind, status: saved.status };

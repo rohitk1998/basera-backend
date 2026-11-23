@@ -5,7 +5,7 @@
 // provisioned profiles.role = 'admin' flag, and this script is the only
 // place that sets password_hash. Run it by hand, once, per admin:
 //
-//   node scripts/seed-admin.mjs "ops@basera.in" "a strong password"
+//   node scripts/seed-admin.mjs "ops@RhenBasera.in" "a strong password"
 //
 // Requires the same .env this app already runs with (SUPABASE_DB_* vars).
 import pg from 'pg';

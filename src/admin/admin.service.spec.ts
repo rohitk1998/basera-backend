@@ -117,3 +117,31 @@ describe('camera capture as the approval requirement', () => {
     expect(e.status).toBe('passed');
   });
 });
+
+describe('reviewProperty status history', () => {
+  const { AdminService } = jest.requireActual('./admin.service');
+  const mk = (history: any) => {
+    const before = { id: 'l1', status: 'in_review', host_id: 'h1', draft_data: {} };
+    const listings: any = {
+      findOne: jest.fn().mockResolvedValueOnce(before).mockResolvedValue({ ...before, status: 'changes_needed' }),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
+    const notifications = { notify: jest.fn() };
+    const svc = new AdminService(listings, {} as any, {} as any, {} as any, {} as any, {} as any, notifications as any, {} as any,
+      { bumpSearchCacheVersion: jest.fn() } as any, {} as any, {} as any, history);
+    return { svc, listings };
+  };
+  const body = { status: 'changes_needed', reviewReasonCategory: 'other', reviewNotes: 'Fix photos' };
+
+  it('records the transition and never writes booking_eligible', async () => {
+    const history = { record: jest.fn().mockResolvedValue(undefined) };
+    const { svc, listings } = mk(history);
+    await svc.reviewProperty('l1', 'adm', body);
+    expect(history.record).toHaveBeenCalledWith({ listingId: 'l1', from: 'in_review', to: 'changes_needed', actorId: 'adm', reason: 'Fix photos' });
+    expect(listings.update.mock.calls[0][1]).not.toHaveProperty('booking_eligible');
+  });
+  it('review still succeeds when history fails', async () => {
+    const { svc } = mk({ record: jest.fn().mockRejectedValue(new Error('db')) });
+    await expect(svc.reviewProperty('l1', 'adm', body)).resolves.toMatchObject({ success: true });
+  });
+});

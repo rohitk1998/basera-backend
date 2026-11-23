@@ -57,6 +57,27 @@ export class HostVerificationCaseEntity {
   @Column({ type: 'timestamptz', nullable: true })
   purged_at: Date | null;
 
+  @Column({ type: 'text', nullable: true })
+  liveness_nonce: string | null;
+
+  @Column({ type: 'boolean', default: false })
+  duplicate_flag: boolean;
+
+  @Column({ type: 'int', default: 0 })
+  face_attempts: number;
+
+  @Column({ type: 'date', nullable: true })
+  doc_dob: string | null;
+
+  @Column({ type: 'date', nullable: true })
+  doc_expiry: string | null;
+
+  @Column({ type: 'boolean', default: false })
+  adult_confirmed: boolean;
+
+  @Column({ type: 'boolean', default: false })
+  expiry_confirmed: boolean;
+
   @Column({ type: 'timestamptz' })
   expires_at: Date;
 

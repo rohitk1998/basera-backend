@@ -25,6 +25,7 @@ import { CaptureConfigService } from './capture-config.service';
 import { SupabaseProvider } from '../auth/supabase.provider';
 import { RedisService } from '../redis/redis.service';
 import { SEARCH_CACHE_VERSION_KEY } from './listings.service';
+import { ListingHistoryService } from './listing-history.service';
 import {
   assessWalkthroughMetadata,
   distanceMetres,
@@ -195,7 +196,31 @@ export class HostListingsService implements OnModuleDestroy {
     @Optional() private readonly captureConfig?: CaptureConfigService,
 
     @Optional() private readonly geocode?: GeocodeService,
+
+    @Optional() private readonly history?: ListingHistoryService,
   ) {}
+
+  /** Best-effort: typed pricing, host provenance and the status-history row. Never fails the submission. */
+  private async recordSubmission(
+    listingId: string,
+    userId: string,
+    from: string | null,
+    property: Record<string, any>,
+  ): Promise<void> {
+    if (!this.history) return;
+    try {
+      await this.history.record({ listingId, from, to: 'in_review', actorId: userId, reason: 'Submitted by host' });
+      await this.history.savePricing(listingId, property);
+      await this.history.recordProvenance(
+        listingId,
+        ['title', 'description', 'theSpace', 'guestAccess', 'photos', 'amenities', 'houseRules', 'pricing'].map(
+          (field) => ({ field, source: 'host' as const }),
+        ),
+      );
+    } catch (err) {
+      this.logger.warn(`listing ${listingId} history/pricing write failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 
   get locationBypass(): boolean {
     return this.captureConfig?.locationBypass === true;
@@ -1077,6 +1102,7 @@ export class HostListingsService implements OnModuleDestroy {
     };
 
     const wasLive = existing.status === 'live';
+    const priorStatus = existing.status;
 
     existing.draft_data = draft_data;
     existing.status = 'in_review';
@@ -1085,6 +1111,8 @@ export class HostListingsService implements OnModuleDestroy {
     existing.updated_at = new Date();
 
     const saved = await this.listings.save(existing);
+
+    await this.recordSubmission(saved.id, userId, priorStatus, property);
 
     if (wasLive) {
       await this.redis.incrementVersion(SEARCH_CACHE_VERSION_KEY);
@@ -1285,7 +1313,8 @@ export class HostListingsService implements OnModuleDestroy {
       captures: { photos: captures, ...(wifi.record ? { wifi: wifi.record } : {}) },
     };
 
-    return await this.dataSource.transaction(async (manager) => {
+    const priorStatus = existing?.status ?? null;
+    const result = await this.dataSource.transaction(async (manager) => {
       const listings = manager.getRepository(ListingEntity);
       if (existing) {
         const locked = await listings.findOne({
@@ -1311,5 +1340,7 @@ export class HostListingsService implements OnModuleDestroy {
 
       return { listingId: saved.id, status: 'in_review' as const };
     });
+    await this.recordSubmission(result.listingId, userId, priorStatus, property);
+    return result;
   }
 }

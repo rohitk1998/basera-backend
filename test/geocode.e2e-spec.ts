@@ -81,7 +81,7 @@ describe('GET /api/geocode', () => {
     await boot();
     handler = () => ({ status: 200, body: [hit(32.27, 77.17)] });
     await locate({ district: 'Kullu', tehsil: 'Manali', q: 'Vashisht' }).expect(200);
-    expect(osm.calls[0].headers['user-agent']).toMatch(/^Basera\//);
+    expect(osm.calls[0].headers['user-agent']).toMatch(/^RhenBasera\//);
   });
 
   it('says "area" when only a region could be found, not a spot', async () => {

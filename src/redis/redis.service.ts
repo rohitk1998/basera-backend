@@ -8,7 +8,7 @@ const REDIS_COMMAND_TIMEOUT_MS = 2_500;
 export class RedisService implements OnModuleDestroy {
   private readonly logger = new Logger(RedisService.name);
   private readonly client: Redis;
-  readonly keyPrefix = 'basera:';
+  readonly keyPrefix = 'RhenBasera:';
 
   constructor(private readonly config: ConfigService) {
     const url = this.config.get<string>('REDIS_URL') ?? 'redis://localhost:6379';
@@ -77,6 +77,67 @@ export class RedisService implements OnModuleDestroy {
       return await this.client.lrange(key, 0, -1);
     } catch (err: any) {
       this.logger.warn(`LRANGE ${key} failed: ${err?.message ?? err}`);
+      this.recoverFromTimeout(err);
+      return [];
+    }
+  }
+
+  /**
+   * Atomic "count one, but only while the total stays within `limit`". One Lua call, so concurrent workers
+   * (several API instances) can never overshoot. Fails CLOSED (false) when Redis is unreachable: this guards paid calls.
+   */
+  async incrWithin(key: string, limit: number, ttlSeconds: number): Promise<boolean> {
+    try {
+      const r = await this.client.eval(
+        `local n = redis.call('INCR', KEYS[1]) if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end if n > tonumber(ARGV[1]) then redis.call('DECR', KEYS[1]) return 0 end return 1`,
+        1, key, limit, ttlSeconds,
+      );
+      return Number(r) === 1;
+    } catch (err: any) {
+      this.logger.warn(`incrWithin ${key} failed: ${err?.message ?? err}`);
+      this.recoverFromTimeout(err);
+      return false;
+    }
+  }
+
+  /** Plain counter +1 with a TTL (set on first increment). Best effort: never throws. */
+  async bump(key: string, ttlSeconds: number): Promise<void> {
+    try {
+      const n = await this.client.incr(key);
+      if (n === 1) await this.client.expire(key, ttlSeconds);
+    } catch (err: any) {
+      this.logger.warn(`bump ${key} failed: ${err?.message ?? err}`);
+      this.recoverFromTimeout(err);
+    }
+  }
+
+  /** Several string keys in one round trip; missing/unreachable -> null. */
+  async mget(keys: string[]): Promise<(string | null)[]> {
+    if (!keys.length) return [];
+    try {
+      return await this.client.mget(...keys);
+    } catch (err: any) {
+      this.logger.warn(`MGET failed: ${err?.message ?? err}`);
+      this.recoverFromTimeout(err);
+      return keys.map(() => null);
+    }
+  }
+
+  /** Add to a set with a TTL, and read it back. */
+  async addToSet(key: string, member: string, ttlSeconds: number): Promise<void> {
+    try {
+      await this.client.multi().sadd(key, member).expire(key, ttlSeconds).exec();
+    } catch (err: any) {
+      this.logger.warn(`SADD ${key} failed: ${err?.message ?? err}`);
+      this.recoverFromTimeout(err);
+    }
+  }
+
+  async members(key: string): Promise<string[]> {
+    try {
+      return await this.client.smembers(key);
+    } catch (err: any) {
+      this.logger.warn(`SMEMBERS ${key} failed: ${err?.message ?? err}`);
       this.recoverFromTimeout(err);
       return [];
     }

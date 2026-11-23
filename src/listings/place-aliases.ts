@@ -46,6 +46,26 @@ export const PLACE_ALIASES: Readonly<Record<string, PlaceAlias>> = {
   gunehar: { district: 'Kangra', tehsil: 'Dharamshala' },
   triund: { district: 'Kangra', tehsil: 'Dharamshala' },
   naggar: { district: 'Kullu', tehsil: 'Kullu' },
+  jibhi: { district: 'Kullu', tehsil: 'Banjar' },
+  'tirthan valley': { district: 'Kullu', tehsil: 'Banjar' },
+  khajjiar: { district: 'Chamba', tehsil: 'Dalhousie' },
+  sangla: { district: 'Kinnaur', tehsil: 'Sangla' },
+  kalpa: { district: 'Kinnaur', tehsil: 'Kalpa' },
+  kaza: { district: 'Lahaul and Spiti', tehsil: 'Kaza' },
+  sethan: { district: 'Kullu', tehsil: 'Manali' },
+
+  'pangi valley': { district: 'Chamba', tehsil: 'Pangi' },
+  'sach pass': { district: 'Chamba', tehsil: 'Saach' },
+  'janjehli - karsog - chindi': { district: 'Mandi', tehsil: 'Karsog' },
+  'bharmour - kugti region': { district: 'Chamba', tehsil: 'Bharmour' },
+  'pabbar valley - rohru - chanshal pass': { district: 'Shimla', tehsil: 'Rohru' },
+  'sainj valley': { district: 'Kullu', tehsil: 'Sainj' },
+  'miyar valley': { district: 'Lahaul and Spiti', tehsil: 'Udaipur' },
+  'lahaul region': { district: 'Lahaul and Spiti', tehsil: 'Lahaul' },
+  'churah region': { district: 'Chamba', tehsil: 'Churah' },
+  'kotkhai - apple country': { district: 'Shimla', tehsil: 'Kotkhai' },
+  'rupi - bhaba region, kinnaur': { district: 'Kinnaur', tehsil: 'Nichar' },
+  'thachi valley': { district: 'Mandi', tehsil: 'Thachi' },
 };
 
 export function normalizePlaceName(name: string): string {

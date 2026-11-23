@@ -1,19 +1,57 @@
-import { ConflictException, Injectable, InternalServerErrorException, Inject } from '@nestjs/common';
+import { ConflictException, Injectable, InternalServerErrorException, Logger, Optional } from '@nestjs/common';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
-import { Repository, DataSource, In, QueryFailedError } from 'typeorm';
+import { Repository, DataSource, EntityManager, In, QueryFailedError } from 'typeorm';
 import { PaymentEntity } from '../entities';
+import { FinanceFlowService } from '../finance/finance-flow.service';
+import { CashfreeService } from './cashfree.service';
 
 const PG_UNIQUE_VIOLATION = '23505';
 
 @Injectable()
 export class PaymentsService {
+  private readonly logger = new Logger(PaymentsService.name);
+
   constructor(
     @InjectRepository(PaymentEntity)
     private readonly paymentsRepo: Repository<PaymentEntity>,
     @InjectDataSource()
     private readonly dataSource: DataSource,
+    @Optional() private readonly finance?: FinanceFlowService,
+    @Optional() private readonly cashfree?: CashfreeService,
   ) {}
+
+  /** The payment row as the finance layer needs it, or null when finance is not wired (unit tests). */
+  private async financeRow(bookingId: string, manager?: EntityManager) {
+    if (!this.finance) return null;
+    return this.repoFor(manager).findOne({ where: { booking_id: bookingId } });
+  }
+
+  /**
+   * Cancel/expiry hook: close the still-payable Cashfree order and mark the payment failed.
+   * No-op unless the payment is pending with a real order. If the order turns out PAID the
+   * payment is left pending so syncPayment/reconcile holds-then-refunds it.
+   */
+  async closePendingOrder(bookingId: string): Promise<'closed' | 'paid' | 'none'> {
+    if (!this.cashfree) return 'none';
+    const payment = await this.paymentsRepo.findOne({ where: { booking_id: bookingId } });
+    if (!payment || payment.status !== 'pending' || payment.cashfree_order_id.startsWith('SIMULATED-')) return 'none';
+    const status = await this.cashfree.terminateOrder(payment.cashfree_order_id);
+    if (status === 'PAID') return 'paid';
+    await this.markFailed(bookingId);
+    return 'closed';
+  }
+
+  /** Pending payments older than `minAgeMs`, for the reconcile job. */
+  async listStalePending(minAgeMs: number, limit = 100): Promise<PaymentEntity[]> {
+    return this.paymentsRepo
+      .createQueryBuilder('p')
+      .where('p.status = :s', { s: 'pending' })
+      .andWhere('p.updated_at < :t', { t: new Date(Date.now() - minAgeMs) })
+      .orderBy('p.updated_at', 'ASC')
+      .limit(limit)
+      .getMany();
+  }
 
   buildMockedSplitPayload(
     hostId: string,
@@ -97,7 +135,17 @@ export class PaymentsService {
       { booking_id: bookingId, status: 'pending' },
       { status: 'held', cf_payment_id: cfPaymentId, paid_at: new Date(), updated_at: new Date() },
     );
-    return (result.affected ?? 0) > 0;
+    const changed = (result.affected ?? 0) > 0;
+    if (changed && this.finance) {
+      try {
+        const row = await this.paymentsRepo.findOne({ where: { booking_id: bookingId } });
+        if (row) await this.finance.onHeld(row);
+      } catch (err) {
+        // Replays are no-ops and the reconcile job backfills missing held entries.
+        this.logger.error(`ledger post for held payment of booking ${bookingId} failed: ${(err as Error).message}`);
+      }
+    }
+    return changed;
   }
 
   async markFailed(bookingId: string): Promise<void> {
@@ -121,42 +169,89 @@ export class PaymentsService {
     return new Map(rows.map((row) => [row.booking_id, row]));
   }
 
-  async release(bookingId: string): Promise<void> {
-    const payment = await this.getForBooking(bookingId);
-    if (!payment || payment.status !== 'held') {
-      throw new InternalServerErrorException(`No held payment found for booking ${bookingId}`);
-    }
-    await this.paymentsRepo.update(
-      { id: payment.id },
-      { status: 'released_to_host', cashfree_payout_id: `SIMULATED-${randomUUID()}`, updated_at: new Date() },
+  private repoFor(manager?: EntityManager): Repository<PaymentEntity> {
+    return manager ? manager.getRepository(PaymentEntity) : this.paymentsRepo;
+  }
+
+  /**
+   * Status-guarded transition: the UPDATE only matches while the row is still in
+   * one of `from`, so of two racing callers (release vs refund vs split, or a
+   * dispute landing during a release) exactly one affects a row; the loser gets
+   * a 409 and, when called with a transaction manager, rolls the whole unit back.
+   */
+  private async guardedUpdate(
+    bookingId: string,
+    from: string[],
+    patch: Partial<PaymentEntity>,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const res = await this.repoFor(manager).update(
+      { booking_id: bookingId, status: In(from) },
+      { ...patch, updated_at: new Date() },
     );
-  }
-
-  async refund(bookingId: string): Promise<void> {
-    const payment = await this.getForBooking(bookingId);
-    if (!payment || payment.status !== 'held') {
-      throw new InternalServerErrorException(`No held payment found for booking ${bookingId}`);
+    if (!res.affected) {
+      throw new ConflictException(
+        `Payment for booking ${bookingId} is not in a state that allows this (expected ${from.join(' or ')}).`,
+      );
     }
-    await this.paymentsRepo.update({ id: payment.id }, { status: 'refunded', updated_at: new Date() });
   }
 
-  async splitRelease(bookingId: string, amountToGuest: number): Promise<void> {
-    const payment = await this.getForBooking(bookingId);
+  async release(bookingId: string, manager?: EntityManager): Promise<void> {
+    await this.guardedUpdate(
+      bookingId,
+      ['held'],
+      { status: 'released_to_host' },
+      manager,
+    );
+    // No money moves here: a payouts row (provider 'manual') is created and an admin pays it out.
+    const row = await this.financeRow(bookingId, manager);
+    if (row) await this.finance!.onRelease(row, manager);
+  }
+
+  /**
+   * Refund a held payment via Cashfree (real order) or directly (legacy/simulated rows).
+   * `amount` defaults to the full payment; a smaller amount refunds that part to the guest and
+   * the retained remainder goes to the host. Accepts (bookingId, amount) as well as
+   * (bookingId, manager, amount).
+   */
+  async refund(bookingId: string, managerOrAmount?: EntityManager | number, amountArg?: number): Promise<void> {
+    const manager = typeof managerOrAmount === 'number' ? undefined : managerOrAmount;
+    const amount = typeof managerOrAmount === 'number' ? managerOrAmount : amountArg;
+    const row = await this.financeRow(bookingId, manager);
+    if (row && amount != null && (!Number.isInteger(amount) || amount <= 0 || amount > row.amount)) {
+      throw new InternalServerErrorException('Refund amount must be between 1 and the held amount');
+    }
+    await this.guardedUpdate(bookingId, ['held'], { status: 'refunded' }, manager);
+    if (row) await this.finance!.onRefund(row, amount ?? row.amount, { reason: 'Booking cancelled', manager });
+  }
+
+  /**
+   * `from` defaults to held; an admin appeal re-decides an already split
+   * payment, so resolveAppeal passes ['split'].
+   */
+  async splitRelease(
+    bookingId: string,
+    amountToGuest: number,
+    manager?: EntityManager,
+    from: string[] = ['held'],
+  ): Promise<void> {
+    const payment = await this.repoFor(manager).findOne({ where: { booking_id: bookingId } });
     if (!payment) {
       throw new InternalServerErrorException(`No payment found for booking ${bookingId}`);
     }
     if (amountToGuest < 0 || amountToGuest > payment.amount) {
       throw new InternalServerErrorException('amountToGuest must be between 0 and the held amount');
     }
-    await this.paymentsRepo.update(
-      { id: payment.id },
-      {
-        status: 'split',
-        split_amount_to_guest: amountToGuest,
-        cashfree_payout_id: `SIMULATED-${randomUUID()}`,
-        updated_at: new Date(),
-      },
+    await this.guardedUpdate(
+      bookingId,
+      from,
+      { status: 'split', split_amount_to_guest: amountToGuest, cashfree_payout_id: null },
+      manager,
     );
+    if (this.finance) {
+      const prev = payment.status === 'split' ? payment.split_amount_to_guest ?? 0 : null;
+      await this.finance.onSplit(payment, amountToGuest, manager, prev);
+    }
   }
 
   async listTransactions(userId: string, role?: 'guest' | 'host') {

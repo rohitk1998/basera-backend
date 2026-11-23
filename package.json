@@ -1,5 +1,5 @@
 {
-  "name": "basera-backend",
+  "name": "RhenBasera-backend",
   "version": "0.0.1",
   "description": "",
   "author": "",
@@ -22,9 +22,15 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "seed:admin": "node scripts/seed-admin.mjs",
     "import:attractions": "nest build && node dist/attractions/import.cli.js",
-    "loadtest": "node scripts/loadtest.mjs"
+    "loadtest": "node scripts/loadtest.mjs",
+    "migrate:status": "node scripts/migrate.mjs --status",
+    "migrate:dry": "node scripts/migrate.mjs --dry-run",
+    "migrate:apply": "node scripts/migrate.mjs --yes",
+    "lint:migrations": "node scripts/lint-migrations.mjs",
+    "test:migrate": "node --test scripts/migrate.test.mjs"
   },
   "dependencies": {
+    "@nestjs/bullmq": "^11.0.5",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.0.1",
@@ -34,6 +40,7 @@
     "@nestjs/typeorm": "^11.0.3",
     "@supabase/supabase-js": "^2.112.4",
     "bcrypt": "^6.0.0",
+    "bullmq": "^5.81.5",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "cookie-parser": "^1.4.7",
@@ -47,6 +54,7 @@
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "sharp": "^0.35.5",
     "typeorm": "^1.1.0",
     "zod": "^4.4.3"
   },
